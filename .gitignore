@@ -1,0 +1,12 @@
+node_modules/
+out/
+release/
+dist-tsc/
+.DS_Store
+*.log
+.env
+.env.local
+
+# Personal sessions saved at the repo root during testing
+*.dflou.json
+/Test*.json

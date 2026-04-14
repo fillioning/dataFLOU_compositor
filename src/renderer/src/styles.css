@@ -1,0 +1,433 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ======== Theme palettes ======== */
+/* Colors are held as space-separated RGB triples so Tailwind's rgb(.../<alpha>)
+   machinery can add opacity variants. */
+
+:root,
+[data-theme='dark'] {
+  --c-bg: 29 29 29;
+  --c-panel: 42 42 42;
+  --c-panel2: 54 54 54;
+  --c-panel3: 66 66 66;
+  --c-border: 20 20 20;
+  --c-accent: 255 153 51;
+  --c-accent2: 123 167 217;
+  --c-muted: 138 138 138;
+  --c-text: 212 212 212;
+  --c-active: 255 169 77;
+  --c-danger: 216 75 75;
+  --c-success: 119 192 122;
+  --c-input-bg: 26 26 26;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+/* Light — bright but with enough contrast to actually read; darker accent
+   + visible borders so panels read as distinct surfaces. */
+[data-theme='light'] {
+  --c-bg: 214 214 214;
+  --c-panel: 236 236 236;
+  --c-panel2: 224 224 224;
+  --c-panel3: 200 200 200;
+  --c-border: 160 160 160;
+  --c-accent: 200 95 20;
+  --c-accent2: 40 95 160;
+  --c-muted: 90 90 90;
+  --c-text: 30 30 30;
+  --c-active: 220 110 35;
+  --c-danger: 180 45 45;
+  --c-success: 55 140 85;
+  --c-input-bg: 248 248 248;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+/* Pastel — dusty rose + lavender, muted not garish, sans-serif only. */
+[data-theme='pastel'] {
+  --c-bg: 232 218 232;
+  --c-panel: 244 230 242;
+  --c-panel2: 226 210 228;
+  --c-panel3: 208 190 214;
+  --c-border: 180 158 190;
+  --c-accent: 182 108 146;
+  --c-accent2: 128 160 196;
+  --c-muted: 130 110 146;
+  --c-text: 64 48 78;
+  --c-active: 200 130 168;
+  --c-danger: 188 78 94;
+  --c-success: 108 172 130;
+  --c-input-bg: 252 246 250;
+  --font-app: 'Quicksand', 'Nunito', 'Trebuchet MS', sans-serif;
+}
+
+/* Reaper Classic — blue-grey, cool, medium-high contrast. */
+[data-theme='reaper'] {
+  --c-bg: 30 30 30;
+  --c-panel: 43 43 43;
+  --c-panel2: 56 56 56;
+  --c-panel3: 72 72 72;
+  --c-border: 16 16 16;
+  --c-accent: 74 144 200;
+  --c-accent2: 122 176 216;
+  --c-muted: 128 128 128;
+  --c-text: 208 208 208;
+  --c-active: 98 160 210;
+  --c-danger: 201 64 64;
+  --c-success: 110 180 120;
+  --c-input-bg: 24 24 24;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+/* Smooth — low contrast, warm greys, "easy on the eyes". */
+[data-theme='smooth'] {
+  --c-bg: 44 42 40;
+  --c-panel: 54 52 50;
+  --c-panel2: 64 62 60;
+  --c-panel3: 76 74 72;
+  --c-border: 32 30 28;
+  --c-accent: 164 146 124;
+  --c-accent2: 142 160 172;
+  --c-muted: 120 114 106;
+  --c-text: 186 178 168;
+  --c-active: 188 170 146;
+  --c-danger: 172 108 108;
+  --c-success: 136 160 132;
+  --c-input-bg: 38 36 34;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+/* Hydra — desaturated blue-greys with a bright cyan accent. */
+[data-theme='hydra'] {
+  --c-bg: 26 37 48;
+  --c-panel: 37 51 64;
+  --c-panel2: 51 67 80;
+  --c-panel3: 68 85 102;
+  --c-border: 10 18 24;
+  --c-accent: 77 208 225;
+  --c-accent2: 128 203 196;
+  --c-muted: 120 144 156;
+  --c-text: 207 216 220;
+  --c-active: 100 220 235;
+  --c-danger: 229 115 115;
+  --c-success: 129 199 132;
+  --c-input-bg: 20 28 38;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+/* DarkSide — near-black with a hot red-orange accent. */
+[data-theme='darkside'] {
+  --c-bg: 10 10 10;
+  --c-panel: 20 20 20;
+  --c-panel2: 30 30 30;
+  --c-panel3: 42 42 42;
+  --c-border: 0 0 0;
+  --c-accent: 255 87 34;
+  --c-accent2: 255 138 101;
+  --c-muted: 112 112 112;
+  --c-text: 224 224 224;
+  --c-active: 255 112 67;
+  --c-danger: 255 61 0;
+  --c-success: 118 196 122;
+  --c-input-bg: 5 5 5;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+/* Solaris — cool blue-dominated. */
+[data-theme='solaris'] {
+  --c-bg: 26 40 56;
+  --c-panel: 34 51 72;
+  --c-panel2: 42 63 88;
+  --c-panel3: 53 77 106;
+  --c-border: 15 26 38;
+  --c-accent: 41 182 246;
+  --c-accent2: 129 212 250;
+  --c-muted: 106 138 165;
+  --c-text: 207 226 234;
+  --c-active: 79 195 247;
+  --c-danger: 224 96 96;
+  --c-success: 129 199 132;
+  --c-input-bg: 21 34 47;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+/* Flame — FL-Studio-ish dark grey with a hot orange. */
+[data-theme='flame'] {
+  --c-bg: 28 28 28;
+  --c-panel: 40 40 40;
+  --c-panel2: 52 52 52;
+  --c-panel3: 66 66 66;
+  --c-border: 12 12 12;
+  --c-accent: 255 122 0;
+  --c-accent2: 255 169 77;
+  --c-muted: 140 140 140;
+  --c-text: 224 224 224;
+  --c-active: 255 145 30;
+  --c-danger: 216 60 60;
+  --c-success: 98 198 122;
+  --c-input-bg: 22 22 22;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+/* Analog — X-Raym-ish warm wood/cream. */
+[data-theme='analog'] {
+  --c-bg: 58 46 34;
+  --c-panel: 74 59 44;
+  --c-panel2: 86 70 52;
+  --c-panel3: 106 86 63;
+  --c-border: 40 30 20;
+  --c-accent: 230 180 94;
+  --c-accent2: 216 146 98;
+  --c-muted: 168 144 120;
+  --c-text: 240 228 200;
+  --c-active: 240 194 116;
+  --c-danger: 216 101 96;
+  --c-success: 152 188 122;
+  --c-input-bg: 48 37 25;
+  --font-app: 'Georgia', 'Iowan Old Style', serif;
+}
+
+/* ======== Base ======== */
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-app);
+  font-size: 13px;
+  background: rgb(var(--c-bg));
+  color: rgb(var(--c-text));
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+input,
+select,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--c-panel3));
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--c-muted) / 0.6);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Strip the native up/down spinner arrows from all number inputs. */
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* ======== LFO/Sequencer clockwise sweep on the trigger square ======== */
+
+@property --lfo-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+/* Sweep overlays: filled wedge = accent, unfilled = dark panel (so the sweep
+   is visible even when the button's own bg is accent). */
+.lfo-sweep {
+  background: conic-gradient(
+    from 0deg,
+    rgb(var(--c-accent)) 0deg,
+    rgb(var(--c-accent)) var(--lfo-angle),
+    rgb(var(--c-panel2)) var(--lfo-angle) 360deg
+  );
+  animation-name: lfo-spin;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+.scene-fill {
+  background: conic-gradient(
+    from 0deg,
+    rgb(var(--c-accent)) 0deg,
+    rgb(var(--c-accent)) var(--lfo-angle),
+    rgb(var(--c-panel2)) var(--lfo-angle) 360deg
+  );
+  animation-name: lfo-spin;
+  animation-timing-function: linear;
+  animation-iteration-count: 1;
+  animation-fill-mode: forwards;
+}
+
+@keyframes lfo-spin {
+  from {
+    --lfo-angle: 0deg;
+  }
+  to {
+    --lfo-angle: 360deg;
+  }
+}
+
+/* ======== Step blink ======== */
+/* When a cell's sequencer is on the active step, its step-value input or the
+   cell tile itself pulses with accent color. */
+
+@keyframes seq-pulse {
+  0% {
+    box-shadow: 0 0 0 2px rgb(var(--c-accent) / 0.8) inset;
+    background: rgb(var(--c-accent) / 0.2);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgb(var(--c-accent) / 0) inset;
+    background: rgb(var(--c-accent) / 0);
+  }
+}
+
+.seq-pulse {
+  animation: seq-pulse 400ms ease-out;
+}
+
+/* One-shot red flash for the Stop All / Panic buttons on click. */
+@keyframes flash-red {
+  0% {
+    background: rgb(var(--c-danger));
+    color: #000;
+    border-color: rgb(var(--c-danger));
+  }
+  100% {
+    background: rgb(var(--c-panel2));
+    color: inherit;
+    border-color: rgb(var(--c-border));
+  }
+}
+.flash-red {
+  animation: flash-red 400ms ease-out;
+}
+
+/* One-shot blue flash for the Save button on a successful write. */
+@keyframes flash-blue {
+  0% {
+    background: rgb(var(--c-accent2));
+    color: #000;
+    border-color: rgb(var(--c-accent2));
+  }
+  100% {
+    background: rgb(var(--c-panel2));
+    color: inherit;
+    border-color: rgb(var(--c-border));
+  }
+}
+.flash-blue {
+  animation: flash-blue 500ms ease-out;
+}
+
+/* ======== Form controls ======== */
+
+.input {
+  background: rgb(var(--c-input-bg));
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 2px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: rgb(var(--c-text));
+  outline: none;
+  transition: border-color 120ms;
+}
+.input:hover:not(:disabled):not(:focus) {
+  border-color: rgb(var(--c-panel3));
+}
+.input:focus {
+  border-color: rgb(var(--c-accent));
+  background: rgb(var(--c-input-bg) / 1);
+}
+.input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  background: rgb(var(--c-input-bg));
+  border: 1px solid rgb(var(--c-border));
+}
+
+.btn {
+  padding: 4px 8px;
+  border-radius: 2px;
+  border: 1px solid rgb(var(--c-border));
+  background: rgb(var(--c-panel2));
+  font-size: 12px;
+  color: inherit;
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) {
+  background: rgb(var(--c-panel3));
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-accent {
+  padding: 4px 8px;
+  border-radius: 2px;
+  background: rgb(var(--c-accent));
+  color: #000;
+  font-size: 12px;
+  font-weight: 500;
+}
+.btn-accent:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+.btn-accent:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: rgb(var(--c-muted));
+}
+
+/* Resize handles */
+.resize-h {
+  cursor: row-resize;
+}
+.resize-v {
+  cursor: col-resize;
+}
+.resize-h:hover,
+.resize-v:hover {
+  background: rgb(var(--c-accent) / 0.35);
+}

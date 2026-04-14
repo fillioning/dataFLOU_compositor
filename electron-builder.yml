@@ -1,0 +1,30 @@
+appId: com.vincentfillion.dataflou-compositor
+productName: dataFLOU_compositor
+copyright: Copyright © 2026 Vincent Fillion
+directories:
+  output: release/${version}
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+  - "!**/*.map"
+  - "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+asar: true
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: ${productName}-${version}-win-${arch}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+mac:
+  target:
+    - target: dmg
+      arch:
+        - universal
+  artifactName: ${productName}-${version}-mac-${arch}.${ext}
+  category: public.app-category.music
