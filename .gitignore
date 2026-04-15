@@ -11,5 +11,9 @@ dist-tsc/
 *.dflou.json
 /Test*.json
 
-# Portable build dropped at the repo root by `npm run build:win`
+# Portable builds dropped at the repo root after a build
 /dataFLOU_compositor.exe
+/dataFLOU_compositor.dmg
+
+# Downloaded CI artifacts (gh run download)
+/artifacts/
