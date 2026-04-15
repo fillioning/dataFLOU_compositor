@@ -551,13 +551,43 @@ function clampFloat(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v
 }
 
+// Pad or truncate a sequence array to exactly `length` slots. Used by
+// propagateDefaults to defend against sessions saved with a shorter or
+// corrupted sequence array.
+function padSequence(seq: (string | null)[], length: number): (string | null)[] {
+  const out: (string | null)[] = seq.slice(0, length)
+  while (out.length < length) out.push(null)
+  return out
+}
+
 function propagateDefaults(s: Session): Session {
+  // Defensive defaults for every top-level Session field. Current session
+  // files always include these, but applying the same pattern everywhere
+  // means future schema additions can't silently leave fields as undefined
+  // for older saves. If you add a Session field, add its fallback here.
+  const SEQUENCE_LEN = 128
   return {
     ...s,
+    version: 1,
+    name: typeof s.name === 'string' ? s.name : 'Untitled',
+    tickRateHz:
+      typeof s.tickRateHz === 'number' ? clampInt(s.tickRateHz, 10, 300) : 120,
     globalBpm: typeof s.globalBpm === 'number' ? s.globalBpm : 120,
-    sequenceLength: typeof s.sequenceLength === 'number' ? s.sequenceLength : 32,
+    sequenceLength:
+      typeof s.sequenceLength === 'number' ? clampInt(s.sequenceLength, 1, 128) : 32,
+    defaultOscAddress:
+      typeof s.defaultOscAddress === 'string' ? s.defaultOscAddress : '/dataflou/value',
+    defaultDestIp: typeof s.defaultDestIp === 'string' ? s.defaultDestIp : '127.0.0.1',
+    defaultDestPort: typeof s.defaultDestPort === 'number' ? s.defaultDestPort : 9000,
+    tracks: Array.isArray(s.tracks) ? s.tracks : [],
+    focusedSceneId: typeof s.focusedSceneId === 'string' ? s.focusedSceneId : null,
+    midiInputName: typeof s.midiInputName === 'string' ? s.midiInputName : null,
+    sequence:
+      Array.isArray(s.sequence) && s.sequence.length === SEQUENCE_LEN
+        ? s.sequence
+        : padSequence(Array.isArray(s.sequence) ? s.sequence : [], SEQUENCE_LEN),
     // Soft-migrate scenes: `notes` is new; fall back to '' if missing.
-    scenes: s.scenes.map((sc) => ({
+    scenes: (Array.isArray(s.scenes) ? s.scenes : []).map((sc) => ({
       ...sc,
       notes: sc.notes ?? '',
       cells: Object.fromEntries(

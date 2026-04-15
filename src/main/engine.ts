@@ -462,11 +462,15 @@ export class SceneEngine {
 
   private startTicker(): void {
     if (!this.session) {
-      // Kick off at 30Hz default until session arrives.
-      this.tickTimer = setInterval(() => this.tick(), 1000 / 30)
+      // Kick off at 120Hz default until session arrives (matches the
+      // renderer's default from factory.makeEmptySession).
+      this.tickTimer = setInterval(() => this.tick(), 1000 / 120)
       return
     }
-    const hz = clamp(this.session.tickRateHz, 10, 100)
+    // Keep this range in sync with setTickRate() above and with the
+    // renderer's clamp in store.setTickRate. Drifting apart silently caps
+    // the engine to a lower rate than the UI advertises.
+    const hz = clamp(this.session.tickRateHz, 10, 300)
     this.tickTimer = setInterval(() => this.tick(), 1000 / hz)
   }
 

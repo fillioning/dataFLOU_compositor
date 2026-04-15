@@ -146,7 +146,7 @@ export interface MidiBinding {
 export interface Session {
   version: 1
   name: string
-  tickRateHz: number // 10..100
+  tickRateHz: number // 10..300
   globalBpm: number // 10..500, default for sync-mode sequencers
   sequenceLength: number // 1..128, number of visible slots in the Sequence view
   defaultOscAddress: string
