@@ -74,6 +74,9 @@ app.whenReady().then(async () => {
   ipcMain.handle('engine:resumeSequence', () => engine.resumeSequence())
   ipcMain.handle('engine:setTickRate', (_e, hz: number) => engine.setTickRate(hz))
   ipcMain.handle('engine:updateSession', (_e, s: Session) => engine.updateSession(s))
+  ipcMain.handle('engine:sendMetaValue', (_e, knobIdx: number, v: number) =>
+    engine.sendMetaValue(knobIdx, v)
+  )
 
   // ---------- IPC: Session I/O ----------
   ipcMain.handle('session:saveAs', (_e, s: Session) => sessionIO.saveAs(mainWindow, s))

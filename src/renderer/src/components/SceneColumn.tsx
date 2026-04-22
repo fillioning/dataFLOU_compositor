@@ -1,16 +1,22 @@
+import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useStore } from '../store'
 import CellTile from './CellTile'
-import { useEffectiveRowHeight, useHeaderHeight } from './EditView'
+import { SCENE_COL_COLLAPSED_MIN_W, useEffectiveRowHeight, useHeaderHeight } from './EditView'
 import { ResizeHandle } from './ResizeHandle'
-import { UncontrolledTextarea, UncontrolledTextInput } from './UncontrolledInput'
+import { UncontrolledTextInput } from './UncontrolledInput'
+import { BoundedNumberInput } from './BoundedNumberInput'
 
 export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Element {
   const scene = useStore((s) => s.session.scenes.find((sc) => sc.id === sceneId))
   const tracks = useStore((s) => s.session.tracks)
   const focusedSceneId = useStore((s) => s.session.focusedSceneId)
+  const selectedSceneIds = useStore((s) => s.selectedSceneIds)
   const updateScene = useStore((s) => s.updateScene)
   const removeScene = useStore((s) => s.removeScene)
+  const removeScenes = useStore((s) => s.removeScenes)
   const setFocusedScene = useStore((s) => s.setFocusedScene)
+  const selectSceneRange = useStore((s) => s.selectSceneRange)
   const setSceneMidi = useStore((s) => s.setSceneMidi)
   const engineActiveScene = useStore((s) => s.engine.activeSceneId)
   const activeSceneStartedAt = useStore((s) => s.engine.activeSceneStartedAt)
@@ -32,6 +38,12 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
 
   const isPlaying = engineActiveScene === sceneId
   const isFocused = focusedSceneId === sceneId
+  // Column is visually selected when it's part of the current multi-select.
+  // Falls back to isFocused for the single-select case to keep old behavior
+  // when nothing's been explicitly multi-selected yet.
+  const isInSelection = selectedSceneIds.length > 0
+    ? selectedSceneIds.includes(sceneId)
+    : isFocused
 
   async function trigger(): Promise<void> {
     // In MIDI Learn mode, clicking the trigger selects it as the learn target
@@ -55,13 +67,68 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
   // Column-wide tint using the scene color at low alpha.
   const tint = scene.color + '14'
 
+  // Right-click context menu — the targets array is what the menu will
+  // actually act on: either the current multi-selection (if this scene is
+  // already part of it) or just this scene (in which case the right-click
+  // replaces the selection with it).
+  const [menu, setMenu] = useState<{ x: number; y: number; targets: string[] } | null>(
+    null
+  )
+  useEffect(() => {
+    if (!menu) return
+    const close = (): void => setMenu(null)
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setMenu(null)
+    }
+    window.addEventListener('mousedown', close)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [menu])
+
+  // Plain click = single select + new anchor. Shift-click = extend range
+  // from anchor (focusedSceneId) through this scene inclusive. Matches the
+  // Shift-click convention used for message rows.
+  function onHeaderClick(e: React.MouseEvent): void {
+    if (e.shiftKey) selectSceneRange(sceneId)
+    else setFocusedScene(sceneId)
+  }
+
+  function onContextMenu(e: React.MouseEvent): void {
+    // Don't hijack the browser's right-click inside input / textarea /
+    // select / contenteditable — the user probably wants clipboard actions.
+    const tag = (e.target as HTMLElement | null)?.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+    e.preventDefault()
+    const inSel = selectedSceneIds.includes(sceneId)
+    // If this scene is part of a multi-selection, the menu acts on the
+    // whole selection. Otherwise it targets just this one and we replace
+    // the selection so the user's intent is unambiguous.
+    const targets = inSel && selectedSceneIds.length > 1 ? selectedSceneIds : [sceneId]
+    if (!inSel) setFocusedScene(sceneId)
+    setMenu({ x: e.clientX, y: e.clientY, targets })
+  }
+
   return (
     <div
       className={`shrink-0 border-r border-border flex flex-col relative ${
-        isFocused ? 'ring-1 ring-inset ring-accent/30' : ''
+        isInSelection ? 'ring-1 ring-inset ring-accent/30' : ''
       }`}
-      style={{ width: sceneColumnWidth, background: tint }}
-      onClick={() => setFocusedScene(sceneId)}
+      style={{
+        // When scenes are collapsed, each column auto-sizes to its own
+        // content (play button + scene name + whatever's in the cells)
+        // instead of a fixed 132 px. Shorter names → tighter columns;
+        // fits many more scenes on screen at once.
+        width: scenesCollapsed ? 'fit-content' : sceneColumnWidth,
+        minWidth: scenesCollapsed ? SCENE_COL_COLLAPSED_MIN_W : undefined,
+        background: tint
+      }}
+      onClick={onHeaderClick}
+      /* onContextMenu is attached ONLY to the scene-header divs below —
+         right-click on a cell should reach CellTile's own menu without
+         this column handler firing too. */
     >
       {/* 3px color strip on top — absolute so it doesn't affect layout height
           (which would misalign cells against the track sidebar rows). */}
@@ -70,13 +137,16 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         style={{ background: scene.color }}
       />
       {/* Column-width resize handle on the right edge — global. */}
+      {/* Column-width resize handle is hidden while scenes are collapsed —
+          the column is locked to a compact preset width in that mode, and
+          the handle would otherwise hit the name input at 132 px wide. */}
       <ResizeHandle
         direction="col"
         value={sceneColumnWidth}
         onChange={setSceneColumnWidth}
         min={180}
         max={480}
-        className="absolute top-0 right-0 bottom-0 w-[4px] z-10"
+        className={`absolute top-0 right-0 bottom-0 w-[4px] z-10 ${scenesCollapsed ? 'hidden' : ''}`}
         title="Drag to resize all scene columns"
       />
 
@@ -85,6 +155,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         <div
           className="relative border-b border-border px-2 flex items-center gap-1.5 shrink-0"
           style={{ height: headerH }}
+          onContextMenu={onContextMenu}
         >
           <SceneTriggerButton
             isPlaying={isPlaying}
@@ -97,7 +168,13 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             }}
           />
           <input
-            className="input flex-1 text-[11px] font-semibold min-w-0 py-0.5"
+            // `size` makes the input hug its own text (native <input size>
+            // attribute). Minimum 3 so tiny names still leave room to click;
+            // + 1 gives a trailing space so the caret doesn't clip on the
+            // last character. Paired with the column's `fit-content` width,
+            // this gives us per-scene adaptive widths.
+            size={Math.max(3, scene.name.length + 1)}
+            className="input text-[11px] font-semibold py-0.5"
             value={scene.name}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
@@ -108,6 +185,7 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
       <div
         className="relative border-b border-border px-2 py-2 flex flex-col gap-1.5 shrink-0"
         style={{ height: headerH }}
+        onContextMenu={onContextMenu}
       >
         <div className="flex items-center gap-1.5">
           <SceneTriggerButton
@@ -137,32 +215,42 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           />
         </div>
 
-        {/* Italic notes textarea — shared height across all scenes. */}
-        <UncontrolledTextarea
-          className="input italic text-[11px] leading-snug w-full"
-          style={{ height: notesHeight, resize: 'none' }}
-          placeholder="Notes…"
-          value={scene.notes ?? ''}
-          onClick={(e) => e.stopPropagation()}
-          onMouseDown={(e) => e.stopPropagation()}
-          onChange={(v) => updateScene(sceneId, { notes: v })}
-        />
+        {/* Italic notes textarea — shared height across all scenes.
+            Uses a plain controlled <textarea> (not UncontrolledTextarea)
+            because scene.notes is never updated by the 20Hz engine tick,
+            so the controlled-input race UncontrolledTextarea guards against
+            doesn't apply here. The uncontrolled version also had a quirk
+            where switching OS windows + coming back could leave the
+            element in a state where keystrokes didn't register. */}
+        {notesHeight > 0 && (
+          <textarea
+            className="input italic text-[11px] leading-snug w-full"
+            // overflow hidden = no scrollbar chrome cluttering a one-line
+            // strip. If the user wants more room they drag the notes
+            // handle bigger; content beyond the visible height just clips.
+            style={{ height: notesHeight, resize: 'none', overflow: 'hidden' }}
+            placeholder="Notes…"
+            value={scene.notes ?? ''}
+            onClick={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            onChange={(e) => updateScene(sceneId, { notes: e.target.value })}
+          />
+        )}
 
         <div className="flex items-center gap-1 text-[10px]">
           <span className="label">Dur</span>
-          <input
-            className="input w-12 text-[11px] py-0.5"
-            type="number"
-            min={0.5}
-            max={300}
-            step={0.5}
-            value={scene.durationSec}
+          <span
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
-            onChange={(e) =>
-              updateScene(sceneId, { durationSec: clamp(Number(e.target.value), 0.5, 300) })
-            }
-          />
+          >
+            <BoundedNumberInput
+              className="input w-12 text-[11px] py-0.5"
+              value={scene.durationSec}
+              onChange={(v) => updateScene(sceneId, { durationSec: v })}
+              min={0.5}
+              max={300}
+            />
+          </span>
           <span className="text-muted">s</span>
           <span className="label ml-1">Next</span>
           <select
@@ -171,17 +259,33 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
             onChange={(e) =>
-              updateScene(sceneId, { nextMode: e.target.value as 'off' | 'next' | 'random' })
+              updateScene(sceneId, {
+                nextMode: e.target.value as
+                  | 'stop'
+                  | 'loop'
+                  | 'next'
+                  | 'prev'
+                  | 'first'
+                  | 'last'
+                  | 'any'
+                  | 'other'
+              })
             }
           >
-            <option value="off">Off</option>
+            <option value="stop">Stop</option>
+            <option value="loop">Loop</option>
             <option value="next">Next</option>
-            <option value="random">Random</option>
+            <option value="prev">Previous</option>
+            <option value="first">First</option>
+            <option value="last">Last</option>
+            <option value="any">Any</option>
+            <option value="other">Other</option>
           </select>
         </div>
 
-        <div className="flex items-center gap-1">
-          {scene.midiTrigger && (
+        {/* MIDI binding chip — Delete moved to the right-click context menu. */}
+        {scene.midiTrigger && (
+          <div className="flex items-center gap-1">
             <span className="chip">
               {scene.midiTrigger.kind === 'note'
                 ? noteName(scene.midiTrigger.number)
@@ -198,18 +302,8 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
                 ✕
               </button>
             </span>
-          )}
-          <div className="flex-1" />
-          <button
-            className="btn text-[10px] px-1.5 py-0.5 text-danger hover:bg-danger hover:text-black"
-            onClick={(e) => {
-              e.stopPropagation()
-              if (confirm(`Delete "${scene.name}"?`)) removeScene(sceneId)
-            }}
-          >
-            Del
-          </button>
-        </div>
+          </div>
+        )}
 
         {/* Notes resize handle on the bottom border of the header — identical
             placement to the handle in TrackSidebar to keep alignment. */}
@@ -235,6 +329,42 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           <CellTile sceneId={sceneId} trackId={t.id} />
         </div>
       ))}
+
+      {/* Right-click context menu — portaled to <body> so it isn't clipped
+          by the column's overflow boundary. Closes on click-outside or
+          Escape (see useEffect above). */}
+      {menu &&
+        createPortal(
+          <div
+            className="fixed z-50 bg-panel border border-border rounded shadow-lg py-1 text-[12px] min-w-[160px]"
+            style={{ left: menu.x, top: menu.y }}
+            // Stop the window-level mousedown listener from closing before
+            // the menu button's click fires.
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <button
+              className="w-full text-left px-3 py-1 hover:bg-panel2 text-danger"
+              onClick={() => {
+                const ids = menu.targets
+                setMenu(null)
+                const n = ids.length
+                if (n === 0) return
+                const label =
+                  n === 1
+                    ? `Delete "${scene.name}"?`
+                    : `Delete ${n} scenes?`
+                if (!confirm(label)) return
+                if (n === 1) removeScene(ids[0])
+                else removeScenes(ids)
+              }}
+            >
+              {menu.targets.length > 1
+                ? `Delete ${menu.targets.length} scenes`
+                : 'Delete scene'}
+            </button>
+          </div>,
+          document.body
+        )}
     </div>
   )
 }

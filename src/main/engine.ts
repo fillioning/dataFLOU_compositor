@@ -14,6 +14,7 @@
 //    picks the next scene (or off).
 
 import type { Cell, EngineState, LfoShape, Modulation, Scene, Session } from '@shared/types'
+import { META_KNOB_COUNT } from '@shared/types'
 import {
   autoDetectOscArg,
   buildArpLadder,
@@ -22,7 +23,8 @@ import {
   hashSeedString,
   mulberry32,
   parseValueTokens,
-  readNumber
+  readNumber,
+  scaleMetaValue
 } from '@shared/factory'
 import { OscSender } from './osc'
 
@@ -141,6 +143,11 @@ export class SceneEngine {
   private lastTickAt = 0
   private activeSceneId: string | null = null
   private activeSceneStartedAt: number | null = null
+  // Per-session "how many times has the active scene played so far?" counter.
+  // Resets to 1 whenever activeSceneId CHANGES (fresh user trigger or follow
+  // action to a different scene). Increments when the active scene re-triggers
+  // itself (loop mode OR a multiplicator-driven internal repeat).
+  private activeSceneRepeatCount = 0
   private sceneAdvanceTimer: NodeJS.Timeout | null = null
   private onStateChange: ((s: EngineState) => void) | null = null
   // Latest computed output per (sceneId, trackId). Populated every tick by the
@@ -223,6 +230,29 @@ export class SceneEngine {
     if (!this.session) return
     this.session.tickRateHz = clamp(hz, 10, 300)
     this.restartTicker()
+  }
+
+  /**
+   * Meta Controller live output. Called by the renderer on every interpolated
+   * frame (drag, MIDI CC — both tweened renderer-side so the UI and the OSC
+   * output match exactly). This method just scales through the knob's curve
+   * and fires OSC to every enabled destination. No smoothing is applied here
+   * — it's entirely the renderer's responsibility so what you see on the
+   * knob is what leaves the socket.
+   *
+   * Values always go out as floats (`f`) — knob outputs are always numeric.
+   */
+  sendMetaValue(knobIdx: number, normalizedValue: number): void {
+    if (!this.session) return
+    if (knobIdx < 0 || knobIdx >= META_KNOB_COUNT) return
+    const knob = this.session.metaController?.knobs?.[knobIdx]
+    if (!knob) return
+    const t = clamp(normalizedValue, 0, 1)
+    const scaled = scaleMetaValue(t, knob.min, knob.max, knob.curve)
+    for (const d of knob.destinations) {
+      if (!d.enabled) continue
+      this.sender.send(d.destIp, d.destPort, d.oscAddress, { type: 'f', value: scaled })
+    }
   }
 
   triggerCell(sceneId: string, trackId: string): void {
@@ -353,6 +383,11 @@ export class SceneEngine {
     if (!this.session) return
     const scene = this.session.scenes.find((s) => s.id === sceneId)
     if (!scene) return
+    // If this is the SAME scene as what's already active, we're here via a
+    // loop follow-action or a multiplicator-driven internal repeat — bump
+    // the repeat counter. Otherwise reset to 1 (fresh play).
+    if (this.activeSceneId === sceneId) this.activeSceneRepeatCount += 1
+    else this.activeSceneRepeatCount = 1
     for (const trackId of Object.keys(scene.cells)) {
       this.triggerCell(sceneId, trackId)
     }
@@ -365,14 +400,23 @@ export class SceneEngine {
   private armSceneAdvance(scene: Scene): void {
     this.clearSceneAdvance()
     this.sceneAdvanceTimer = setTimeout(() => {
-      if (scene.nextMode === 'off') {
-        // Only clear the active-scene flag if no cell in this scene is still
-        // "doing something" (modulating or sequencing). Otherwise keep it held
-        // until the last active cell stops — matches the user's requested
-        // "except when modulation or sequencer is playing" carve-out.
+      // Multiplicator gate — if the scene hasn't yet played the requested
+      // number of times, re-trigger itself (counter bumps in triggerScene)
+      // before the real follow action fires. Applies to every mode: stop
+      // with mult=3 plays 3x then stops; next with mult=2 plays 2x then
+      // advances; loop is unchanged (it already re-triggers forever).
+      const mult = Math.max(1, Math.floor(scene.multiplicator || 1))
+      if (this.activeSceneRepeatCount < mult) {
+        this.triggerScene(scene.id)
+        return
+      }
+      // Stop always respects the "carve-out" — keep the scene active while
+      // cells are still modulating/sequencing; otherwise clear.
+      if (scene.nextMode === 'stop') {
         if (!this.sceneHasOngoingActivity(scene.id)) {
           this.activeSceneId = null
           this.activeSceneStartedAt = null
+          this.activeSceneRepeatCount = 0
         }
         this.emitState()
       } else {
@@ -403,28 +447,75 @@ export class SceneEngine {
 
   private advanceScene(current: Scene): void {
     if (!this.session) return
+    // Loop bypasses the sequence entirely — it re-triggers the current
+    // scene regardless of whether it's placed in any sequencer slot. The
+    // repeat-counter increments on re-trigger, but stays capped at its own
+    // count so it keeps looping forever.
+    if (current.nextMode === 'loop') {
+      this.triggerScene(current.id)
+      return
+    }
     const len = Math.max(1, Math.min(128, this.session.sequenceLength ?? 128))
     const seq = this.session.sequence.slice(0, len)
     const presentInSeq = seq.filter((id): id is string => !!id)
     if (presentInSeq.length === 0) return
+
     let nextId: string | null = null
-    if (current.nextMode === 'next') {
-      const start = seq.findIndex((id) => id === current.id)
-      if (start < 0) {
-        nextId = presentInSeq[0]
-      } else {
-        for (let i = 1; i <= seq.length; i++) {
-          const idx = (start + i) % seq.length
-          if (seq[idx]) {
-            nextId = seq[idx]
-            break
+    const start = seq.findIndex((id) => id === current.id)
+
+    switch (current.nextMode) {
+      case 'next': {
+        if (start < 0) nextId = presentInSeq[0]
+        else {
+          for (let i = 1; i <= seq.length; i++) {
+            const idx = (start + i) % seq.length
+            if (seq[idx]) {
+              nextId = seq[idx]
+              break
+            }
           }
         }
+        break
       }
-    } else if (current.nextMode === 'random') {
-      const pool = presentInSeq.filter((id) => id !== current.id)
-      const pick = pool.length ? pool[Math.floor(Math.random() * pool.length)] : presentInSeq[0]
-      nextId = pick
+      case 'prev': {
+        if (start < 0) nextId = presentInSeq[presentInSeq.length - 1]
+        else {
+          for (let i = 1; i <= seq.length; i++) {
+            const idx = (start - i + seq.length) % seq.length
+            if (seq[idx]) {
+              nextId = seq[idx]
+              break
+            }
+          }
+        }
+        break
+      }
+      case 'first': {
+        nextId = presentInSeq[0]
+        break
+      }
+      case 'last': {
+        nextId = presentInSeq[presentInSeq.length - 1]
+        break
+      }
+      case 'any': {
+        // Random pick from EVERY present scene (including self).
+        nextId = presentInSeq[Math.floor(Math.random() * presentInSeq.length)]
+        break
+      }
+      case 'other': {
+        // Random pick EXCLUDING the current scene. If it's the only one
+        // present, fall back to self so the loop doesn't stall silently.
+        const pool = presentInSeq.filter((id) => id !== current.id)
+        nextId = pool.length
+          ? pool[Math.floor(Math.random() * pool.length)]
+          : presentInSeq[0]
+        break
+      }
+      default:
+        // 'stop' and 'loop' are handled above / earlier; anything else is a
+        // no-op on purpose.
+        break
     }
     if (nextId) this.triggerScene(nextId)
   }
@@ -436,6 +527,7 @@ export class SceneEngine {
     this.clearSceneAdvance()
     this.activeSceneId = null
     this.activeSceneStartedAt = null
+    this.activeSceneRepeatCount = 0
     this.emitState()
   }
 
@@ -455,6 +547,7 @@ export class SceneEngine {
     this.clearSceneAdvance()
     this.activeSceneId = null
     this.activeSceneStartedAt = null
+    this.activeSceneRepeatCount = 0
     this.emitState()
   }
 

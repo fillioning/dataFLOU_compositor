@@ -136,11 +136,13 @@ function CellInspector(): JSX.Element {
         ))}
       </datalist>
 
-      <div>
-        <div className="label mb-1">Cell</div>
-        <div className="text-[11px]">
-          <span className="text-muted">{scene.name} → {track.name}</span>
-        </div>
+      {/* Single line saves a row of vertical space — the label sits inline
+          with the scene→message breadcrumb. */}
+      <div className="flex items-baseline gap-2">
+        <span className="label shrink-0">Cell</span>
+        <span className="text-[11px] text-muted truncate">
+          {scene.name} → {track.name}
+        </span>
       </div>
 
       <Section title="Destination">
@@ -238,25 +240,23 @@ function CellInspector(): JSX.Element {
       <Section title="Timing">
         <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center">
           <span className="label">Delay</span>
-          <input
+          <BoundedNumberInput
             className="input"
-            type="number"
+            value={cell.delayMs}
+            onChange={(v) => u({ delayMs: v })}
             min={0}
             max={10000}
-            step={10}
-            value={cell.delayMs}
-            onChange={(e) => u({ delayMs: clamp(Number(e.target.value), 0, 10000) })}
+            integer
           />
           <span className="text-muted text-[11px]">ms</span>
           <span className="label">Transition</span>
-          <input
+          <BoundedNumberInput
             className="input"
-            type="number"
+            value={cell.transitionMs}
+            onChange={(v) => u({ transitionMs: v })}
             min={0}
             max={10000}
-            step={10}
-            value={cell.transitionMs}
-            onChange={(e) => u({ transitionMs: clamp(Number(e.target.value), 0, 10000) })}
+            integer
           />
           <span className="text-muted text-[11px]">ms</span>
         </div>
@@ -311,14 +311,13 @@ function CellInspector(): JSX.Element {
             value={cell.sequencer.steps}
             onChange={(e) => uSeq({ steps: clamp(Math.round(Number(e.target.value)), 1, 16) })}
           />
-          <input
+          <BoundedNumberInput
             className="input w-14 text-right"
-            type="number"
+            value={cell.sequencer.steps}
+            onChange={(v) => uSeq({ steps: v })}
             min={1}
             max={16}
-            step={1}
-            value={cell.sequencer.steps}
-            onChange={(e) => uSeq({ steps: clamp(Math.round(Number(e.target.value)), 1, 16) })}
+            integer
           />
 
           <span className="label">Mode</span>
@@ -363,14 +362,13 @@ function CellInspector(): JSX.Element {
                 value={cell.sequencer.bpm}
                 onChange={(e) => uSeq({ bpm: clamp(Number(e.target.value), 10, 500) })}
               />
-              <input
+              <BoundedNumberInput
                 className="input w-14 text-right"
-                type="number"
+                value={cell.sequencer.bpm}
+                onChange={(v) => uSeq({ bpm: v })}
                 min={10}
                 max={500}
-                step={1}
-                value={cell.sequencer.bpm}
-                onChange={(e) => uSeq({ bpm: clamp(Number(e.target.value), 10, 500) })}
+                integer
               />
             </>
           ) : (
@@ -384,14 +382,13 @@ function CellInspector(): JSX.Element {
                 value={Math.min(5000, cell.sequencer.stepMs)}
                 onChange={(e) => uSeq({ stepMs: clamp(Number(e.target.value), 1, 60000) })}
               />
-              <input
+              <BoundedNumberInput
                 className="input w-16 text-right"
-                type="number"
+                value={cell.sequencer.stepMs}
+                onChange={(v) => uSeq({ stepMs: v })}
                 min={1}
                 max={60000}
-                step={1}
-                value={cell.sequencer.stepMs}
-                onChange={(e) => uSeq({ stepMs: clamp(Number(e.target.value), 1, 60000) })}
+                integer
               />
             </>
           )}
@@ -551,10 +548,13 @@ function LfoEditor({
       )}
 
       <span className="label">Sync</span>
-      <div className="flex items-center gap-2 text-[11px] min-w-0 flex-wrap">
+      {/* Keep Free (Hz) / Dotted / Triplet on a single line — dropped
+          flex-wrap and bumped the select width enough to show the full
+          "Free (Hz)" label without truncation. */}
+      <div className="flex items-center gap-2 text-[11px] min-w-0">
         <select
           className="input text-[11px] py-0.5 shrink-0"
-          style={{ width: 82 }}
+          style={{ width: 96 }}
           value={m.sync}
           onChange={(e) => uMod({ sync: e.target.value as LfoSync })}
         >
@@ -728,10 +728,13 @@ Div/Mult: Value in the middle; halvings below, doublings above."
       )}
 
       <span className="label">Sync</span>
-      <div className="flex items-center gap-2 text-[11px] min-w-0 flex-wrap">
+      {/* Keep Free (Hz) / Dotted / Triplet on a single line — dropped
+          flex-wrap and bumped the select width enough to show the full
+          "Free (Hz)" label without truncation. */}
+      <div className="flex items-center gap-2 text-[11px] min-w-0">
         <select
           className="input text-[11px] py-0.5 shrink-0"
-          style={{ width: 82 }}
+          style={{ width: 96 }}
           value={m.sync}
           onChange={(e) => uMod({ sync: e.target.value as LfoSync })}
         >
@@ -885,10 +888,13 @@ function RandomEditor({
       )}
 
       <span className="label">Sync</span>
-      <div className="flex items-center gap-2 text-[11px] min-w-0 flex-wrap">
+      {/* Keep Free (Hz) / Dotted / Triplet on a single line — dropped
+          flex-wrap and bumped the select width enough to show the full
+          "Free (Hz)" label without truncation. */}
+      <div className="flex items-center gap-2 text-[11px] min-w-0">
         <select
           className="input text-[11px] py-0.5 shrink-0"
-          style={{ width: 82 }}
+          style={{ width: 96 }}
           value={m.sync}
           onChange={(e) => uMod({ sync: e.target.value as LfoSync })}
         >

@@ -1,12 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
-import { useStore } from '../store'
+import { NOTES_ONE_LINE_HEIGHT, useStore } from '../store'
 import TrackSidebar from './TrackSidebar'
 import SceneColumn from './SceneColumn'
 import Inspector from './Inspector'
 import { ResizeHandle } from './ResizeHandle'
 import { Modal } from './Modal'
 
-export const HEADER_BASE = 88
+// Header height in the Edit view.
+// The TrackSidebar's "Buttons box" now holds only two rows (Scenes, Messages) —
+// the display toggles (Notes, Meta Controller) moved to the Inspector's top
+// SettingsBox. 80 px leaves each row ~24 px tall with py-2 container padding
+// and comfortable breathing room so no button sits flush against the edge.
+// Scene column headers use the same base so the top-of-matrix alignment stays
+// pixel-perfect.
+export const HEADER_BASE = 80
 export const HEADER_COLLAPSED = 32
 
 export function useHeaderHeight(): number {
@@ -14,6 +21,13 @@ export function useHeaderHeight(): number {
   const collapsed = useStore((s) => s.scenesCollapsed)
   return collapsed ? HEADER_COLLAPSED : HEADER_BASE + notesH
 }
+
+// Minimum column width (px) when scenes are collapsed. The column uses
+// `fit-content` sizing, so its effective width depends on the widest piece
+// of its content (header with play button + name, or a filled clip's
+// contents). This just guarantees a floor so extremely short names still
+// show a legible play button + room to click in.
+export const SCENE_COL_COLLAPSED_MIN_W = 56
 
 export function useEffectiveRowHeight(): number {
   const rowH = useStore((s) => s.rowHeight)
@@ -23,7 +37,6 @@ export function useEffectiveRowHeight(): number {
 
 export default function EditView(): JSX.Element {
   const scenes = useStore((s) => s.session.scenes)
-  const addScene = useStore((s) => s.addScene)
   const selectedCell = useStore((s) => s.selectedCell)
   const selectedTrack = useStore((s) => s.selectedTrack)
   const tracks = useStore((s) => s.session.tracks)
@@ -62,17 +75,8 @@ export default function EditView(): JSX.Element {
           {scenes.map((sc) => (
             <SceneColumn key={sc.id} sceneId={sc.id} />
           ))}
-
-          <div className="flex items-start p-2">
-            <button
-              className="btn h-9 whitespace-nowrap"
-              onClick={addScene}
-              disabled={scenes.length >= 128}
-              title={scenes.length >= 128 ? 'Max 128 scenes' : 'Add scene'}
-            >
-              + Scene
-            </button>
-          </div>
+          {/* Trailing "+ Scene" button removed — the one in the Buttons box
+              (TrackSidebar header) is the single entry point now. */}
         </div>
       </div>
 
@@ -125,6 +129,15 @@ function SettingsBox(): JSX.Element {
   const applyClipTemplate = useStore((s) => s.applyClipTemplate)
   const saveClipAsTemplate = useStore((s) => s.saveClipAsTemplate)
   const deleteClipTemplate = useStore((s) => s.deleteClipTemplate)
+  // Notes + Meta Controller toggles live here (top of the Inspector) rather
+  // than in the TrackSidebar header — keeps the "Buttons box" focused on
+  // scene/message creation + count, and gathers display toggles in one spot.
+  const notesHeight = useStore((s) => s.editorNotesHeight)
+  const setNotesHeight = useStore((s) => s.setEditorNotesHeight)
+  const notesOn = notesHeight > 0
+  const toggleNotes = (): void => setNotesHeight(notesOn ? 0 : NOTES_ONE_LINE_HEIGHT)
+  const metaVisible = useStore((s) => s.session.metaController.visible)
+  const setMetaVisible = useStore((s) => s.setMetaControllerVisible)
 
   const [namingOpen, setNamingOpen] = useState(false)
 
@@ -144,13 +157,57 @@ function SettingsBox(): JSX.Element {
   return (
     <>
     <div className="border-b border-border bg-panel2 px-3 py-2 flex flex-col gap-1.5 shrink-0">
+      {/* Row 1 — display toggles that affect the whole editor (global).
+          Notes = show/hide scene-notes strip (one line by default); Meta
+          Controller = show/hide the knob bank. Both sit above the collapse
+          toggles because they're the broader-impact controls. */}
       <div className="flex items-center gap-1">
+        <button
+          className={`btn text-[10px] py-0.5 flex-1 ${
+            notesOn ? 'bg-accent text-black border-accent' : ''
+          }`}
+          onClick={toggleNotes}
+          title={notesOn ? 'Hide scene notes' : 'Show scene notes (one line)'}
+        >
+          Notes
+        </button>
+        <button
+          // Meta Controller keeps an orange border at all times so it's
+          // discoverable as the toggle; when active it fills fully orange
+          // with black text. Border/background/color go inline because the
+          // `.btn` class uses `border:` shorthand, which overrides Tailwind
+          // `border-accent` via CSS source order.
+          className="btn text-[10px] py-0.5 flex-1"
+          style={{
+            borderColor: 'rgb(var(--c-accent))',
+            background: metaVisible ? 'rgb(var(--c-accent))' : undefined,
+            color: metaVisible ? '#000' : 'rgb(var(--c-accent))'
+          }}
+          onClick={() => setMetaVisible(!metaVisible)}
+          title="Toggle the Meta Controller bank"
+        >
+          Meta Controller
+        </button>
+      </div>
+      <div className="flex items-center gap-1">
+        {/* Left-click toggles each axis independently. Right-click on
+            either button toggles BOTH in lockstep — handy for the common
+            "go fully compact / fully expanded" case. The new linked state
+            is derived from whichever axis was clicked, so right-clicking
+            an inactive button turns both ON, an active button turns both
+            OFF. */}
         <button
           className={`btn text-[10px] py-0.5 flex-1 ${
             scenesCollapsed ? 'bg-accent/20 border-accent text-accent' : ''
           }`}
           onClick={() => setScenesCollapsed(!scenesCollapsed)}
-          title="Toggle compact scene headers"
+          onContextMenu={(e) => {
+            e.preventDefault()
+            const next = !scenesCollapsed
+            setScenesCollapsed(next)
+            setTracksCollapsed(next)
+          }}
+          title="Click: toggle scenes only · Right-click: toggle both scenes + messages"
         >
           {scenesCollapsed ? '⇲ Scenes' : '⇱ Collapse Scenes'}
         </button>
@@ -159,7 +216,13 @@ function SettingsBox(): JSX.Element {
             tracksCollapsed ? 'bg-accent/20 border-accent text-accent' : ''
           }`}
           onClick={() => setTracksCollapsed(!tracksCollapsed)}
-          title="Toggle compact message rows"
+          onContextMenu={(e) => {
+            e.preventDefault()
+            const next = !tracksCollapsed
+            setScenesCollapsed(next)
+            setTracksCollapsed(next)
+          }}
+          title="Click: toggle messages only · Right-click: toggle both scenes + messages"
         >
           {tracksCollapsed ? '⇲ Messages' : '⇱ Collapse Messages'}
         </button>

@@ -12,6 +12,7 @@ const api: ExposedApi = {
   resumeSequence: () => ipcRenderer.invoke('engine:resumeSequence'),
   setTickRate: (hz) => ipcRenderer.invoke('engine:setTickRate', hz),
   updateSession: (s: Session) => ipcRenderer.invoke('engine:updateSession', s),
+  sendMetaValue: (knobIdx, v) => ipcRenderer.invoke('engine:sendMetaValue', knobIdx, v),
 
   sessionSaveAs: (s: Session) => ipcRenderer.invoke('session:saveAs', s),
   sessionSave: (s: Session, path: string) => ipcRenderer.invoke('session:saveTo', s, path),

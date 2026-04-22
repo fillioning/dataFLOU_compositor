@@ -17,3 +17,13 @@ dist-tsc/
 
 # Downloaded CI artifacts (gh run download)
 /artifacts/
+
+# Claude Code workspace — local scratch, not part of the project.
+.claude/
+
+# Theme / typography design exploration. The real app-bundled fonts live
+# in src/renderer/src/fonts; these root-level copies + the mockup HTML +
+# the font-embedding helper script are design-time artifacts only.
+/fonts/
+/theme-mockups.html
+/embed-fonts.js

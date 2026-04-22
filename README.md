@@ -17,10 +17,15 @@ You build a grid of **Messages** (rows — each row is one OSC message destinati
 - **Four modulation types** — pick per clip: **LFO**, **Envelope (ADSR)**, **Arpeggiator**, **Random Generator**.
 - **Sequencer (1–16 steps)** — cycles through per‑step values at BPM (session‑locked), Tempo (per‑clip slider), or Free (ms). With Modulation also on, the modulator operates on the current step value.
 - **Transitions** morph the previous clip's value into the new one over a configurable time, even while the LFO keeps running.
-- **Scene auto‑advance** (Off / Next / Random) drives a 1–128‑step sequence grid drag‑laid in the Sequence view.
+- **Ableton‑style follow actions** — Stop / Loop / Next / Previous / First / Last / Any / Other, plus a per‑scene **×Multiplicator** (how many times the scene plays before the follow action fires).
+- **Sequence grid** — 1–128‑step drag‑laid sequence in the Sequence view, with a floating drag preview while you drop scenes into slots.
+- **Meta Controller** — a global bank of **8 circular knobs**, each with a user name, min/max range, a **Smooth (ms)** time to interpolate between values, one of **14 output curves** (linear, log, exp, geom, ease‑in, ease‑out, cubic, sqrt, sigmoid, smoothstep, dB taper, gamma, step, invert), up to **8 OSC destinations** broadcasting simultaneously, and MIDI CC learn. Dial position = what leaves the socket — smoothing is visible, not just sent.
 - **Clip Templates** — save full clip configs and apply them to empty cells via the right‑click menu or the Template dropdown. Persisted in localStorage, survive app restarts.
-- **Global MIDI Learn** (Ableton‑style, one button) — enter learn mode, click a scene or clip trigger, wiggle a MIDI control. Blue overlays show learnables, green = bound.
+- **Multi‑select clips** — Ctrl+click adds clips to a disjoint selection; right‑click the selection to bulk‑apply a template or re‑sync every selected clip's OSC to the session defaults.
+- **Global MIDI Learn** (Ableton‑style, one button) — enter learn mode, click a scene, clip trigger, or Meta knob, wiggle a MIDI control. Blue overlays show learnables, green = bound.
 - **Live value display** — every active clip's current output shows in real time inside its cell tile.
+- **UI zoom** — Ctrl+wheel rescales everything below the main toolbar (0.5×–2×). Persisted per‑install.
+- **15 themes** — 5 new ones in 0.3.0 (Studio Dark, Warm Charcoal, Graphite, Cream, Paper Light) with bundled Inter / Roboto / Work Sans / IBM Plex Sans fonts.
 
 OSC is sent over UDP. The engine runs in the Electron main process at a configurable tick rate (10–100 Hz) so timing stays stable even if the UI is busy.
 
@@ -61,11 +66,14 @@ The window is split into three regions:
 
 | Region | What it holds |
 | --- | --- |
-| **Top toolbar** | Session name, file actions (New / Open / Save / Save As), default OSC address & destination, Tick rate, Global BPM, MIDI input picker, **Edit ↔ Sequence** view toggle, **Stop All**, **Panic** |
-| **Editor** (Edit view) | Left: Messages sidebar (rows). Center: Scene columns (one per scene). Right: Inspector panel for the selected clip or message |
-| **Sequence view** (the other tab) | Left: scene palette + Theme picker. Center: 128‑slot drag‑drop sequence grid. Bottom: status/transport bar (Play / Pause / Stop, focused scene name, message count) |
+| **Top toolbar** | **dataFLOU** brand button (click to reveal the preferences sub‑toolbar with **Theme** picker), session name, file actions (New / Open / Save / Save As), default OSC address & destination, Tick rate, Global BPM, MIDI input picker, **MIDI Learn**, **Edit ↔ Sequence** view toggle, **Stop All**, **Panic** |
+| **Meta Controller bar** | Toggled via the Inspector's top "Meta Controller" button — sits below the main toolbar, resizable via the handle on its bottom edge. 8 circular knobs + a details pane for the selected knob |
+| **Editor** (Edit view) | Left: "Buttons box" (Scenes/Messages counts + add buttons) and Messages sidebar (rows). Center: Scene columns. Right: Inspector panel (top toggles for Notes / Meta Controller / Collapse Scenes / Collapse Messages, then Clip Template dropdown when a cell is selected, then the clip's full parameters) |
+| **Sequence view** (the other tab) | Left: resizable palette column holding the scene list (pills auto‑size to their names) + a per‑scene inspector (name / color / notes / duration / Next follow‑action / ×Multiplicator / Delete). Center: 128‑slot drag‑drop sequence grid with floating drag preview. Bottom: status/transport bar (Play / Pause / Stop, focused scene name, message count) |
 
 Tab toggles Edit ↔ Sequence (suppressed inside text inputs).
+
+**Ctrl+wheel** zooms the whole app (except the main toolbar). **Left‑click** on either Collapse toggle flips just that axis; **right‑click** on either flips both (full compact mode).
 
 ---
 
@@ -75,27 +83,31 @@ Tab toggles Edit ↔ Sequence (suppressed inside text inputs).
 
 A Message is a row in the editor. Each Message can hold optional defaults — a default destination (`IP:port`) and default OSC address — used by the **"Send to clips"** button on its row, which propagates those defaults to every existing clip on that Message. Empty Message defaults are skipped, so you can propagate just a port, just an address, etc.
 
-Add a Message with the **`+`** button in the sidebar header or with **Ctrl + T**.
+Add a Message with the **`+ Message`** button in the "Buttons box" (top‑left of the Edit view) or with **Ctrl + T**. Click a message to select it; **Shift‑click** another to select the range between them. **Right‑click** a message row (or selection) to delete — bulk delete is supported.
 
 ### Scenes (columns)
 
 A Scene is a column. It has:
 
-- A **name** (editable), **color** (color picker), and **notes** (italic text under the name; resize the notes height by dragging the strip at the bottom of any scene header — affects every scene at once for alignment).
-- A **Duration** (0.5 – 300 s) and a **Next Mode**:
-  - `Off` — duration ends → scene trigger reverts visually; clips keep modulating until you stop them or trigger another scene.
-  - `Next` — at duration end, the next non‑empty slot in the Sequence advances.
-  - `Random` — at duration end, a different non‑empty slot is picked at random.
-- A **MIDI Learn** chip — click "MIDI Learn", play a note/CC, the binding is captured. Click the chip's ✕ to clear; click "MIDI Learn" while waiting to cancel.
+- A **name** (editable), **color** (color picker), and **notes** (italic text under the name; toggle visibility globally via the **Notes** button at the top of the Inspector, and drag the strip at the bottom of any scene header to resize notes across all scenes).
+- A **Duration** (0.5 – 300 s) and a **Next** follow‑action (Ableton‑style):
+  - `Stop` — at duration end, cells keep modulating but the scene loses its active flag once they settle.
+  - `Loop` — re‑trigger the same scene indefinitely.
+  - `Next` / `Previous` — walk the sequence grid (wraps).
+  - `First` / `Last` — jump to the first / last non‑empty slot in the sequence.
+  - `Any` — random pick from every sequenced scene (including self).
+  - `Other` — random pick from every sequenced scene except self.
+- A **×Multiplicator** (Sequence‑tab inspector only) — how many times the scene plays before the follow action fires. `Stop × 3` plays three times then stops; `Next × 2` plays twice then advances. Default 1.
+- A **MIDI Learn** chip — click "MIDI Learn", play a note/CC, the binding is captured. Click the chip's ✕ to clear.
 - A **trigger button** (top of column) that **fills clockwise over the scene Duration** to give you a visual countdown.
 
-Add a Scene with **+ Scene** at the right of the editor or with **Alt + S**.
+Add a Scene with the **`+ Scene`** button in the "Buttons box" or with **Alt + S**. Click a scene to focus it; **Shift‑click** another to select the range. **Right‑click** a scene header (or selection) to delete — bulk delete is supported. **Delete** key in Sequence view also deletes the focused scene.
 
 ### Clips (cells)
 
 Each clip carries the full per‑scene settings for one Message. Open a clip in the Inspector by clicking its tile. Parameters:
 
-- **Destination** — IP and port. **`~def~`** chip means it's linked to the session default; click **Default** to relink it. Editing the field unlinks.
+- **Destination** — IP and port. **`~def~`** chip means it's linked to the session default; click **Default** to relink it. Editing the field unlinks. **Changing the session default no longer overwrites existing linked clips** — all currently‑linked clips freeze at the old default at the moment of change, so "edit default OSC" only affects clips created after it.
 - **OSC Address** — the path (e.g. `/patate/knobs`). Same `~def~` / Default behavior.
 - **Value** — typed in raw; auto‑detected at send time:
   - `true` / `false` → OSC bool (`T` / `F`)
@@ -145,17 +157,45 @@ Each clip carries the full per‑scene settings for one Message. Open a clip in 
 - **Live value text in orange** in the cell tile — currently being modulated/sequenced; falls back to the static `value` when stopped.
 - **Per‑step pulse** in the Inspector — flashes the current step at the sequencer rate.
 
-### Templates
+### Templates & bulk clip actions
 
-Right‑click an empty cell to pick from saved Clip Templates ("Empty" creates a default clip). With a clip selected, the **Template** dropdown at the top of the right panel lets you apply existing templates or **Save** the current clip as a new template (a modal asks for a name).
+- **Right‑click an empty cell** → pick from saved Clip Templates ("Empty" creates a default clip).
+- **With a clip selected**, the **Template** dropdown at the top of the Inspector lets you apply existing templates or **Save** the current clip as a new template (a modal asks for a name).
+- **Ctrl‑click clips** to build a disjoint multi‑selection across any scene/message combination. **Right‑click any selected clip** to open a menu that operates on every selected clip at once:
+  - **Apply template** → bulk‑apply a saved template.
+  - **Use Default OSC** → overwrite OSC address + destination on every selected clip with the session's current defaults (and re‑link them, so a future default change will freeze them at the new value).
 
 Templates are stored in **localStorage** under `dataflou:clipTemplates:v1`, so they survive app restarts (per‑install — dev mode and the packaged build keep separate stores).
 
+### Meta Controller
+
+A global bank of 8 circular knobs, toggled from the Inspector's top **Meta Controller** button. Lives as a resizable strip immediately below the main toolbar.
+
+Per‑knob parameters:
+
+- **Name** — free text.
+- **Min / Max** — output range, any float, positive or negative.
+- **Smooth (ms)** — when a new target arrives (drag or MIDI), the knob tweens from its current visible position toward the target over this many milliseconds at ~60 Hz, firing OSC on every frame. Smooths MIDI CC stair‑stepping into a continuous ramp. 0 = instant.
+- **Curve** — one of 14 shapes applied to the normalized position before mapping into [min, max]:
+  - `Linear` — straight line.
+  - `Log` / `Exp` — fast‑then‑slow / slow‑then‑fast.
+  - `Geom` — true log‑space interpolation (constant ratio; use for frequency 20→20000 Hz or amplitude 0.01→1).
+  - `Ease‑in (t²)` / `Ease‑out` / `Cubic (t³)` / `Square root` — polynomial curves.
+  - `Sigmoid (S)` / `Smoothstep` — S‑curves (logistic vs. Hermite).
+  - `dB taper (audio)` — 60 dB perceived‑linear volume.
+  - `Gamma 2.2 (brightness)` — perceived‑linear brightness.
+  - `Step` — snap to 8 discrete levels.
+  - `Invert` — flips the range.
+- **MIDI** — assign a CC via global MIDI Learn or the knob's own Learn flow. While bound, incoming CC (0..127) drives the knob position; outgoing OSC follows the same smoothing path the UI shows.
+- **Destinations** — up to 8 OSC destinations (IP + port + address), each with a mute checkbox. One knob move blasts to every enabled destination simultaneously.
+- **Dragging** — click + drag vertically; **Shift** = fine (×4 slower); **double‑click** = reset to 0. Cursor disappears during drag (Ableton‑style).
+
 ### Sequence view
 
-A 1 – 128 slot grid (configurable via the **Scene steps** input at the top) for laying out scenes in playback order.
+A 1 – 128 slot grid (configurable via the **Scene steps** input at the top) for laying out scenes in playback order. Left column is user‑resizable (drag its right edge).
 
-- **Drag a scene** from the left palette into a slot.
+- **Scene palette** (top of the left column) — each scene as a pill that auto‑sizes to its own name. Click to focus, Shift‑click to range‑select, drag to drop into a grid slot (with a floating drag preview following the cursor).
+- **Scene inspector** (bottom of the left column, appears when a scene is focused) — edit name / color / notes / Duration / Next follow‑action / **×Multiplicator**, or Delete.
 - **Drag slots** to swap their contents.
 - **Click "Clear mode"** then click slots to empty them.
 - **Click a filled slot** (outside Clear mode) to focus that scene.
@@ -165,8 +205,11 @@ A 1 – 128 slot grid (configurable via the **Scene steps** input at the top) fo
 
 Uses the browser's **Web MIDI API** so no native module is needed — Electron's renderer talks to your interface directly. Pick your controller from the **MIDI** dropdown in the toolbar.
 
-- **Note On (velocity > 0)** and **CC (value > 0)** trigger bindings.
-- **MIDI Learn**: click the Learn button on a scene or message row, play a note/CC. Click "cancel" while waiting to back out.
+- **Note On (velocity > 0)** fires scene / clip trigger bindings.
+- **CC** (any value including 0) drives **Meta Controller knobs** continuously. CC > 0 also fires scene / clip trigger bindings.
+- **Global MIDI Learn** (button in the main toolbar): click it, then click any scene trigger, clip trigger, or Meta knob — the next MIDI message you send binds it. Stays in learn mode so you can chain several bindings; click the button again to exit.
+- **Per‑knob Learn** — each Meta knob also has its own Learn button in the details panel for one‑shot binding without using global learn mode.
+- Knob CC values are routed through the smoother, so the OSC ramp you hear matches the dial position on screen even when the controller is emitting chunky CC steps.
 - Clip triggers fire **the cell for that message in the focused scene**. Click a scene column to focus it.
 
 ### Transport (top right)
@@ -177,18 +220,28 @@ Uses the browser's **Web MIDI API** so no native module is needed — Electron's
 
 ### Themes
 
-10 built‑in themes (selector lives at the bottom of the Sequence view's left palette):
+15 built‑in themes (picker lives in the preferences sub‑toolbar — click the **dataFLOU** brand button at the top‑left to reveal it). Each theme sets colors + radius + typography. Fonts are bundled as woff2 (`Inter`, `Roboto`, `Work Sans`, `IBM Plex Sans`) so everything works offline.
 
-- **Dark** — default; charcoal grey + warm orange, Ableton‑ish.
-- **Light** — bright but high contrast (no washed‑out white).
+**New in 0.3.0** (listed first in the picker):
+
+- **Studio Dark** — canonical DAW dark. `#1E1E1E` bg, `#2A2A2A` panels, inset inputs (`#151515` — darker than the panel), warm orange `#FF8E0F`, Inter with `ss01` + `cv11` tuning for an Ableton‑Sans‑ish feel. **Default**.
+- **Warm Charcoal** — same DNA as Studio Dark, warmer neutrals, Inter.
+- **Graphite** — cool flat dark, Bitwig‑ish, Roboto.
+- **Cream** — warm paper light, burnt‑orange accent, IBM Plex Sans.
+- **Paper Light** — cool grey canvas with pure‑white panels, light‑grey inset inputs, Figma blue, Work Sans.
+
+**Original themes** (kept intact):
+
+- **Dark** — charcoal grey + warm orange.
+- **Light** — bright but high contrast.
 - **Pastel** — dusty rose + lavender, Quicksand/Nunito font.
-- **Reaper Classic** — `#1e1e1e` charcoal + Reaper blue accent.
+- **Classic** — `#1e1e1e` charcoal + blue accent.
 - **Smooth** — low‑contrast warm greys.
 - **Hydra** — desaturated blue‑grey + cyan accent.
 - **DarkSide** — near‑black + hot red‑orange.
 - **Solaris** — deep blue + sky accent.
-- **Flame** — FL‑Studio‑inspired, dark grey + signature FL orange.
-- **Analog** — X‑Raym‑style warm browns + cream + Georgia serif.
+- **Flame** — dark grey + hot orange.
+- **Analog** — warm browns + cream + Georgia serif.
 
 Selection is per‑install (UI preference, not saved with sessions).
 
@@ -217,9 +270,19 @@ The Save button **flashes blue** on a successful write.
 | **Tab** | Toggle Edit ↔ Sequence (suppressed inside text fields) |
 | **Ctrl + T** *(Cmd + T on macOS)* | Add a Message |
 | **Alt + S** | Add a Scene |
-| **Esc** | Close any open modal / cancel MIDI Learn |
+| **Delete** | In Sequence view, delete the focused scene |
+| **Esc** | Close any open modal / cancel MIDI Learn / close context menu |
+| **Ctrl + wheel** | Zoom the whole app (except the main toolbar), 0.5×–2× |
 | **Ctrl + drag** *(Cmd + drag on macOS)* a clip onto an empty cell | Duplicate that clip |
-| **Right‑click** an empty cell | Open the Clip Template menu |
+| **Ctrl + click** a clip | Add / remove it from the disjoint multi‑selection |
+| **Shift + click** a scene or message | Extend range selection from the anchor |
+| **Right‑click** an empty cell | Open the Clip Template picker |
+| **Right‑click** a filled clip (or multi‑selection) | Apply template / Use Default OSC menu |
+| **Right‑click** a scene header | Delete scene menu (bulk if multi‑selected) |
+| **Right‑click** a message row | Delete message menu (bulk if multi‑selected) |
+| **Right‑click** a Collapse toggle | Flip BOTH Collapse Scenes + Collapse Messages together |
+| **Shift + drag** a knob | Fine adjustment (×4 slower) |
+| **Double‑click** a knob | Reset to 0 |
 
 ---
 
@@ -236,17 +299,38 @@ src/
 ├── preload/      # window.api bridge
 ├── shared/       # types & factories used by main and renderer
 └── renderer/
-    ├── components/  # React UI
-    ├── store.ts     # Zustand global state
-    ├── midi.ts      # Web MIDI manager
-    └── styles.css   # Tailwind + theme CSS variables
+    ├── components/    # React UI (CellTile, Inspector, MetaKnob, MetaControllerBar, …)
+    ├── fonts/         # bundled woff2 for themes (Inter, Roboto, Work Sans, IBM Plex Sans)
+    ├── store.ts       # Zustand global state (session + ephemeral UI state)
+    ├── metaSmooth.ts  # renderer-side knob-value tweener (rAF-driven, fires OSC)
+    ├── midi.ts        # Web MIDI manager
+    └── styles.css     # Tailwind + theme CSS variables + @font-face declarations
 ```
 
 ---
 
+## Release notes — 0.3.0
+
+Big UI + features pass.
+
+- **Meta Controller** bank — 8 knobs, 14 curves, per‑knob smoothing, MIDI CC learn, up to 8 OSC destinations per knob.
+- **Ableton‑style follow actions** (Stop / Loop / Next / Previous / First / Last / Any / Other) + per‑scene **×Multiplicator**.
+- **Multi‑select** everywhere — Shift‑click for scene / message range, Ctrl‑click for disjoint clip selection; right‑click bulk‑deletes or bulk‑actions (template apply, default‑OSC reset).
+- **Default OSC bug fix** — editing the session default no longer rewrites every existing linked clip. Existing clips freeze at their previous address; only new clips get the new default.
+- **Clip right‑click menu** with `Apply template` + `Use Default OSC`.
+- **5 new themes** (Studio Dark, Warm Charcoal, Graphite, Cream, Paper Light) with bundled Inter / Roboto / Work Sans / IBM Plex Sans fonts.
+- **Theme picker** moved to a preferences sub‑toolbar behind the **dataFLOU** brand button.
+- **Collapse Scenes / Messages** — independent by default, right‑click either to flip both together. Collapsed scene columns now auto‑size to their content (each scene as wide as its own name).
+- **UI zoom** — Ctrl+wheel (persisted 0.5×–2×).
+- **Scene inspector in Sequence view** — per‑scene edit panel under the palette, resizable column, draggable drag preview.
+- **Notes** — toggle globally via the Inspector's Notes button; hidden by default, one line when enabled, drag to grow.
+- **Number inputs cleared** — every bounded number input (Min / Max / Smooth / Delay / Transition / sequencer steps / BPM / stepMs / durations) uses the `BoundedNumberInput` pattern so you can fully delete the value and re‑type it.
+- **Cursor hides during knob drag** (Ableton style).
+- **Session migration hardened** — MIDI bindings are shape‑validated, tracks get proper defaults, old `nextMode` values auto‑translate (`off` → `stop`, `random` → `any`), and clip‑template application merges over a fresh baseline so older templates with missing fields no longer crash the renderer.
+
 ## Project status
 
-This is a v1 personal tool by [Vincent Fillion](https://vincentfillion.com). It runs end‑to‑end and is daily‑driver usable, but a few things are intentionally out of scope for now:
+This is a personal tool by [Vincent Fillion](https://vincentfillion.com). It runs end‑to‑end and is daily‑driver usable, but a few things are intentionally out of scope for now:
 
 - No undo / redo
 - No MIDI output (MIDI is input‑only for triggering)

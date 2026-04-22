@@ -1,7 +1,26 @@
 import { useEffect, useRef, useState } from 'react'
-import { useStore } from '../store'
+import { useStore, type ThemeName } from '../store'
 import { midi, type MidiDevice } from '../midi'
 import { BoundedNumberInput } from './BoundedNumberInput'
+
+// Theme picker options. Order = order shown in the dropdown. New themes first.
+const THEMES: { id: ThemeName; label: string }[] = [
+  { id: 'studio-dark', label: 'Studio Dark' },
+  { id: 'warm-charcoal', label: 'Warm Charcoal' },
+  { id: 'graphite', label: 'Graphite' },
+  { id: 'cream', label: 'Cream' },
+  { id: 'paper-light', label: 'Paper Light' },
+  { id: 'dark', label: 'Dark' },
+  { id: 'light', label: 'Light' },
+  { id: 'pastel', label: 'Pastel' },
+  { id: 'reaper', label: 'Classic' },
+  { id: 'smooth', label: 'Smooth' },
+  { id: 'hydra', label: 'Hydra' },
+  { id: 'darkside', label: 'DarkSide' },
+  { id: 'solaris', label: 'Solaris' },
+  { id: 'flame', label: 'Flame' },
+  { id: 'analog', label: 'Analog' }
+]
 
 export default function TopBar(): JSX.Element {
   const session = useStore((s) => s.session)
@@ -18,6 +37,12 @@ export default function TopBar(): JSX.Element {
   const setGlobalBpm = useStore((s) => s.setGlobalBpm)
 
   const [midiDevices, setMidiDevices] = useState<MidiDevice[]>([])
+  // Click-to-toggle preferences sub-toolbar (lives under the main toolbar and
+  // currently houses the theme picker). Triggered by clicking the dataFLOU
+  // brand label at the top-left.
+  const [prefsOpen, setPrefsOpen] = useState(false)
+  const theme = useStore((s) => s.theme)
+  const setTheme = useStore((s) => s.setTheme)
 
   useEffect(() => {
     setMidiDevices(midi.listDevices())
@@ -64,9 +89,17 @@ export default function TopBar(): JSX.Element {
 
 
   return (
-    <div className="flex items-center gap-2 px-2 py-2 bg-panel border-b border-border">
+    <>
+    <div className={`flex items-center gap-2 px-2 py-2 bg-panel ${prefsOpen ? '' : 'border-b border-border'}`}>
       <div className="flex items-center gap-1.5">
-        <div className="text-accent font-semibold tracking-tight">dataFLOU</div>
+        <button
+          className={`text-accent font-semibold tracking-tight px-1 rounded-sm hover:bg-panel2 transition-colors ${prefsOpen ? 'bg-panel2' : ''}`}
+          onClick={() => setPrefsOpen((v) => !v)}
+          title={prefsOpen ? 'Hide preferences' : 'Show preferences'}
+          aria-expanded={prefsOpen}
+        >
+          dataFLOU
+        </button>
         <input
           className="input w-32"
           value={session.name}
@@ -140,7 +173,7 @@ export default function TopBar(): JSX.Element {
       <div className="flex items-center gap-1.5">
         <span className="label">MIDI</span>
         <select
-          className="input w-44"
+          className="input w-32"
           value={session.midiInputName ?? ''}
           onChange={(e) => onMidiChange(e.target.value || null)}
         >
@@ -157,7 +190,7 @@ export default function TopBar(): JSX.Element {
       <div className="flex-1" />
 
       <button
-        className="btn"
+        className="btn min-w-[76px]"
         onClick={() => setView(view === 'edit' ? 'sequence' : 'edit')}
         title={`Go to ${view === 'edit' ? 'Sequence' : 'Edit'} view`}
       >
@@ -191,6 +224,41 @@ export default function TopBar(): JSX.Element {
         Panic
       </button>
     </div>
+
+    {/* Preferences sub-toolbar — toggled by clicking the dataFLOU brand
+        label. Sits immediately below the main toolbar and pushes the rest
+        of the app down (normal flex-column flow in App.tsx). */}
+    {prefsOpen && (
+      <div className="flex items-center gap-2 px-2 py-2 bg-panel border-b border-border">
+        <span className="label shrink-0 ml-1">Theme</span>
+        <select
+          className="input w-44"
+          value={theme}
+          onChange={(e) => {
+            setTheme(e.target.value as ThemeName)
+            // Release focus so global Tab-toggles-view fires on next press
+            // instead of being intercepted by the <select>'s native focus.
+            e.target.blur()
+          }}
+        >
+          {THEMES.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.label}
+            </option>
+          ))}
+        </select>
+
+        <span className="flex-1" />
+        <button
+          className="btn"
+          onClick={() => setPrefsOpen(false)}
+          title="Close preferences"
+        >
+          Close
+        </button>
+      </div>
+    )}
+    </>
   )
 }
 

@@ -21,6 +21,14 @@ export default function CellTile({
   const selected = useStore(
     (s) => s.selectedCell?.sceneId === sceneId && s.selectedCell?.trackId === trackId
   )
+  // Disjoint multi-selection (Ctrl+click). A cell is "in multi" if it's in
+  // the `selectedCells` list. When the list is empty we fall back to the
+  // single-anchor highlight above.
+  const inMulti = useStore((s) =>
+    s.selectedCells.some((r) => r.sceneId === sceneId && r.trackId === trackId)
+  )
+  const toggleCellSelection = useStore((s) => s.toggleCellSelection)
+  const applyDefaultOscToCells = useStore((s) => s.applyDefaultOscToCells)
   const isPlaying = useStore((s) => !!s.engine.activeBySceneAndTrack[sceneId]?.[trackId])
   const currentStep = useStore(
     (s) => s.engine.seqStepBySceneAndTrack[sceneId]?.[trackId]
@@ -34,6 +42,61 @@ export default function CellTile({
   const setMidiLearnTarget = useStore((s) => s.setMidiLearnTarget)
   const globalBpm = useStore((s) => s.session.globalBpm)
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+  // Separate context menu for FILLED cells (the `menu` state above is for
+  // the empty-cell + clip picker). Targets either this single cell or the
+  // multi-selection set.
+  const [filledMenu, setFilledMenu] = useState<
+    { x: number; y: number; targets: { sceneId: string; trackId: string }[] } | null
+  >(null)
+  useEffect(() => {
+    if (!filledMenu) return
+    const close = (): void => setFilledMenu(null)
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setFilledMenu(null)
+    }
+    window.addEventListener('mousedown', close)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [filledMenu])
+
+  // Plain click on a filled clip: single-select. Ctrl+click: toggle this
+  // cell in the disjoint multi-selection. Keeps right-click's "act on
+  // everything that's selected" semantics straightforward.
+  function onClickCell(e: React.MouseEvent): void {
+    if (e.ctrlKey || e.metaKey) {
+      toggleCellSelection(sceneId, trackId)
+    } else {
+      selectCell(sceneId, trackId)
+    }
+  }
+
+  // Right-click on a filled clip opens a context menu with Apply Template
+  // + Use Default OSC. If the clicked cell is already part of a multi-
+  // selection (ctrl-click set), the menu targets the whole set. Otherwise
+  // it targets just this cell and replaces the current selection so the
+  // user's intent is unambiguous.
+  function onContextMenuCell(e: React.MouseEvent): void {
+    const tag = (e.target as HTMLElement | null)?.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+    e.preventDefault()
+    e.stopPropagation()
+    const here = { sceneId, trackId }
+    let targets: { sceneId: string; trackId: string }[]
+    const st = useStore.getState()
+    const inSel = st.selectedCells.some(
+      (r) => r.sceneId === sceneId && r.trackId === trackId
+    )
+    if (inSel && st.selectedCells.length > 1) {
+      targets = st.selectedCells
+    } else {
+      targets = [here]
+      if (!inSel) selectCell(sceneId, trackId)
+    }
+    setFilledMenu({ x: e.clientX, y: e.clientY, targets })
+  }
   // Replay the blink keyframe on every step change by toggling the class.
   const pulseRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -201,17 +264,24 @@ export default function CellTile({
     </button>
   )
 
+  // Scene color piped as a CSS custom property so theme CSS can paint a
+  // per-theme top bar / rail using it.
+  const sceneColorStyle = { ['--scene-color' as string]: scene?.color ?? 'transparent' } as React.CSSProperties
+
   // Compact (Tracks Collapsed) layout: trigger + OSC address + value, one line.
   if (compact) {
     return (
+      <>
       <div
         className={`relative h-full flex items-center gap-1.5 px-1.5 cursor-pointer ${
-          selected ? 'bg-panel2 border-l-2 border-l-accent2' : 'hover:bg-panel3/30'
+          inMulti || selected ? 'bg-panel2 border-l-2 border-l-accent2' : 'hover:bg-panel3/30'
         }`}
         draggable
         onDragStart={onDragStart}
-        onClick={() => selectCell(sceneId, trackId)}
-        title="Ctrl+drag to duplicate to an empty cell"
+        onClick={onClickCell}
+        onContextMenu={onContextMenuCell}
+        title="Ctrl+click to multi-select · Ctrl+drag to duplicate to empty cell · Right-click for actions"
+        style={sceneColorStyle}
       >
         <div
           ref={pulseRef}
@@ -219,6 +289,7 @@ export default function CellTile({
           className="absolute inset-0 pointer-events-none"
           style={{ animationDuration: seqOn && isPlaying ? pulseDurationMs(cell, globalBpm) : undefined }}
         />
+        <div className="clip-top-bar" aria-hidden />
         {triggerBtn}
         <span className="text-[10px] text-muted truncate flex-1 min-w-0">
           {cell.oscAddress}
@@ -231,18 +302,39 @@ export default function CellTile({
           {isPlaying && liveValue !== undefined ? liveValue : cell.value}
         </span>
       </div>
+      {filledMenu && (
+        <FilledCellMenu
+          x={filledMenu.x}
+          y={filledMenu.y}
+          targets={filledMenu.targets}
+          templates={templates}
+          onApplyTemplate={(id) => {
+            filledMenu.targets.forEach((r) => applyClipTemplate(r.sceneId, r.trackId, id))
+            setFilledMenu(null)
+          }}
+          onUseDefaultOsc={() => {
+            applyDefaultOscToCells(filledMenu.targets)
+            setFilledMenu(null)
+          }}
+          onClose={() => setFilledMenu(null)}
+        />
+      )}
+      </>
     )
   }
 
   return (
+    <>
     <div
       className={`relative h-full flex flex-col px-1.5 py-1 cursor-pointer ${
-        selected ? 'bg-panel2 border-l-2 border-l-accent2' : 'hover:bg-panel3/30'
+        inMulti || selected ? 'bg-panel2 border-l-2 border-l-accent2' : 'hover:bg-panel3/30'
       }`}
       draggable
       onDragStart={onDragStart}
-      onClick={() => selectCell(sceneId, trackId)}
-      title="Ctrl+drag to duplicate to an empty cell"
+      onClick={onClickCell}
+      onContextMenu={onContextMenuCell}
+      title="Ctrl+click to multi-select · Ctrl+drag to duplicate to empty cell · Right-click for actions"
+      style={sceneColorStyle}
     >
       <div
         ref={pulseRef}
@@ -250,6 +342,7 @@ export default function CellTile({
         className="absolute inset-0 pointer-events-none"
         style={{ animationDuration: seqOn && isPlaying ? pulseDurationMs(cell, globalBpm) : undefined }}
       />
+      <div className="clip-top-bar" aria-hidden />
       <div className="flex items-center gap-1.5">
         {triggerBtn}
         <span className="text-[10px] text-muted truncate flex-1">
@@ -303,6 +396,24 @@ export default function CellTile({
         {cell.transitionMs > 0 && <span>~{cell.transitionMs}ms</span>}
       </div>
     </div>
+    {filledMenu && (
+      <FilledCellMenu
+        x={filledMenu.x}
+        y={filledMenu.y}
+        targets={filledMenu.targets}
+        templates={templates}
+        onApplyTemplate={(id) => {
+          filledMenu.targets.forEach((r) => applyClipTemplate(r.sceneId, r.trackId, id))
+          setFilledMenu(null)
+        }}
+        onUseDefaultOsc={() => {
+          applyDefaultOscToCells(filledMenu.targets)
+          setFilledMenu(null)
+        }}
+        onClose={() => setFilledMenu(null)}
+      />
+    )}
+    </>
   )
 }
 
@@ -383,4 +494,78 @@ function pulseDurationMs(
         : Math.max(1, cell.sequencer.stepMs)
   // Cap blink animation to the step length but clamp so it's visible.
   return `${Math.min(600, Math.max(120, ms))}ms`
+}
+
+// Right-click context menu for FILLED clips. Actions apply to every ref
+// in `targets` — that's either just the clicked clip OR the whole current
+// multi-selection (see CellTile.onContextMenuCell for the resolution).
+function FilledCellMenu({
+  x,
+  y,
+  targets,
+  templates,
+  onApplyTemplate,
+  onUseDefaultOsc,
+  onClose
+}: {
+  x: number
+  y: number
+  targets: { sceneId: string; trackId: string }[]
+  templates: { id: string; name: string }[]
+  onApplyTemplate: (id: string) => void
+  onUseDefaultOsc: () => void
+  onClose: () => void
+}): JSX.Element {
+  useEffect(() => {
+    const onDoc = (): void => onClose()
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [onClose])
+  const plural = targets.length > 1
+  return createPortal(
+    <div
+      className="fixed z-50 bg-panel border border-border rounded shadow-lg py-1 text-[12px] min-w-[200px]"
+      style={{ left: x, top: y }}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      <div className="px-3 py-0.5 text-[10px] text-muted">
+        {plural ? `${targets.length} clips selected` : 'Clip'}
+      </div>
+      <div className="border-t border-border my-1" />
+      {templates.length > 0 ? (
+        <>
+          <div className="px-3 py-0.5 text-[10px] text-muted">Apply template</div>
+          {templates.map((t) => (
+            <button
+              key={t.id}
+              className="w-full text-left px-3 py-1 hover:bg-panel2"
+              onClick={() => onApplyTemplate(t.id)}
+            >
+              {t.name}
+            </button>
+          ))}
+          <div className="border-t border-border my-1" />
+        </>
+      ) : (
+        <div className="px-3 py-1 text-[10px] text-muted italic">
+          No saved templates yet
+        </div>
+      )}
+      <button
+        className="w-full text-left px-3 py-1 hover:bg-panel2"
+        onClick={onUseDefaultOsc}
+        title="Overwrite OSC address + destination on every selected clip with the session's current defaults"
+      >
+        Use Default OSC
+      </button>
+    </div>,
+    document.body
+  )
 }

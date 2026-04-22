@@ -9,6 +9,7 @@
 
 import type { MidiBinding } from '@shared/types'
 import { useStore } from './store'
+import { setKnobTarget } from './metaSmooth'
 
 export interface MidiDevice {
   id: string
@@ -89,14 +90,20 @@ class MidiManager {
 
   private onMessage(e: MIDIMessageEvent): void {
     const data = e.data
-    if (!data || data.length < 2) return
+    if (!data || data.length < 3) return
     const status = data[0] & 0xf0
     const channel = data[0] & 0x0f
+    const number = data[1]
+    const value = data[2] ?? 0
     let binding: MidiBinding | null = null
-    if (status === 0x90 && (data[2] ?? 0) > 0) {
-      binding = { kind: 'note', channel, number: data[1] }
-    } else if (status === 0xb0 && (data[2] ?? 0) > 0) {
-      binding = { kind: 'cc', channel, number: data[1] }
+    // Build a binding from any Note-On or CC message. We do NOT filter out
+    // CC value 0 here — knobs need the full 0..127 range (CC0 = knob fully
+    // down). Trigger routing below still only acts on value > 0 so a
+    // controller button's release edge doesn't double-fire scenes/cells.
+    if (status === 0x90 && value > 0) {
+      binding = { kind: 'note', channel, number }
+    } else if (status === 0xb0) {
+      binding = { kind: 'cc', channel, number }
     }
     if (!binding) return
 
@@ -116,8 +123,13 @@ class MidiManager {
       const target = st.midiLearnTarget
       if (target.kind === 'scene') {
         st.setSceneMidi(target.id, binding)
-      } else {
+      } else if (target.kind === 'cell') {
         st.updateCell(target.sceneId, target.trackId, { midiTrigger: binding })
+      } else if (target.kind === 'metaKnob') {
+        // Knobs are CC-only in practice. If someone hits a note while a knob
+        // is the learn target we ignore it so they can keep trying.
+        if (binding.kind !== 'cc') return
+        st.setMetaKnobMidi(target.index, binding)
       }
       st.setMidiLearnTarget(null)
       return
@@ -128,6 +140,32 @@ class MidiManager {
 
     // Normal mode — match against bindings in current session.
     const session = st.session
+
+    // Meta Controller knobs — check FIRST so knob CCs don't also match a
+    // scene/cell bound to the same CC number (knob routing is continuous;
+    // trigger routing would be wrong here). Only CC messages match knobs.
+    //
+    // Routing goes through the renderer-side smoother: commit the new target
+    // to the session so it persists (and the knob's logical `value` stays
+    // in sync), then call setKnobTarget which tweens the display + fires
+    // OSC at each frame. The dial you see on screen is the same value the
+    // engine is sending — smoothing is visible everywhere.
+    if (binding.kind === 'cc') {
+      const knobs = session.metaController.knobs
+      for (let i = 0; i < knobs.length; i++) {
+        if (matches(knobs[i].midiCc, binding)) {
+          const normalized = value / 127
+          st.setMetaKnobValueFromMidi(i, normalized)
+          setKnobTarget(i, normalized, knobs[i].smoothMs)
+          return
+        }
+      }
+    }
+
+    // Triggers (scenes/cells) only fire on value > 0 so a CC's release edge
+    // (or zero-velocity note-off smuggled through) doesn't double-fire.
+    if (value <= 0) return
+
     // Cell triggers first (per-clip binding).
     for (const sc of session.scenes) {
       for (const [trackId, cell] of Object.entries(sc.cells)) {
@@ -151,7 +189,8 @@ class MidiManager {
       }
     }
     // (Message rows are NOT routable via MIDI — per the app spec, only scene
-    // triggers and individual clip triggers are MIDI-bindable.)
+    // triggers, individual clip triggers, and Meta Controller knobs are
+    // MIDI-bindable.)
   }
 }
 

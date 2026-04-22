@@ -2,9 +2,131 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ======== Fonts ========
+   Bundled as woff2 + loaded via @font-face so Electron's file:// renderer
+   works without hitting any CDN. Vite fingerprints these at build time. */
+@font-face { font-family: 'Inter'; font-weight: 400; font-style: normal; font-display: swap; src: url('./fonts/inter-400.woff2') format('woff2'); }
+@font-face { font-family: 'Inter'; font-weight: 500; font-style: normal; font-display: swap; src: url('./fonts/inter-500.woff2') format('woff2'); }
+@font-face { font-family: 'Inter'; font-weight: 600; font-style: normal; font-display: swap; src: url('./fonts/inter-600.woff2') format('woff2'); }
+@font-face { font-family: 'Inter'; font-weight: 700; font-style: normal; font-display: swap; src: url('./fonts/inter-700.woff2') format('woff2'); }
+@font-face { font-family: 'Roboto'; font-weight: 400; font-style: normal; font-display: swap; src: url('./fonts/roboto-400.woff2') format('woff2'); }
+@font-face { font-family: 'Roboto'; font-weight: 500; font-style: normal; font-display: swap; src: url('./fonts/roboto-500.woff2') format('woff2'); }
+@font-face { font-family: 'Roboto'; font-weight: 700; font-style: normal; font-display: swap; src: url('./fonts/roboto-700.woff2') format('woff2'); }
+@font-face { font-family: 'Work Sans'; font-weight: 400; font-style: normal; font-display: swap; src: url('./fonts/worksans-400.woff2') format('woff2'); }
+@font-face { font-family: 'Work Sans'; font-weight: 500; font-style: normal; font-display: swap; src: url('./fonts/worksans-500.woff2') format('woff2'); }
+@font-face { font-family: 'Work Sans'; font-weight: 600; font-style: normal; font-display: swap; src: url('./fonts/worksans-600.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-weight: 400; font-style: normal; font-display: swap; src: url('./fonts/plexsans-400.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-weight: 500; font-style: normal; font-display: swap; src: url('./fonts/plexsans-500.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-weight: 600; font-style: normal; font-display: swap; src: url('./fonts/plexsans-600.woff2') format('woff2'); }
+
 /* ======== Theme palettes ======== */
 /* Colors are held as space-separated RGB triples so Tailwind's rgb(.../<alpha>)
-   machinery can add opacity variants. */
+   machinery can add opacity variants. Themes also expose an optional
+   --input-inset custom-property (box-shadow) for the Live-12-style inset
+   entry-box treatment; themes that don't set it fall back to `none`. */
+
+/* -------- NEW THEMES (first in the picker). ----------
+   Shared DNA: panel > bg contrast, inputs DARKER than their containing panel
+   with a 1px inner rim shadow — they read as a CRT cutout. */
+
+/* Studio Dark — canonical DAW stock dark (Inter, warm orange).
+   :root prefix bumps specificity so these rules beat the `:root, [data-theme='dark']`
+   default further down the file regardless of source order. */
+:root[data-theme='studio-dark'] {
+  --c-bg: 30 30 30;
+  --c-panel: 42 42 42;
+  --c-panel2: 50 50 50;
+  --c-panel3: 74 74 74;
+  --c-border: 17 17 17;
+  --c-accent: 255 142 15;
+  --c-accent2: 0 190 244;
+  --c-muted: 138 138 138;
+  --c-text: 216 216 216;
+  --c-active: 255 164 50;
+  --c-danger: 235 95 95;
+  --c-success: 110 180 120;
+  --c-input-bg: 21 21 21;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --input-inset: inset 0 1px 0 rgb(10 10 10 / 0.95), inset 1px 0 0 rgb(10 10 10 / 0.5);
+}
+
+/* Warm Charcoal — warm take on the studio-dark DNA (Inter). */
+:root[data-theme='warm-charcoal'] {
+  --c-bg: 29 29 29;
+  --c-panel: 42 42 42;
+  --c-panel2: 52 52 52;
+  --c-panel3: 62 62 62;
+  --c-border: 17 17 17;
+  --c-accent: 255 140 66;
+  --c-accent2: 110 163 214;
+  --c-muted: 138 138 138;
+  --c-text: 234 234 234;
+  --c-active: 255 166 96;
+  --c-danger: 224 102 102;
+  --c-success: 110 180 120;
+  --c-input-bg: 20 20 20;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --input-inset: inset 0 1px 0 rgb(8 8 8 / 0.8);
+}
+
+/* Graphite — cool flat dark (Roboto). */
+:root[data-theme='graphite'] {
+  --c-bg: 28 28 28;
+  --c-panel: 38 38 38;
+  --c-panel2: 48 48 48;
+  --c-panel3: 64 64 64;
+  --c-border: 14 14 14;
+  --c-accent: 238 126 17;
+  --c-accent2: 97 196 200;
+  --c-muted: 154 154 154;
+  --c-text: 224 224 224;
+  --c-active: 250 150 50;
+  --c-danger: 229 90 90;
+  --c-success: 110 180 120;
+  --c-input-bg: 18 18 18;
+  --font-app: 'Roboto', 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --input-inset: inset 0 1px 0 rgb(6 6 6 / 0.9);
+}
+
+/* Cream — warm paper light (IBM Plex Sans, burnt orange). */
+:root[data-theme='cream'] {
+  --c-bg: 228 220 206;
+  --c-panel: 245 240 228;
+  --c-panel2: 238 232 218;
+  --c-panel3: 222 214 196;
+  --c-border: 182 170 148;
+  --c-accent: 200 88 36;
+  --c-accent2: 58 130 160;
+  --c-muted: 122 108 88;
+  --c-text: 46 38 28;
+  --c-active: 220 110 50;
+  --c-danger: 180 60 50;
+  --c-success: 110 150 80;
+  --c-input-bg: 232 224 206;
+  --font-app: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  --input-inset: inset 0 1px 2px rgb(0 0 0 / 0.08);
+}
+
+/* Paper Light — cool paper light (Work Sans, blue). */
+:root[data-theme='paper-light'] {
+  --c-bg: 235 236 240;
+  --c-panel: 255 255 255;
+  --c-panel2: 247 248 250;
+  --c-panel3: 232 233 238;
+  --c-border: 199 199 205;
+  --c-accent: 13 153 255;
+  --c-accent2: 255 76 141;
+  --c-muted: 107 107 115;
+  --c-text: 15 15 17;
+  --c-active: 40 170 255;
+  --c-danger: 215 58 58;
+  --c-success: 55 140 85;
+  --c-input-bg: 240 241 245;
+  --font-app: 'Work Sans', ui-sans-serif, system-ui, sans-serif;
+  --input-inset: inset 0 1px 2px rgb(0 0 0 / 0.06);
+}
+
+/* -------- EXISTING THEMES (unchanged) ---------- */
 
 :root,
 [data-theme='dark'] {
@@ -61,7 +183,7 @@
   --font-app: 'Quicksand', 'Nunito', 'Trebuchet MS', sans-serif;
 }
 
-/* Reaper Classic — blue-grey, cool, medium-high contrast. */
+/* Classic — blue-grey, cool, medium-high contrast. */
 [data-theme='reaper'] {
   --c-bg: 30 30 30;
   --c-panel: 43 43 43;
@@ -151,7 +273,7 @@
   --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 
-/* Flame — FL-Studio-ish dark grey with a hot orange. */
+/* Flame — dark grey with a hot orange. */
 [data-theme='flame'] {
   --c-bg: 28 28 28;
   --c-panel: 40 40 40;
@@ -169,7 +291,7 @@
   --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 
-/* Analog — X-Raym-ish warm wood/cream. */
+/* Analog — warm wood/cream. */
 [data-theme='analog'] {
   --c-bg: 58 46 34;
   --c-panel: 74 59 44;
@@ -204,6 +326,12 @@ body {
   color: rgb(var(--c-text));
   -webkit-user-select: none;
   user-select: none;
+  /* Enable Inter's single-storey 'a' (ss01) and cv11 alt glyphs for a more
+     Ableton-Sans-ish feel. Other fonts silently ignore features they don't
+     ship. We deliberately do NOT set letter-spacing here — Inter's intrinsic
+     metrics plus any extra tracking push the top-bar wide enough that the
+     rightmost buttons (Stop All / Panic) clipped off-screen. */
+  font-feature-settings: 'ss01', 'cv11';
 }
 
 input,
@@ -355,6 +483,9 @@ button {
   font-size: 12px;
   color: rgb(var(--c-text));
   outline: none;
+  /* Themes that define --input-inset get a Live-12-style inset shadow;
+     existing themes that don't set it fall back to none (no change). */
+  box-shadow: var(--input-inset, none);
   transition: border-color 120ms;
 }
 .input:hover:not(:disabled):not(:focus) {
@@ -419,6 +550,27 @@ button {
   letter-spacing: 0.04em;
   color: rgb(var(--c-muted));
 }
+
+/* ======== Clip top bar ======== */
+/* A scene-color strip at the top edge of every filled clip. Thickness is
+   per-theme via [data-theme='x'] .clip-top-bar rules below. Default 0 so
+   the bar is invisible on themes that don't opt in (existing 10 themes). */
+.clip-top-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 0;
+  background: var(--scene-color, transparent);
+  pointer-events: none;
+  z-index: 1;
+}
+
+[data-theme='studio-dark']   .clip-top-bar { height: 3px; }
+[data-theme='warm-charcoal'] .clip-top-bar { height: 2px; opacity: 0.85; }
+[data-theme='graphite']      .clip-top-bar { height: 2px; }
+[data-theme='cream']         .clip-top-bar { height: 3px; }
+[data-theme='paper-light']   .clip-top-bar { height: 3px; }
 
 /* ======== MIDI Learn overlays ======== */
 /* Rendered on top of scene triggers and track rows while learn mode is on.
