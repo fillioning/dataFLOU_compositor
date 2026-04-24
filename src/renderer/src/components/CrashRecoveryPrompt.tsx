@@ -10,7 +10,10 @@ import { useStore } from '../store'
 import { Modal } from './Modal'
 
 export default function CrashRecoveryPrompt(): JSX.Element | null {
-  const setSession = useStore((s) => s.setSession)
+  // Route through requestSessionLoad so a broken autosave (a session file
+  // that was mid-write when the previous run crashed) still gets the
+  // integrity-check modal instead of silently loading garbage.
+  const requestSessionLoad = useStore((s) => s.requestSessionLoad)
   const [state, setState] = useState<{
     visible: boolean
     entries: AutosaveEntry[]
@@ -38,7 +41,9 @@ export default function CrashRecoveryPrompt(): JSX.Element | null {
   async function restore(path: string): Promise<void> {
     try {
       const s = await window.api.autosaveLoad(path)
-      setSession(s)
+      // Autosaves load without a currentFilePath — the next Save pops
+      // Save-As so we don't clobber any specific on-disk session file.
+      requestSessionLoad(s, null)
     } catch (e) {
       console.error('[restore] failed', (e as Error).message)
       alert(`Failed to load autosave:\n${(e as Error).message}`)

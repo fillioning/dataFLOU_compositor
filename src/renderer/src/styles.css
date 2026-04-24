@@ -561,6 +561,27 @@ html[data-show-mode='true'] [data-hide-in-show='true'] {
   cursor: not-allowed;
 }
 
+/* Compact native-select style — used where we need the dropdown to fit in
+   a narrow column (e.g. SceneColumn's "Next" follow-action). Strips the
+   platform's native dropdown arrow (which eats ~20 px on Windows and
+   ~24 px on macOS) and replaces it with a small chevron drawn as a
+   background SVG. The extra right-padding (16 px) leaves room for the
+   chevron without cropping the label. */
+.select-compact {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  padding-right: 16px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M1 1l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 5px center;
+  background-size: 8px 5px;
+}
+/* Hide the dropdown arrow that IE / Edge legacy still renders. */
+.select-compact::-ms-expand {
+  display: none;
+}
+
 .chip {
   display: inline-flex;
   align-items: center;

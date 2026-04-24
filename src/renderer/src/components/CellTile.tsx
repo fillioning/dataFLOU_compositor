@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
 import { createPortal } from 'react-dom'
 import { effectiveLfoHz } from '@shared/factory'
+import { DestHealthDot } from './DestHealthDot'
 
 const DRAG_MIME = 'application/x-dataflou-cell'
 
@@ -371,6 +372,7 @@ export default function CellTile({
         />
         <div className="clip-top-bar" aria-hidden />
         {triggerBtn}
+        <DestHealthDot ip={cell.destIp} port={cell.destPort} />
         <span className="text-[10px] text-muted truncate flex-1 min-w-0">
           {cell.oscAddress}
         </span>
@@ -447,12 +449,17 @@ export default function CellTile({
           ✕
         </button>
       </div>
-      {/* Row 2: ip:port — secondary info, smaller, allowed to truncate. */}
+      {/* Row 2: ip:port — secondary info, smaller, allowed to truncate.
+          Health dot appears when this destination has had a send failure
+          in the last 5 s (from main's oscErrors IPC stream). */}
       <div
-        className="text-[10px] text-muted truncate mt-0.5"
+        className="text-[10px] text-muted truncate mt-0.5 flex items-center gap-1"
         title={`${cell.destIp}:${cell.destPort}`}
       >
-        {cell.destIp}:{cell.destPort}
+        <DestHealthDot ip={cell.destIp} port={cell.destPort} />
+        <span className="truncate">
+          {cell.destIp}:{cell.destPort}
+        </span>
       </div>
       <div className="flex-1 flex items-center">
         <span
@@ -487,7 +494,40 @@ export default function CellTile({
             RND {cell.modulation.random.valueType === 'colour' ? 'rgb' : cell.modulation.random.valueType}
           </span>
         )}
-        {seqOn && <span className="text-accent">SEQ{cell.sequencer.steps}</span>}
+        {modOn && cell.modulation.type === 'sh' && (
+          <span className="text-accent2">
+            S&amp;H {cell.modulation.depthPct}%
+          </span>
+        )}
+        {modOn && cell.modulation.type === 'slew' && (
+          <span className="text-accent2">
+            SLEW {cell.modulation.depthPct}%
+          </span>
+        )}
+        {modOn && cell.modulation.type === 'chaos' && (
+          <span
+            className="text-accent2"
+            title={`Logistic map r = ${cell.modulation.chaos.r.toFixed(2)}`}
+          >
+            CHAOS {cell.modulation.depthPct}%
+          </span>
+        )}
+        {seqOn && (
+          <span
+            className="text-accent"
+            title={
+              cell.sequencer.mode === 'euclidean'
+                ? `Euclidean ${cell.sequencer.pulses}/${cell.sequencer.steps}${
+                    cell.sequencer.rotation ? ` +${cell.sequencer.rotation}` : ''
+                  }`
+                : `Sequencer ${cell.sequencer.steps} steps`
+            }
+          >
+            {cell.sequencer.mode === 'euclidean'
+              ? `EUC${cell.sequencer.pulses}/${cell.sequencer.steps}`
+              : `SEQ${cell.sequencer.steps}`}
+          </span>
+        )}
         {cell.delayMs > 0 && (
           <span title="Delay before trigger (ms)">⟲{cell.delayMs}ms</span>
         )}

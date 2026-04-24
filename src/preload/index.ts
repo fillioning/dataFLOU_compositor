@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { EngineState, ExposedApi, OscEvent, Session } from '@shared/types'
+import type {
+  EngineState,
+  ExposedApi,
+  OscErrorEvent,
+  OscEvent,
+  Session
+} from '@shared/types'
 
 const api: ExposedApi = {
   triggerCell: (sceneId, trackId) => ipcRenderer.invoke('engine:triggerCell', sceneId, trackId),
@@ -31,6 +37,12 @@ const api: ExposedApi = {
     const h = (_e: Electron.IpcRendererEvent, batch: OscEvent[]): void => cb(batch)
     ipcRenderer.on('engine:oscEvents', h)
     return () => ipcRenderer.off('engine:oscEvents', h)
+  },
+  onOscErrors: (cb) => {
+    const h = (_e: Electron.IpcRendererEvent, batch: OscErrorEvent[]): void =>
+      cb(batch)
+    ipcRenderer.on('engine:oscErrors', h)
+    return () => ipcRenderer.off('engine:oscErrors', h)
   }
 }
 

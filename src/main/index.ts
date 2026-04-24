@@ -3,17 +3,43 @@
 
 import { app, BrowserWindow, ipcMain, shell, session as electronSession } from 'electron'
 import { join } from 'path'
-import type { EngineState, OscEvent, Session } from '@shared/types'
+import type { EngineState, OscErrorEvent, OscEvent, Session } from '@shared/types'
 import { SceneEngine } from './engine'
 import * as sessionIO from './session'
 import * as autosave from './autosave'
 
 let mainWindow: BrowserWindow | null = null
 const engine = new SceneEngine()
+// Hoisted here (rather than inside whenReady()) so the module-level
+// before-quit / window-all-closed handlers can clear it alongside the
+// rest of the shutdown work. Previously there were TWO before-quit
+// handlers and the one that cleared this timer ran in isolation from
+// the one that stopped the engine + autosave — so shutdown sequencing
+// depended on registration order and ran stopAutosave twice.
+let oscFlushTimer: ReturnType<typeof setInterval> | null = null
 // Whether the previous run exited uncleanly. Detected when the autosave
 // sentinel file still exists at startup; surfaced to the renderer on demand
 // via the `session:crashCheck` IPC so it can offer a "Restore?" prompt.
 let prevRunCrashed = false
+
+/**
+ * Single shutdown path. Safe to call twice (before-quit + window-all-closed
+ * can both fire depending on platform / how the user exited), so every step
+ * is idempotent. The old two-handler arrangement ran autosave.stopAutosave
+ * twice on a normal quit — which wrote the .running sentinel-file unlink
+ * twice and fired a final autosave snapshot twice.
+ */
+let shutdownComplete = false
+function shutdown(): void {
+  if (shutdownComplete) return
+  shutdownComplete = true
+  if (oscFlushTimer) {
+    clearInterval(oscFlushTimer)
+    oscFlushTimer = null
+  }
+  engine.stop()
+  autosave.stopAutosave()
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -69,17 +95,31 @@ app.whenReady().then(async () => {
   // when a burst overflows one flush window; overflow is dropped with a
   // one-off warning per flush to keep the UI responsive.
   let oscBuffer: OscEvent[] = []
+  let oscErrBuffer: OscErrorEvent[] = []
   const OSC_BUFFER_MAX = 2000
   engine.setOnOscSend((e) => {
     if (oscBuffer.length < OSC_BUFFER_MAX) oscBuffer.push(e)
   })
-  const oscFlushTimer = setInterval(() => {
-    if (oscBuffer.length === 0) return
-    const batch = oscBuffer
-    oscBuffer = []
-    mainWindow?.webContents.send('engine:oscEvents', batch)
+  engine.setOnOscError((e) => {
+    // Much lower cap on errors — if something is pathologically wrong
+    // (destination down, UDP socket thrashing) we don't need to flood
+    // the renderer with thousands of identical entries. Rate-limit in
+    // osc.ts already throttles the console log; cap here is a safety
+    // net for the IPC channel.
+    if (oscErrBuffer.length < 256) oscErrBuffer.push(e)
+  })
+  oscFlushTimer = setInterval(() => {
+    if (oscBuffer.length > 0) {
+      const batch = oscBuffer
+      oscBuffer = []
+      mainWindow?.webContents.send('engine:oscEvents', batch)
+    }
+    if (oscErrBuffer.length > 0) {
+      const errBatch = oscErrBuffer
+      oscErrBuffer = []
+      mainWindow?.webContents.send('engine:oscErrors', errBatch)
+    }
   }, 50)
-  app.on('before-quit', () => clearInterval(oscFlushTimer))
 
   // ---------- IPC: Engine ----------
   ipcMain.handle('engine:triggerCell', (_e, sceneId: string, trackId: string) => {
@@ -88,9 +128,12 @@ app.whenReady().then(async () => {
   ipcMain.handle('engine:stopCell', (_e, sceneId: string, trackId: string) => {
     engine.stopCell(sceneId, trackId)
   })
-  ipcMain.handle('engine:triggerScene', (_e, sceneId: string, opts?: { morphMs?: number }) => {
-    engine.triggerScene(sceneId, opts)
-  })
+  ipcMain.handle(
+    'engine:triggerScene',
+    (_e, sceneId: string, opts?: { morphMs?: number; sourceSlotIdx?: number | null }) => {
+      engine.triggerScene(sceneId, opts)
+    }
+  )
   ipcMain.handle('engine:stopScene', (_e, sceneId: string) => {
     engine.stopScene(sceneId)
   })
@@ -131,12 +174,8 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
-  engine.stop()
-  autosave.stopAutosave()
+  shutdown()
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
-  engine.stop()
-  autosave.stopAutosave()
-})
+app.on('before-quit', shutdown)

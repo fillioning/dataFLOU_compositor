@@ -16,11 +16,14 @@ import type {
 import { META_KNOB_COUNT, META_MAX_DESTS } from '@shared/types'
 import {
   DEFAULT_ARPEGGIATOR,
+  DEFAULT_CHAOS,
   DEFAULT_ENVELOPE,
   DEFAULT_MODULATION,
   DEFAULT_RAMP,
   DEFAULT_RANDOM,
   DEFAULT_SEQUENCER,
+  DEFAULT_SH,
+  DEFAULT_SLEW,
   META_DEFAULT_SMOOTH_MS,
   META_MAX_HEIGHT,
   META_MAX_SMOOTH_MS,
@@ -159,6 +162,15 @@ interface UiState {
   // messages (address, ip:port, args) for debugging. Off by default; when
   // closed the monitor component unmounts so no state accumulates.
   oscMonitorOpen: boolean
+  // Integrity-check hand-off. When the user triggers Open or restores
+  // from autosave, the incoming session is scanned; if issues turn up,
+  // we stash it here (session + path + issues) and render the global
+  // IntegrityPrompt modal instead of committing. Null = nothing pending.
+  pendingIntegrityLoad: {
+    session: Session
+    path: string | null
+    issues: import('./hooks/sessionIntegrity').IntegrityIssue[]
+  } | null
   // Live-performance "cue" — the scene primed to fire on the next GO. UI-
   // only (not saved in the session) because arming is a concern of the
   // current run, not of the composition. Re-opening a session the next day
@@ -309,6 +321,14 @@ interface Actions {
   setTracksCollapsed: (v: boolean) => void
   setShowMode: (v: boolean) => void
   setOscMonitorOpen: (v: boolean) => void
+  // Entry point for any code path that wants to load a session (Open
+  // dialog, crash recovery, future: drag-and-drop). Runs the integrity
+  // check synchronously; commits immediately if clean, otherwise stages
+  // the session in `pendingIntegrityLoad` for the modal to resolve.
+  requestSessionLoad: (session: Session, path: string | null) => void
+  // Called by IntegrityPrompt — either commits the staged (possibly
+  // fixed) session or cancels.
+  resolveIntegrityLoad: (commit: Session | null) => void
   // Arm a scene for the next GO. Pass null to clear.
   setArmedSceneId: (id: string | null) => void
   setAutoAdvanceArm: (v: boolean) => void
@@ -323,7 +343,10 @@ interface Actions {
   // resolution. Every scene-firing call site (Space, 1-0 keys, GO button,
   // scene-column play button, palette play, MIDI-triggered scene, etc.)
   // should go through this so users get consistent morph behavior.
-  triggerSceneWithMorph: (sceneId: string) => void
+  // `sourceSlotIdx` — forwarded to the engine so the Sequence view
+  // highlights the specific slot that fired (useful when the scene
+  // appears in multiple slots). Omit for palette / column / cue triggers.
+  triggerSceneWithMorph: (sceneId: string, sourceSlotIdx?: number | null) => void
   // Fire the armed scene (if any) and clear the arm. If autoAdvanceArm is
   // on, find the next non-empty sequence slot after the one we just fired
   // and arm it immediately. Returns the scene id that was fired, or null.
@@ -375,6 +398,7 @@ const emptyEngineState: EngineState = {
   currentValueBySceneAndTrack: {},
   activeSceneId: null,
   activeSceneStartedAt: null,
+  activeSequenceSlotIdx: null,
   tickRateHz: 30
 }
 
@@ -413,6 +437,7 @@ export const useStore = create<State>((set, get) => ({
   // Exit: hold Escape for ~1 second while in show mode.
   showMode: false,
   oscMonitorOpen: false,
+  pendingIntegrityLoad: null,
   armedSceneId: null,
   autoAdvanceArm: false,
   morphEnabled: false,
@@ -990,6 +1015,28 @@ export const useStore = create<State>((set, get) => ({
     ),
   setTracksCollapsed: (v) => set({ tracksCollapsed: v }),
   setOscMonitorOpen: (v) => set({ oscMonitorOpen: v }),
+  requestSessionLoad: (session, path) => {
+    // Lazy-import to avoid a circular dep (sessionIntegrity is a hook
+    // module that might reference store types in the future).
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { checkSessionIntegrity } = require('./hooks/sessionIntegrity') as typeof import('./hooks/sessionIntegrity')
+    const issues = checkSessionIntegrity(session)
+    if (issues.length === 0) {
+      get().setSession(session)
+      get().setCurrentFilePath(path)
+      return
+    }
+    set({ pendingIntegrityLoad: { session, path, issues } })
+  },
+  resolveIntegrityLoad: (commit) => {
+    const st = get()
+    const pending = st.pendingIntegrityLoad
+    if (!pending) return
+    set({ pendingIntegrityLoad: null })
+    if (!commit) return // cancel path
+    st.setSession(commit)
+    st.setCurrentFilePath(pending.path)
+  },
   setArmedSceneId: (id) =>
     set((st) => {
       // Defensive — don't arm a scene that doesn't exist.
@@ -1020,11 +1067,14 @@ export const useStore = create<State>((set, get) => ({
     if (st.morphEnabled) return st.morphMs
     return undefined
   },
-  triggerSceneWithMorph: (sceneId) => {
+  triggerSceneWithMorph: (sceneId, sourceSlotIdx) => {
     const morphMs = get().resolveMorphMs(sceneId)
+    const opts: { morphMs?: number; sourceSlotIdx?: number | null } = {}
+    if (morphMs !== undefined) opts.morphMs = morphMs
+    if (sourceSlotIdx !== undefined) opts.sourceSlotIdx = sourceSlotIdx
     void window.api.triggerScene(
       sceneId,
-      morphMs !== undefined ? { morphMs } : undefined
+      opts.morphMs !== undefined || opts.sourceSlotIdx !== undefined ? opts : undefined
     )
   },
   fireArmed: () => {
@@ -1129,7 +1179,13 @@ export const useStore = create<State>((set, get) => ({
           // clip's ramp mutates whichever object the spread kept alive.
           ramp: { ...base.modulation.ramp, ...(tm?.ramp ?? {}) },
           arpeggiator: { ...base.modulation.arpeggiator, ...(tm?.arpeggiator ?? {}) },
-          random: { ...base.modulation.random, ...(tm?.random ?? {}) }
+          random: { ...base.modulation.random, ...(tm?.random ?? {}) },
+          // S&H / Slew / Chaos — same deep-clone rule. Templates saved
+          // before these modulators existed spread in as undefined and
+          // we fall through to the base defaults.
+          sh: { ...base.modulation.sh, ...(tm?.sh ?? {}) },
+          slew: { ...base.modulation.slew, ...(tm?.slew ?? {}) },
+          chaos: { ...base.modulation.chaos, ...(tm?.chaos ?? {}) }
         },
         sequencer: {
           ...base.sequencer,
@@ -1392,7 +1448,40 @@ function propagateDefaults(s: Session): Session {
                     (c.sequencer.syncMode as string) === 'sync'
                       ? 'tempo'
                       : c.sequencer.syncMode,
-                  stepValues: [...c.sequencer.stepValues]
+                  stepValues: [...c.sequencer.stepValues],
+                  // Euclidean fields — new in this build. Older sessions
+                  // default to classic 'steps' mode with sensible pulses /
+                  // rotation (factory default tresillo 3-over-8).
+                  mode:
+                    (c.sequencer as Partial<typeof DEFAULT_SEQUENCER>).mode === 'euclidean'
+                      ? 'euclidean'
+                      : 'steps',
+                  pulses:
+                    typeof (c.sequencer as Partial<typeof DEFAULT_SEQUENCER>).pulses === 'number'
+                      ? Math.max(
+                          0,
+                          Math.min(
+                            16,
+                            Math.floor(
+                              (c.sequencer as Partial<typeof DEFAULT_SEQUENCER>).pulses as number
+                            )
+                          )
+                        )
+                      : DEFAULT_SEQUENCER.pulses,
+                  rotation:
+                    typeof (c.sequencer as Partial<typeof DEFAULT_SEQUENCER>).rotation ===
+                    'number'
+                      ? Math.max(
+                          0,
+                          Math.min(
+                            15,
+                            Math.floor(
+                              (c.sequencer as Partial<typeof DEFAULT_SEQUENCER>)
+                                .rotation as number
+                            )
+                          )
+                        )
+                      : DEFAULT_SEQUENCER.rotation
                 }
               : { ...DEFAULT_SEQUENCER, stepValues: [...DEFAULT_SEQUENCER.stepValues] },
             scaleToUnit: typeof c.scaleToUnit === 'boolean' ? c.scaleToUnit : false,
@@ -1462,6 +1551,46 @@ function propagateDefaults(s: Session): Session {
                 max:
                   (m?.random as Partial<typeof DEFAULT_RANDOM> | undefined)?.max ??
                   DEFAULT_RANDOM.max
+              },
+              // S&H / Slew / Chaos — all three brand-new; back-fill on
+              // load so older session files still satisfy the type and
+              // the engine has valid numbers to work with.
+              sh: {
+                smooth:
+                  typeof (m?.sh as Partial<typeof DEFAULT_SH> | undefined)?.smooth === 'boolean'
+                    ? (m!.sh as typeof DEFAULT_SH).smooth
+                    : DEFAULT_SH.smooth,
+                probability:
+                  typeof (m?.sh as Partial<typeof DEFAULT_SH> | undefined)?.probability === 'number'
+                    ? Math.max(
+                        0,
+                        Math.min(1, (m!.sh as typeof DEFAULT_SH).probability)
+                      )
+                    : DEFAULT_SH.probability
+              },
+              slew: {
+                riseMs:
+                  typeof (m?.slew as Partial<typeof DEFAULT_SLEW> | undefined)?.riseMs === 'number'
+                    ? Math.max(0, (m!.slew as typeof DEFAULT_SLEW).riseMs)
+                    : DEFAULT_SLEW.riseMs,
+                fallMs:
+                  typeof (m?.slew as Partial<typeof DEFAULT_SLEW> | undefined)?.fallMs === 'number'
+                    ? Math.max(0, (m!.slew as typeof DEFAULT_SLEW).fallMs)
+                    : DEFAULT_SLEW.fallMs,
+                randomTarget:
+                  typeof (m?.slew as Partial<typeof DEFAULT_SLEW> | undefined)?.randomTarget ===
+                  'boolean'
+                    ? (m!.slew as typeof DEFAULT_SLEW).randomTarget
+                    : DEFAULT_SLEW.randomTarget
+              },
+              chaos: {
+                r:
+                  typeof (m?.chaos as Partial<typeof DEFAULT_CHAOS> | undefined)?.r === 'number'
+                    ? Math.max(
+                        3.4,
+                        Math.min(4.0, (m!.chaos as typeof DEFAULT_CHAOS).r)
+                      )
+                    : DEFAULT_CHAOS.r
               }
             }
           }

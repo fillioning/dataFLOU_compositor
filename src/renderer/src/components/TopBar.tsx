@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, type ThemeName } from '../store'
 import { midi, type MidiDevice } from '../midi'
 import { BoundedNumberInput } from './BoundedNumberInput'
+import { Modal } from './Modal'
+import { detectMidiConflicts } from '../hooks/midiConflicts'
 
 // Theme picker options. Order = order shown in the dropdown. New themes first.
 const THEMES: { id: ThemeName; label: string }[] = [
@@ -57,8 +59,10 @@ export default function TopBar(): JSX.Element {
   async function onOpen(): Promise<void> {
     const res = await window.api.sessionOpen()
     if (!res) return
-    setSession(res.session)
-    setCurrentFilePath(res.path)
+    // Route through requestSessionLoad so an integrity check can
+    // interpose an "Auto-fix?" modal for malformed sessions. Clean
+    // sessions are committed immediately with no extra click.
+    useStore.getState().requestSessionLoad(res.session, res.path)
   }
   async function onSave(): Promise<void> {
     if (currentFilePath) {
@@ -114,6 +118,11 @@ export default function TopBar(): JSX.Element {
         {/* OSC Monitor lives on the main toolbar — useful mid-performance,
             so it stays visible in show mode (no data-hide-in-show). */}
         <OscMonitorToggle />
+        {/* MIDI conflicts warning — only renders when detectMidiConflicts
+            finds overlaps. Click to open a modal listing the colliding
+            targets. Stays visible in show mode so a performer can see
+            at a glance that two pads share a binding. */}
+        <MidiConflictsBanner />
         <input
           data-hide-in-show="true"
           className="input w-24"
@@ -301,6 +310,80 @@ export default function TopBar(): JSX.Element {
 
 // Toggle for the OSC monitor drawer (bottom-of-app scrollable log of
 // outgoing OSC traffic). Default off; lit when open.
+// MIDI conflicts warning. Indexes every MIDI-routable binding in the
+// current session; if any (kind, channel, number) collides, shows a
+// warning badge that opens a modal listing the colliding targets. The
+// detection is memoized per session reference so it re-runs only when
+// the session changes (not on every render of the top bar).
+function MidiConflictsBanner(): JSX.Element | null {
+  const session = useStore((s) => s.session)
+  const setSelectedCell = useStore((s) => s.selectCell)
+  const setFocusedScene = useStore((s) => s.setFocusedScene)
+  const setMetaSelectedKnob = useStore((s) => s.setMetaSelectedKnob)
+  const setMetaControllerVisible = useStore((s) => s.setMetaControllerVisible)
+  const conflicts = useMemo(() => detectMidiConflicts(session), [session])
+  const [open, setOpen] = useState(false)
+  if (conflicts.length === 0) return null
+  const total = conflicts.reduce((n, c) => n + c.targets.length, 0)
+  return (
+    <>
+      <button
+        className="btn text-[10px] py-0.5 px-1.5 shrink-0"
+        style={{
+          borderColor: 'rgb(var(--c-danger))',
+          color: 'rgb(var(--c-danger))'
+        }}
+        onClick={() => setOpen(true)}
+        title={`${conflicts.length} MIDI binding${conflicts.length === 1 ? '' : 's'} bound to multiple targets — click for details`}
+      >
+        ⚠ MIDI ×{conflicts.length}
+      </button>
+      {open && (
+        <Modal title={`MIDI binding conflicts (${total} targets)`} onClose={() => setOpen(false)}>
+          <div className="flex flex-col gap-3 max-h-[60vh] overflow-y-auto">
+            <p className="text-[12px] text-muted">
+              The bindings below fire the FIRST matching target when a
+              MIDI message arrives — the others never trigger. Click a
+              target to jump to it, then re-learn or clear its binding.
+            </p>
+            {conflicts.map((c) => (
+              <div
+                key={c.key}
+                className="border border-border rounded p-2 flex flex-col gap-1"
+              >
+                <div className="font-mono text-[11px] text-accent2">{c.binding}</div>
+                {c.targets.map((t, i) => (
+                  <button
+                    key={i}
+                    className="text-left text-[12px] px-2 py-1 rounded hover:bg-panel2"
+                    onClick={() => {
+                      // Navigate to the conflicting target so the user
+                      // can re-bind or clear it. Closes the modal.
+                      const nav = t.navigate
+                      if (nav?.kind === 'scene') setFocusedScene(nav.id)
+                      else if (nav?.kind === 'cell')
+                        setSelectedCell(nav.sceneId, nav.trackId)
+                      else if (nav?.kind === 'metaKnob') {
+                        setMetaControllerVisible(true)
+                        setMetaSelectedKnob(nav.index)
+                      }
+                      // 'go' and 'morphTime' have no navigation target —
+                      // the Transport bar is always visible already.
+                      setOpen(false)
+                    }}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            ))}
+          </div>
+        </Modal>
+      )}
+    </>
+  )
+}
+
 function OscMonitorToggle(): JSX.Element {
   const open = useStore((s) => s.oscMonitorOpen)
   const setOpen = useStore((s) => s.setOscMonitorOpen)

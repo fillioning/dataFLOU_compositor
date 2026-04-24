@@ -20,13 +20,14 @@ import {
   buildArpLadder,
   buildArpPattern,
   effectiveLfoHz,
+  euclidean,
   hashSeedString,
   mulberry32,
   parseValueTokens,
   readNumber,
   scaleMetaValue
 } from '@shared/factory'
-import { OscSender, type OscSendEvent } from './osc'
+import { OscSender, type OscErrorEvent, type OscSendEvent } from './osc'
 
 type OscArg = { type: 'i' | 'f' | 's' | 'T' | 'F'; value: number | string | boolean }
 
@@ -59,6 +60,22 @@ interface TrackState {
   randRng: (() => number) | null // seeded PRNG; null until the clip is triggered
   randLastAdvanceAt: number       // hrtime ms — when the last random sample fired
   randCurrent: number[]           // last emitted sample (1 item for int/float, 3 for colour)
+  // Sample & Hold state — one held value in [-1, 1] plus a "prev" for
+  // cosine interpolation when smooth=true. shLastAdvanceAt tracks the
+  // last clock tick in hrtime ms (shared with the LFO rate controls).
+  shHeld: number
+  shPrev: number
+  shLastAdvanceAt: number
+  // Slew state — one current interpolated value and one target in
+  // [-1, 1]. Filter is a simple first-order IIR with different time
+  // constants per direction.
+  slewValue: number
+  slewTarget: number
+  slewLastAdvanceAt: number
+  // Chaos (logistic map) state — current iterate in (0, 1). Seeded with
+  // a small perturbation on each trigger so identical cells diverge.
+  chaosX: number
+  chaosLastAdvanceAt: number
   // Active cell ref (source of params)
   activeSceneId: string | null
   stopping: boolean
@@ -91,6 +108,14 @@ function makeTrackState(): TrackState {
     randRng: null,
     randLastAdvanceAt: 0,
     randCurrent: [],
+    shHeld: 0,
+    shPrev: 0,
+    shLastAdvanceAt: 0,
+    slewValue: 0,
+    slewTarget: 0,
+    slewLastAdvanceAt: 0,
+    chaosX: 0.5,
+    chaosLastAdvanceAt: 0,
     activeSceneId: null,
     stopping: false,
     armed: false,
@@ -120,8 +145,14 @@ function lfo(shape: LfoShape, phase: number, state: TrackState, tickIdx: number)
       return state.rndStepValue
     }
     case 'rndSmooth': {
-      // Cosine interpolation between prev and next over one period.
-      const k = 0.5 - 0.5 * Math.cos(p * TWO_PI)
+      // Cosine ease across the full period: k goes 0 → 1 monotonically
+      // as p goes 0 → 1, so the output reaches `next` exactly at the wrap.
+      // When the tick-loop rotates (prev ← next, next ← new random) at
+      // phase wrap, the next cycle starts with k=0 and value = newPrev
+      // = oldNext — continuous. Previous formulation used cos(p·2π)
+      // which made k bounce back to 0 at p=1, producing a pop because
+      // the output snapped from oldPrev back to oldNext at the wrap.
+      const k = 0.5 - 0.5 * Math.cos(p * Math.PI)
       return state.rndSmoothPrev * (1 - k) + state.rndSmoothNext * k
     }
   }
@@ -140,6 +171,12 @@ export class SceneEngine {
   private lastTickAt = 0
   private activeSceneId: string | null = null
   private activeSceneStartedAt: number | null = null
+  // Slot index (0-based into session.sequence) that actually fired the
+  // current active scene — used by the Sequence view to pick which
+  // specific slot to highlight when a scene is placed multiple times.
+  // null when the trigger didn't come from a slot (palette, column
+  // header, MIDI, cue, etc).
+  private activeSequenceSlotIdx: number | null = null
   // Per-session "how many times has the active scene played so far?" counter.
   // Resets to 1 whenever activeSceneId CHANGES (fresh user trigger or follow
   // action to a different scene). Increments when the active scene re-triggers
@@ -172,6 +209,9 @@ export class SceneEngine {
   }
 
   /** Forward every successful OSC send to `cb`. Pass null to detach. */
+  setOnOscError(cb: ((e: OscErrorEvent) => void) | null): void {
+    this.sender.setOnError(cb)
+  }
   setOnOscSend(cb: ((e: OscSendEvent) => void) | null): void {
     this.sender.setOnSent(cb)
   }
@@ -201,6 +241,7 @@ export class SceneEngine {
       currentValueBySceneAndTrack: this.liveValues,
       activeSceneId: this.activeSceneId,
       activeSceneStartedAt: this.activeSceneStartedAt,
+      activeSequenceSlotIdx: this.activeSequenceSlotIdx,
       tickRateHz: this.session.tickRateHz
     })
   }
@@ -219,6 +260,33 @@ export class SceneEngine {
     }
     for (const t of next.tracks) {
       if (!this.tracks.has(t.id)) this.tracks.set(t.id, makeTrackState())
+    }
+    // Prune liveValues entries for scenes or tracks that no longer exist.
+    // Without this, switching between sessions with lots of scenes over an
+    // app lifetime leaks O(scenes × tracks) string entries in `liveValues`
+    // — the engine holds refs forever because the emitState loop only
+    // writes, never removes when a scene disappears.
+    const sceneKeep = new Set(next.scenes.map((s) => s.id))
+    for (const sid of Object.keys(this.liveValues)) {
+      if (!sceneKeep.has(sid)) {
+        delete this.liveValues[sid]
+        continue
+      }
+      const row = this.liveValues[sid]
+      for (const tid of Object.keys(row)) {
+        if (!keep.has(tid)) delete row[tid]
+      }
+    }
+    // If the currently-active scene was deleted, clear the ref so the
+    // engine doesn't keep pointing at a ghost scene. Running cells have
+    // already been safely ignored by getActiveCell returning null, but
+    // the stale activeSceneId would leak through emitState.
+    if (this.activeSceneId && !sceneKeep.has(this.activeSceneId)) {
+      this.activeSceneId = null
+      this.activeSceneStartedAt = null
+      this.activeSequenceSlotIdx = null
+      this.activeSceneRepeatCount = 0
+      this.clearSceneAdvance()
     }
     // Only restart the tick interval if the rate actually changed. Otherwise
     // rapid session updates (e.g., the user typing in a text field) would
@@ -327,6 +395,22 @@ export class SceneEngine {
         const initCount = Math.max(1, parseValueTokens(cell.value).length)
         ts.randCurrent = sampleRandom(ts.randRng, cell.modulation.random, initCount)
       }
+      // Fresh S&H sample at trigger so the first tick has a real value
+      // rather than zero (avoids a dead-air slot on the downbeat).
+      ts.shHeld = Math.random() * 2 - 1
+      ts.shPrev = 0
+      ts.shLastAdvanceAt = now()
+      // Slew: start at current center target to avoid a pop, pick a new
+      // random target immediately so motion is audible.
+      ts.slewValue = 0
+      ts.slewTarget = Math.random() * 2 - 1
+      ts.slewLastAdvanceAt = now()
+      // Chaos: seed close to 0.5 with a small per-trigger jitter so two
+      // adjacent cells running the same settings produce different
+      // trajectories. Values exactly at 0 or 1 are fixed points; keep
+      // clear of both.
+      ts.chaosX = 0.1 + Math.random() * 0.8
+      ts.chaosLastAdvanceAt = now()
       ts.lastSentString = null
       ts.lastStringAtSceneId = null
       ts.lastStringAtStep = -1
@@ -392,6 +476,8 @@ export class SceneEngine {
     }
     if (this.activeSceneId === sceneId) {
       this.activeSceneId = null
+      this.activeSceneStartedAt = null
+      this.activeSequenceSlotIdx = null
       this.clearSceneAdvance()
     }
     this.emitState()
@@ -416,27 +502,39 @@ export class SceneEngine {
   // in the previous scene but have no cell in this new scene will ALSO
   // fade out over the same duration, so the whole sonic picture glides
   // from scene-A's state into scene-B's state in lockstep.
-  triggerScene(sceneId: string, opts?: { morphMs?: number }): void {
+  // `opts.sourceSlotIdx` — when the trigger originated from a specific
+  // slot in the Sequence grid (1..9 / 0 hotkey, follow-action advance,
+  // slot-click), pass the slot index. The Sequence view uses it to
+  // highlight ONLY that instance of the scene in the grid, even when
+  // the scene is placed multiple times.
+  triggerScene(
+    sceneId: string,
+    opts?: { morphMs?: number; sourceSlotIdx?: number | null }
+  ): void {
     if (!this.session) return
     const scene = this.session.scenes.find((s) => s.id === sceneId)
     if (!scene) return
     const morphMs = opts?.morphMs
     const useMorph = typeof morphMs === 'number' && morphMs >= 0
 
-    // Orphan fade — tracks that were playing a cell from the PREVIOUS
-    // scene but have no cell in the new scene. Fade them to 0 over the
-    // same morph duration so orphans don't just keep droning on.
-    // Only relevant when morphMs is provided (the "glide" op). We suppress
-    // the per-track emitState and rely on the single emit at the end of
-    // this method — otherwise a big scene with N orphans fires N+M IPC
-    // messages back-to-back, each triggering a full React reconciliation
-    // on the renderer side. That cascade was what froze the app when
-    // many tracks were in flight at once.
-    if (useMorph) {
+    // Orphan stop — tracks that were playing a cell from the PREVIOUS
+    // scene but have no cell in the new scene. Ableton Session View
+    // convention: new scene fires mean the OLD scene's other cells stop,
+    // period. Previous build only did this in Morph mode; everything
+    // else let a looping clip drone on forever unless the user manually
+    // stopped it. Morph time (when set) becomes the fade duration;
+    // without Morph, each cell falls back to its own transitionMs.
+    // Silent so the per-track emitState doesn't fan out into N IPCs;
+    // coalesced emit lands at the end of this method.
+    {
       const newTrackIds = new Set(Object.keys(scene.cells))
       for (const [trackId, ts] of this.tracks.entries()) {
         if (ts.armed && !newTrackIds.has(trackId)) {
-          this.beginStop(trackId, morphMs, /* silent */ true)
+          this.beginStop(
+            trackId,
+            useMorph ? morphMs : undefined,
+            /* silent */ true
+          )
         }
       }
     }
@@ -458,36 +556,50 @@ export class SceneEngine {
     }
     this.activeSceneId = sceneId
     this.activeSceneStartedAt = Date.now()
+    // If the caller passed a specific slot, use it; otherwise clear
+    // (palette / column / MIDI / cue triggers aren't tied to a slot).
+    this.activeSequenceSlotIdx =
+      typeof opts?.sourceSlotIdx === 'number' ? opts.sourceSlotIdx : null
     this.armSceneAdvance(scene)
     this.emitState()
   }
 
   private armSceneAdvance(scene: Scene): void {
     this.clearSceneAdvance()
+    // Capture the scene's id, NOT the scene object itself, so that edits
+    // made while the duration timer is ticking (user changes nextMode,
+    // multiplicator, or duration via the UI — which replaces this.session
+    // via updateSession) are actually respected by the follow-action.
+    // Prior bug: once A -> B ping-pong started, switching A's nextMode to
+    // "stop" had no effect because the still-scheduled timer held a
+    // reference to A's OLD data.
+    const sceneId = scene.id
     this.sceneAdvanceTimer = setTimeout(() => {
+      // Re-fetch the current version of this scene off the live session.
+      const cur =
+        this.session?.scenes.find((s) => s.id === sceneId) ?? null
+      if (!cur) return
       // Multiplicator gate — if the scene hasn't yet played the requested
       // number of times, re-trigger itself (counter bumps in triggerScene)
       // before the real follow action fires. Applies to every mode: stop
       // with mult=3 plays 3x then stops; next with mult=2 plays 2x then
       // advances; loop is unchanged (it already re-triggers forever).
-      const mult = Math.max(1, Math.floor(scene.multiplicator || 1))
+      const mult = Math.max(1, Math.floor(cur.multiplicator || 1))
       if (this.activeSceneRepeatCount < mult) {
-        this.triggerScene(scene.id)
+        this.triggerScene(cur.id)
         return
       }
-      // Stop always respects the "carve-out" — keep the scene active while
-      // cells are still modulating/sequencing; otherwise clear.
-      if (scene.nextMode === 'stop') {
-        if (!this.sceneHasOngoingActivity(scene.id)) {
-          this.activeSceneId = null
-          this.activeSceneStartedAt = null
-          this.activeSceneRepeatCount = 0
-        }
-        this.emitState()
+      // Stop now *actually* stops everything. Previously the engine kept
+      // the scene "alive" as long as any cell had modulation or sequencer
+      // enabled — useful in theory, but the user's intent with Stop is
+      // "end the scene here." Morph every active cell back to 0 over its
+      // own transitionMs and clear the active-scene state.
+      if (cur.nextMode === 'stop') {
+        this.stopScene(cur.id)
       } else {
-        this.advanceScene(scene)
+        this.advanceScene(cur)
       }
-    }, scene.durationSec * 1000)
+    }, Math.max(10, scene.durationSec * 1000))
   }
 
   private sceneHasOngoingActivity(sceneId: string): boolean {
@@ -520,22 +632,66 @@ export class SceneEngine {
       this.triggerScene(current.id)
       return
     }
+    // Build the "walk list" for follow actions. Primary: scenes placed
+    // in the Sequence grid, in grid order. Fallback: the palette (every
+    // scene in session.scenes), so follow actions still work before the
+    // user has arranged anything in the Sequence view. Without the
+    // fallback, non-loop follow actions silently terminated whenever the
+    // grid was empty — the user experienced this as "only Stop and Loop
+    // work; every other follow action just stops after completion."
     const len = Math.max(1, Math.min(128, this.session.sequenceLength ?? 128))
-    const seq = this.session.sequence.slice(0, len)
-    const presentInSeq = seq.filter((id): id is string => !!id)
-    if (presentInSeq.length === 0) return
+    const gridSeq = this.session.sequence.slice(0, len)
+    const gridPresent = gridSeq.filter((id): id is string => !!id)
+    const usingPalette = gridPresent.length === 0
+    // `seq` is whatever we walk. slotIdx in the result points into
+    // `gridSeq` when we're using the grid, or stays null when we're
+    // walking the palette (the Sequence view won't have a matching slot
+    // to highlight). Either way we pass just the scene id through
+    // triggerScene, so behavior is identical downstream except for the
+    // highlight in the Sequence grid.
+    const seq: (string | null)[] = usingPalette
+      ? this.session.scenes.map((s) => s.id)
+      : gridSeq
+    const filledIdxs: number[] = []
+    seq.forEach((id, i) => {
+      if (id) filledIdxs.push(i)
+    })
+    // Still nothing? Genuinely empty session — fall through to Stop so
+    // cells don't drone indefinitely.
+    if (filledIdxs.length === 0) {
+      this.stopScene(current.id)
+      return
+    }
 
+    // Track (nextId, nextSlotIdx) together so the highlight in the
+    // Sequence view follows the SPECIFIC slot the advance landed on,
+    // not every instance of the scene in the grid. `nextSlotIdx` stays
+    // null when we fall back to walking the palette (no grid slot to
+    // highlight).
     let nextId: string | null = null
+    let nextSlotIdx: number | null = null
     const start = seq.findIndex((id) => id === current.id)
+
+    // When walking the palette, the "slot index" we pick is meaningless
+    // for the Sequence view's highlight — so null it out before firing
+    // triggerScene. The grid path keeps real slot indices so clicking
+    // Next on scene-at-slot-5 highlights slot 6, not every instance of
+    // scene 6 in the grid.
+    const slotOrNull = (idx: number | undefined): number | null =>
+      usingPalette ? null : typeof idx === 'number' ? idx : null
 
     switch (current.nextMode) {
       case 'next': {
-        if (start < 0) nextId = presentInSeq[0]
-        else {
+        if (start < 0) {
+          const pick = filledIdxs[0]
+          nextSlotIdx = slotOrNull(pick)
+          nextId = seq[pick] ?? null
+        } else {
           for (let i = 1; i <= seq.length; i++) {
             const idx = (start + i) % seq.length
             if (seq[idx]) {
               nextId = seq[idx]
+              nextSlotIdx = slotOrNull(idx)
               break
             }
           }
@@ -543,12 +699,16 @@ export class SceneEngine {
         break
       }
       case 'prev': {
-        if (start < 0) nextId = presentInSeq[presentInSeq.length - 1]
-        else {
+        if (start < 0) {
+          const pick = filledIdxs[filledIdxs.length - 1]
+          nextSlotIdx = slotOrNull(pick)
+          nextId = seq[pick] ?? null
+        } else {
           for (let i = 1; i <= seq.length; i++) {
             const idx = (start - i + seq.length) % seq.length
             if (seq[idx]) {
               nextId = seq[idx]
+              nextSlotIdx = slotOrNull(idx)
               break
             }
           }
@@ -556,25 +716,34 @@ export class SceneEngine {
         break
       }
       case 'first': {
-        nextId = presentInSeq[0]
+        const pick = filledIdxs[0]
+        nextSlotIdx = slotOrNull(pick)
+        nextId = seq[pick] ?? null
         break
       }
       case 'last': {
-        nextId = presentInSeq[presentInSeq.length - 1]
+        const pick = filledIdxs[filledIdxs.length - 1]
+        nextSlotIdx = slotOrNull(pick)
+        nextId = seq[pick] ?? null
         break
       }
       case 'any': {
-        // Random pick from EVERY present scene (including self).
-        nextId = presentInSeq[Math.floor(Math.random() * presentInSeq.length)]
+        // Random pick from every present slot (including self).
+        const pick = filledIdxs[Math.floor(Math.random() * filledIdxs.length)]
+        nextSlotIdx = slotOrNull(pick)
+        nextId = seq[pick] ?? null
         break
       }
       case 'other': {
-        // Random pick EXCLUDING the current scene. If it's the only one
-        // present, fall back to self so the loop doesn't stall silently.
-        const pool = presentInSeq.filter((id) => id !== current.id)
-        nextId = pool.length
-          ? pool[Math.floor(Math.random() * pool.length)]
-          : presentInSeq[0]
+        // Random pick excluding the current scene. If only self is
+        // present, fall back to self so the follow doesn't stall.
+        const otherIdxs = filledIdxs.filter((i) => seq[i] !== current.id)
+        const pick =
+          otherIdxs.length > 0
+            ? otherIdxs[Math.floor(Math.random() * otherIdxs.length)]
+            : filledIdxs[0]
+        nextSlotIdx = slotOrNull(pick)
+        nextId = seq[pick] ?? null
         break
       }
       default:
@@ -582,7 +751,14 @@ export class SceneEngine {
         // no-op on purpose.
         break
     }
-    if (nextId) this.triggerScene(nextId)
+    if (nextId) {
+      this.triggerScene(nextId, { sourceSlotIdx: nextSlotIdx })
+    } else {
+      // Every code path above that reached here without finding a next
+      // (e.g. default case) falls back to Stop so the current scene
+      // doesn't hang.
+      this.stopScene(current.id)
+    }
   }
 
   stopAll(): void {
@@ -592,6 +768,7 @@ export class SceneEngine {
     this.clearSceneAdvance()
     this.activeSceneId = null
     this.activeSceneStartedAt = null
+    this.activeSequenceSlotIdx = null
     this.activeSceneRepeatCount = 0
     this.emitState()
   }
@@ -612,6 +789,7 @@ export class SceneEngine {
     this.clearSceneAdvance()
     this.activeSceneId = null
     this.activeSceneStartedAt = null
+    this.activeSequenceSlotIdx = null
     this.activeSceneRepeatCount = 0
     this.emitState()
   }
@@ -649,7 +827,14 @@ export class SceneEngine {
   private tick(): void {
     if (!this.session) return
     const t = now()
-    const dt = this.lastTickAt === 0 ? 0 : (t - this.lastTickAt) / 1000
+    // Cap dt at 50 ms. If the system hiccups (GC pause, CPU spike, sleep
+    // wake-up), a raw dt could be several hundred ms — enough to overshoot
+    // phase, fire multiple clock advances in a single tick for S&H / Slew
+    // / Chaos / Random, or make the one-pole IIR filter in Slew go unstable.
+    // Treating the backlog as "just one frame's worth" keeps DSP sane at
+    // the cost of a visible catch-up delay after real stalls (preferable).
+    const rawDt = this.lastTickAt === 0 ? 0 : (t - this.lastTickAt) / 1000
+    const dt = Math.min(0.05, rawDt)
     this.lastTickAt = t
     this.tickIdx++
 
@@ -668,6 +853,73 @@ export class SceneEngine {
           ts.rndSmoothNext = Math.random() * 2 - 1
           ts.rndStepValue = Math.random() * 2 - 1
           ts.rndStepLastTick = this.tickIdx
+        }
+      }
+
+      // Sample & Hold — clock-driven stair (or cosine-smoothed stair).
+      // Each clock period, optionally pick a fresh sample in [-1, 1].
+      // `probability` below 1.0 gives the pattern a chance to "hold" a
+      // sample for multiple clocks (Turing-machine-ish locked feel).
+      if (cell.modulation.enabled && cell.modulation.type === 'sh' && !ts.stopping) {
+        const effHz = effectiveLfoHz(cell.modulation, this.session.globalBpm)
+        if (effHz > 0) {
+          const period = 1000 / effHz
+          while (t - ts.shLastAdvanceAt >= period) {
+            ts.shLastAdvanceAt += period
+            if (Math.random() < Math.max(0, Math.min(1, cell.modulation.sh.probability))) {
+              ts.shPrev = ts.shHeld
+              ts.shHeld = Math.random() * 2 - 1
+            }
+            // If the die rolls against us, no change — held + prev stay put.
+          }
+        }
+      }
+
+      // Slew — generate a clock-rate target, then per-tick low-pass the
+      // current value toward it using independent rise/fall time constants.
+      if (cell.modulation.enabled && cell.modulation.type === 'slew' && !ts.stopping) {
+        const effHz = effectiveLfoHz(cell.modulation, this.session.globalBpm)
+        if (effHz > 0) {
+          const period = 1000 / effHz
+          while (t - ts.slewLastAdvanceAt >= period) {
+            ts.slewLastAdvanceAt += period
+            if (cell.modulation.slew.randomTarget) {
+              ts.slewTarget = Math.random() * 2 - 1
+            } else {
+              // Bipolar square: flip the existing target's sign each clock.
+              // A previous version used a tick-local counter that reset
+              // every tick, so with exactly one clock advance per tick the
+              // target got stuck at -1 forever (first increment → 1 → odd
+              // → -1, reset to 0 next tick, same again). Flipping in-place
+              // preserves alternation across tick boundaries.
+              ts.slewTarget = ts.slewTarget >= 0 ? -1 : 1
+            }
+          }
+        }
+        // Per-tick filter: exponential toward target, different HL for rise vs fall.
+        const goingUp = ts.slewTarget > ts.slewValue
+        const halfLifeMs = Math.max(1, goingUp ? cell.modulation.slew.riseMs : cell.modulation.slew.fallMs)
+        // One-pole IIR: y += (target - y) * (1 - 2^(-dt / halfLife))
+        const alpha = 1 - Math.pow(2, (-dt * 1000) / halfLifeMs)
+        ts.slewValue += (ts.slewTarget - ts.slewValue) * alpha
+      }
+
+      // Chaos — logistic map iterate at clock rate. Stored state stays in
+      // (0, 1); output is scaled to bipolar [-1, 1] in computeModNorm.
+      if (cell.modulation.enabled && cell.modulation.type === 'chaos' && !ts.stopping) {
+        const effHz = effectiveLfoHz(cell.modulation, this.session.globalBpm)
+        if (effHz > 0) {
+          const period = 1000 / effHz
+          const r = Math.max(3.4, Math.min(4.0, cell.modulation.chaos.r))
+          while (t - ts.chaosLastAdvanceAt >= period) {
+            ts.chaosLastAdvanceAt += period
+            let x = ts.chaosX
+            x = r * x * (1 - x)
+            // Clamp away from fixed points so the trajectory never stalls
+            // on a degenerate input.
+            if (!Number.isFinite(x) || x <= 0 || x >= 1) x = 0.1 + Math.random() * 0.8
+            ts.chaosX = x
+          }
         }
       }
 
@@ -771,6 +1023,28 @@ export class SceneEngine {
           stepChanged = true
         }
         if (stepChanged) this.emitState()
+      }
+
+      // Euclidean gate — when the sequencer is in 'euclidean' mode, the
+      // current step is either a HIT (emit normally) or a MISS (suppress
+      // OSC send so the receiver's current value is held).
+      const seqMuted =
+        cell.sequencer.enabled &&
+        cell.sequencer.mode === 'euclidean' &&
+        (() => {
+          const steps = Math.max(1, Math.min(16, cell.sequencer.steps))
+          const pulses = Math.max(0, Math.min(steps, cell.sequencer.pulses))
+          const pat = euclidean(pulses, steps, cell.sequencer.rotation)
+          return !pat[ts.seqStepIdx % steps]
+        })()
+      if (seqMuted) {
+        // No OSC output this tick. Advance stopping-morph so Stop still
+        // resolves on schedule, and move on to the next track.
+        if (ts.stopping) {
+          const morphP = ts.morphMs > 0 ? clamp((t - ts.morphStart) / ts.morphMs, 0, 1) : 1
+          if (morphP >= 1) this.disarm(ts)
+        }
+        continue
       }
 
       // Resolve the base value string: sequencer step value if enabled, else cell.value.
@@ -977,6 +1251,7 @@ export class SceneEngine {
     ) {
       this.activeSceneId = null
       this.activeSceneStartedAt = null
+      this.activeSequenceSlotIdx = null
     }
     this.emitState()
   }
@@ -1206,7 +1481,45 @@ function computeModNorm(
     const g = computeEnvelopeGain(m.envelope, elapsedSec, sceneDurSec)
     return m.mode === 'bipolar' ? 2 * g - 1 : g
   }
-  // LFO
+  // S&H — emit held value (optionally cosine-smoothed from prev → held).
+  // Tick-loop advances the clock/sample; here we just read the state.
+  if (m.type === 'sh') {
+    let raw: number
+    if (m.sh.smooth) {
+      const effHz = effectiveLfoHz(m, _bpm)
+      const periodMs = effHz > 0 ? 1000 / effHz : 1
+      // Approximate progress across the current step using time since last
+      // advance. ts.shLastAdvanceAt was set to the start of the current
+      // sample; phase-in over the full period via cosine.
+      // NB: we can't read `t` here; computeModNorm is called from inside
+      // the tick, so elapsed-since-advance is the step progress.
+      const nowMs = elapsedSec * 1000 + ts.triggerTime
+      const into = nowMs - ts.shLastAdvanceAt
+      // Half-period cosine so k goes 0 → 1 monotonically across the step.
+      // Previously multiplied by 2π, which made k return to 0 at t=1 —
+      // output oscillated prev → held → prev inside every sample period
+      // instead of smoothly interpolating prev → held.
+      const k = 0.5 - 0.5 * Math.cos(Math.max(0, Math.min(1, into / periodMs)) * Math.PI)
+      raw = ts.shPrev * (1 - k) + ts.shHeld * k
+    } else {
+      raw = ts.shHeld
+    }
+    if (m.mode === 'bipolar') return raw
+    return (raw + 1) / 2
+  }
+  if (m.type === 'slew') {
+    const raw = ts.slewValue
+    if (m.mode === 'bipolar') return raw
+    return (raw + 1) / 2
+  }
+  if (m.type === 'chaos') {
+    // Map (0, 1) to (-1, 1). chaosX stays away from the endpoints thanks to
+    // the sanity clamp in the tick-loop advancement.
+    const raw = ts.chaosX * 2 - 1
+    if (m.mode === 'bipolar') return raw
+    return ts.chaosX // already 0..1
+  }
+  // LFO (default fallthrough)
   const raw = lfo(m.shape, ts.phase, ts, tickIdx) // -1..1
   if (m.mode === 'bipolar') return raw
   return (raw + 1) / 2 // 0..1

@@ -8,8 +8,15 @@
 // subscription, no memory cost.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { OscEvent } from '@shared/types'
+import type { OscErrorEvent, OscEvent } from '@shared/types'
 import { useStore } from '../store'
+
+// Discriminated-union row so the log can interleave successful sends
+// with failures. Kind is the only distinguishing field; everything else
+// lines up with OscEvent / OscErrorEvent structurally.
+type MonitorRow =
+  | ({ kind: 'ok' } & OscEvent)
+  | ({ kind: 'err' } & OscErrorEvent)
 
 // Hard cap on in-memory rows. At 120Hz × 4 active cells we see ~500 msg/sec,
 // so 1000 rows ≈ 2 seconds of history. Enough to eyeball, small enough to
@@ -31,30 +38,42 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   // Store raw events in a ref so the subscriber doesn't trigger a re-render
   // per batch (would stall the UI at high send rates). We bump `tick` on each
   // flush to force a render, throttled to ~10Hz.
-  const bufferRef = useRef<OscEvent[]>([])
+  const bufferRef = useRef<MonitorRow[]>([])
   const [, setTick] = useState(0)
   const scrollRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
 
-  // Subscribe to batched OSC events from main.
+  // Subscribe to batched OSC events AND errors from main. Both streams
+  // feed the same ring buffer — errors render as red [ERR] rows with
+  // the failure message as the "args" column.
   useEffect(() => {
     let pendingRender = false
-    const off = window.api.onOscEvents((batch) => {
+    const scheduleRender = (): void => {
+      if (pendingRender) return
+      pendingRender = true
+      setTimeout(() => {
+        pendingRender = false
+        setTick((n) => n + 1)
+      }, 100)
+    }
+    const offEvents = window.api.onOscEvents((batch) => {
       if (paused) return
       const buf = bufferRef.current
-      for (const e of batch) buf.push(e)
+      for (const e of batch) buf.push({ kind: 'ok', ...e })
       if (buf.length > MAX_ROWS) buf.splice(0, buf.length - MAX_ROWS)
-      // Throttle re-renders to ~10Hz. requestAnimationFrame would be
-      // too eager at 60Hz when batches arrive every 50ms.
-      if (!pendingRender) {
-        pendingRender = true
-        setTimeout(() => {
-          pendingRender = false
-          setTick((n) => n + 1)
-        }, 100)
-      }
+      scheduleRender()
     })
-    return off
+    const offErrors = window.api.onOscErrors((batch) => {
+      if (paused) return
+      const buf = bufferRef.current
+      for (const e of batch) buf.push({ kind: 'err', ...e })
+      if (buf.length > MAX_ROWS) buf.splice(0, buf.length - MAX_ROWS)
+      scheduleRender()
+    })
+    return () => {
+      offEvents()
+      offErrors()
+    }
   }, [paused])
 
   // Auto-scroll to bottom when new rows arrive, unless the user has scrolled
@@ -138,20 +157,40 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
           rows.map((e, i) => (
             <div
               key={i}
-              className="flex gap-2 px-2 py-[1px] hover:bg-panel2 whitespace-nowrap"
+              className={`flex gap-2 px-2 py-[1px] whitespace-nowrap ${
+                e.kind === 'err' ? 'bg-danger/10 hover:bg-danger/20' : 'hover:bg-panel2'
+              }`}
             >
               <span className="text-muted shrink-0 w-16 tabular-nums">
                 {formatTime(e.timestamp)}
               </span>
               <span className="text-muted shrink-0">|</span>
-              <span className="text-muted shrink-0 w-28 truncate" title={`${e.ip}:${e.port}`}>
-                {e.ip}:{e.port}
+              <span
+                className={`shrink-0 w-10 ${e.kind === 'err' ? 'text-danger font-bold' : 'text-muted'}`}
+              >
+                {e.kind === 'err' ? '[ERR]' : 'send'}
               </span>
-              <span className="text-accent shrink-0 w-40 truncate" title={e.address}>
-                {e.address}
+              <span
+                className={`shrink-0 w-28 truncate ${
+                  e.kind === 'err' ? 'text-danger' : 'text-muted'
+                }`}
+                title={e.ip === '*' ? 'Socket-level error' : `${e.ip}:${e.port}`}
+              >
+                {e.ip === '*' ? '(socket)' : `${e.ip}:${e.port}`}
               </span>
-              <span className="truncate" title={formatArgs(e.args)}>
-                {formatArgs(e.args)}
+              <span
+                className={`shrink-0 w-40 truncate ${
+                  e.kind === 'err' ? 'text-muted' : 'text-accent'
+                }`}
+                title={e.address}
+              >
+                {e.address || '—'}
+              </span>
+              <span
+                className={`truncate ${e.kind === 'err' ? 'text-danger' : ''}`}
+                title={e.kind === 'err' ? e.message : formatArgs(e.args)}
+              >
+                {e.kind === 'err' ? e.message : formatArgs(e.args)}
               </span>
             </div>
           ))

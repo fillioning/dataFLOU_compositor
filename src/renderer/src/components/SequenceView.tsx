@@ -13,6 +13,7 @@ import {
   useSensors
 } from '@dnd-kit/core'
 import { useStore } from '../store'
+import { formatRemaining, useSceneCountdown } from '../hooks/useSceneCountdown'
 import type { NextMode, Scene } from '@shared/types'
 import { ResizeHandle } from './ResizeHandle'
 import { BoundedNumberInput } from './BoundedNumberInput'
@@ -24,6 +25,7 @@ export default function SequenceView(): JSX.Element {
   const setSequenceLength = useStore((s) => s.setSequenceLength)
   const setSequenceSlot = useStore((s) => s.setSequenceSlot)
   const activeSceneId = useStore((s) => s.engine.activeSceneId)
+  const activeSlotIdx = useStore((s) => s.engine.activeSequenceSlotIdx)
   const focusedSceneId = useStore((s) => s.session.focusedSceneId)
   const focusedScene = scenes.find((s) => s.id === focusedSceneId) ?? null
   const paletteWidth = useStore((s) => s.scenePaletteWidth)
@@ -162,7 +164,15 @@ export default function SequenceView(): JSX.Element {
                   key={i}
                   index={i}
                   scene={sceneId ? sceneById(sceneId) : undefined}
-                  active={activeSceneId === sceneId}
+                  // Only light up the specific slot that fired. If we
+                  // don't have a source-slot (scene was fired from the
+                  // palette / column / MIDI), fall back to highlighting
+                  // every instance of the scene so the user can still
+                  // see "this scene is playing" somewhere in the grid.
+                  active={
+                    activeSceneId === sceneId &&
+                    (activeSlotIdx === null || activeSlotIdx === i)
+                  }
                   onClear={clearMode ? () => setSequenceSlot(i, null) : undefined}
                 />
               ))}
@@ -201,108 +211,6 @@ export default function SequenceView(): JSX.Element {
   )
 }
 
-function StatusBar(): JSX.Element {
-  const session = useStore((s) => s.session)
-  const focusedSceneId = session.focusedSceneId
-  const focusedScene = session.scenes.find((s) => s.id === focusedSceneId) ?? null
-  const activeSceneId = useStore((s) => s.engine.activeSceneId)
-  const paused = useStore((s) => s.sequencePaused)
-  const setPaused = useStore((s) => s.setSequencePaused)
-
-  const trackCountInFocused = focusedScene
-    ? Object.keys(focusedScene.cells).length
-    : 0
-
-  async function onPlay(): Promise<void> {
-    if (paused && activeSceneId) {
-      await window.api.resumeSequence()
-      setPaused(false)
-      return
-    }
-    // Start from focused scene if present, else first non-empty sequence slot.
-    let startId = focusedSceneId
-    if (!startId) {
-      const first = session.sequence.find((id) => !!id) ?? null
-      startId = first
-    }
-    if (startId) {
-      useStore.getState().triggerSceneWithMorph(startId)
-      setPaused(false)
-    }
-  }
-
-  async function onPause(): Promise<void> {
-    await window.api.pauseSequence()
-    setPaused(true)
-  }
-
-  async function onStop(): Promise<void> {
-    await window.api.stopAll()
-    setPaused(false)
-  }
-
-  return (
-    <div className="border-t border-border bg-panel px-3 py-2 flex items-center gap-3 text-[12px] shrink-0">
-      <div className="flex items-center gap-1">
-        <button
-          className="btn-accent w-8 h-7 flex items-center justify-center"
-          onClick={onPlay}
-          title={paused ? 'Resume' : 'Play focused scene'}
-        >
-          <svg width="10" height="10" viewBox="0 0 10 10">
-            <polygon points="2,1 9,5 2,9" fill="currentColor" />
-          </svg>
-        </button>
-        <button
-          className="btn w-8 h-7 flex items-center justify-center"
-          onClick={onPause}
-          title="Pause auto-advance (cells keep playing)"
-          disabled={!activeSceneId || paused}
-        >
-          <svg width="10" height="10" viewBox="0 0 10 10">
-            <rect x="2" y="1" width="2" height="8" fill="currentColor" />
-            <rect x="6" y="1" width="2" height="8" fill="currentColor" />
-          </svg>
-        </button>
-        <button
-          className="btn w-8 h-7 flex items-center justify-center"
-          onClick={onStop}
-          title="Stop all"
-        >
-          <svg width="10" height="10" viewBox="0 0 10 10">
-            <rect x="1" y="1" width="8" height="8" fill="currentColor" />
-          </svg>
-        </button>
-      </div>
-
-      <div className="h-6 w-px bg-border" />
-
-      <div className="flex items-center gap-2 min-w-0">
-        <span className="label shrink-0">Selected</span>
-        {focusedScene ? (
-          <>
-            <span
-              className="inline-block w-2.5 h-2.5 rounded-sm shrink-0"
-              style={{ background: focusedScene.color }}
-            />
-            <span className="font-medium truncate">{focusedScene.name}</span>
-            <span className="text-muted shrink-0">· {trackCountInFocused} message{trackCountInFocused === 1 ? '' : 's'}</span>
-          </>
-        ) : (
-          <span className="text-muted">(none)</span>
-        )}
-      </div>
-
-      <div className="flex-1" />
-
-      <div className="flex items-center gap-2 text-muted">
-        {activeSceneId && !paused && <span className="text-accent">● playing</span>}
-        {paused && <span className="text-accent2">⏸ paused</span>}
-      </div>
-    </div>
-  )
-}
-
 function PaletteItem({ scene, focused }: { scene: Scene; focused: boolean }): JSX.Element {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `scene-${scene.id}`
@@ -311,6 +219,8 @@ function PaletteItem({ scene, focused }: { scene: Scene; focused: boolean }): JS
   const selectSceneRange = useStore((s) => s.selectSceneRange)
   const selectedSceneIds = useStore((s) => s.selectedSceneIds)
   const isArmed = useStore((s) => s.armedSceneId === scene.id)
+  // Live countdown while this pill is the engine's active scene.
+  const { active, remainingMs, progress } = useSceneCountdown(scene.id, scene.durationSec)
   // Highlight if part of the multi-selection (same logic as SceneColumn).
   const inMulti = selectedSceneIds.length > 0 && selectedSceneIds.includes(scene.id)
   const highlighted = inMulti || (selectedSceneIds.length === 0 && focused)
@@ -335,7 +245,7 @@ function PaletteItem({ scene, focused }: { scene: Scene; focused: boolean }): JS
         const cur = useStore.getState().armedSceneId
         useStore.getState().setArmedSceneId(cur === scene.id ? null : scene.id)
       }}
-      className={`relative px-2 py-1.5 rounded border cursor-pointer text-[12px] ${
+      className={`relative px-2 py-1.5 rounded border cursor-pointer text-[12px] overflow-hidden ${
         isDragging ? 'opacity-50 cursor-grab' : ''
       } ${highlighted ? 'ring-2 ring-accent' : ''}`}
       // A scene inside the multi-selection gets a deeper tint so the set
@@ -348,7 +258,32 @@ function PaletteItem({ scene, focused }: { scene: Scene; focused: boolean }): JS
     >
       {isArmed && <div className="armed-ring absolute inset-0 pointer-events-none" />}
       {isArmed && <span className="armed-chevron" aria-hidden>▶▶</span>}
-      <span className="font-medium">{scene.name}</span>
+      {/* Scene-duration progress strip along the bottom edge of the pill.
+          Only rendered while this scene is actively playing. Accent orange
+          matches the trigger-square "playing" color. Thin (2 px) so it
+          doesn't compete with the armed-ring (blue) visually. */}
+      {active && (
+        <div
+          className="absolute left-0 bottom-0 h-[2px] pointer-events-none"
+          style={{
+            width: `${progress * 100}%`,
+            background: 'rgb(var(--c-accent))',
+            transition: 'width 50ms linear'
+          }}
+          aria-hidden
+        />
+      )}
+      <div className="flex items-center gap-1.5 min-w-0">
+        <span className="font-medium truncate flex-1">{scene.name}</span>
+        {active && (
+          <span
+            className="text-[10px] font-mono tabular-nums text-accent shrink-0"
+            title="Time remaining in this scene's duration"
+          >
+            {formatRemaining(remainingMs)}
+          </span>
+        )}
+      </div>
     </div>
   )
 }
@@ -441,7 +376,7 @@ function SceneInfoPanel({ scene }: { scene: Scene }): JSX.Element {
         <div className="flex items-center gap-1.5">
           <span className="label">Next</span>
           <select
-            className="input text-[12px] py-0.5"
+            className="input text-[12px] py-0.5 min-w-[96px]"
             value={scene.nextMode}
             onChange={(e) => updateScene(scene.id, { nextMode: e.target.value as NextMode })}
           >

@@ -2,6 +2,7 @@ import type {
   ArpMode,
   ArpeggiatorParams,
   Cell,
+  ChaosParams,
   EnvelopeParams,
   MetaController,
   MetaCurve,
@@ -10,8 +11,10 @@ import type {
   MultMode,
   RampParams,
   RandomParams,
+  SampleHoldParams,
   Scene,
   SequencerParams,
+  SlewParams,
   Session,
   Track
 } from './types'
@@ -114,6 +117,21 @@ export const DEFAULT_RANDOM: RandomParams = {
   max: 1
 }
 
+export const DEFAULT_SH: SampleHoldParams = {
+  smooth: false,
+  probability: 1.0
+}
+
+export const DEFAULT_SLEW: SlewParams = {
+  riseMs: 200,
+  fallMs: 200,
+  randomTarget: true
+}
+
+export const DEFAULT_CHAOS: ChaosParams = {
+  r: 3.8
+}
+
 export const DEFAULT_MODULATION: Modulation = {
   enabled: false,
   type: 'lfo',
@@ -128,7 +146,10 @@ export const DEFAULT_MODULATION: Modulation = {
   envelope: { ...DEFAULT_ENVELOPE },
   ramp: { ...DEFAULT_RAMP },
   arpeggiator: { ...DEFAULT_ARPEGGIATOR },
-  random: { ...DEFAULT_RANDOM }
+  random: { ...DEFAULT_RANDOM },
+  sh: { ...DEFAULT_SH },
+  slew: { ...DEFAULT_SLEW },
+  chaos: { ...DEFAULT_CHAOS }
 }
 
 // ---- Arpeggiator helpers ----
@@ -234,7 +255,12 @@ export const DEFAULT_SEQUENCER: SequencerParams = {
   syncMode: 'tempo',
   bpm: 120,
   stepMs: 500,
-  stepValues: ['0', '0', '0', '0', '0', '0', '0', '0', '', '', '', '', '', '', '', '']
+  stepValues: ['0', '0', '0', '0', '0', '0', '0', '0', '', '', '', '', '', '', '', ''],
+  mode: 'steps',
+  // Classic Euclidean default: 3 pulses over 8 steps gives you the
+  // cuban tresillo / Cinquillo pattern — useful out of the box.
+  pulses: 3,
+  rotation: 0
 }
 
 export function makeCell(defaults: {
@@ -256,7 +282,10 @@ export function makeCell(defaults: {
       envelope: { ...DEFAULT_ENVELOPE },
       ramp: { ...DEFAULT_RAMP },
       arpeggiator: { ...DEFAULT_ARPEGGIATOR },
-      random: { ...DEFAULT_RANDOM }
+      random: { ...DEFAULT_RANDOM },
+      sh: { ...DEFAULT_SH },
+      slew: { ...DEFAULT_SLEW },
+      chaos: { ...DEFAULT_CHAOS }
     },
     sequencer: {
       ...DEFAULT_SEQUENCER,
@@ -264,6 +293,50 @@ export function makeCell(defaults: {
     },
     scaleToUnit: false
   }
+}
+
+// Build a Euclidean rhythm pattern — `pulses` active hits distributed as
+// evenly as possible across `steps` total slots, then rotated by
+// `rotation` (modulo `steps`). Returns a boolean[] of length `steps`
+// where `true` = hit, `false` = rest.
+//
+// Uses the "angle method" (Toussaint): step i is a hit iff
+//   floor((i+1) · p / s) − floor(i · p / s) === 1.
+// This produces the same even-as-possible distribution as Bjorklund for
+// our purposes (up to rotation), in clean O(steps).
+//
+// Examples (before rotation):
+//   euclidean(3, 8) = [F F T F F T F T]   (tresillo, rotated)
+//   euclidean(5, 8) = [F T F T T F T T]   (cinquillo, rotated)
+//   euclidean(4, 4) = [T T T T]           (four on the floor)
+//
+// Memoized per (pulses, steps, rotation) triple — the engine calls this
+// every sequencer step. The key space is bounded by 16³ = 4096 max.
+const euclideanCache = new Map<string, boolean[]>()
+export function euclidean(pulses: number, steps: number, rotation: number): boolean[] {
+  const s = Math.max(1, Math.floor(steps))
+  const p = Math.max(0, Math.min(s, Math.floor(pulses)))
+  const r = ((Math.floor(rotation) % s) + s) % s
+  const key = `${p}:${s}:${r}`
+  const cached = euclideanCache.get(key)
+  if (cached) return cached
+
+  const base = new Array<boolean>(s)
+  if (p <= 0) base.fill(false)
+  else if (p >= s) base.fill(true)
+  else {
+    for (let i = 0; i < s; i++) {
+      base[i] = Math.floor(((i + 1) * p) / s) - Math.floor((i * p) / s) === 1
+    }
+  }
+
+  let out = base
+  if (r !== 0) {
+    out = new Array<boolean>(s)
+    for (let i = 0; i < s; i++) out[(i + r) % s] = base[i]
+  }
+  euclideanCache.set(key, out)
+  return out
 }
 
 // Value-string parsing helpers.
@@ -336,7 +409,10 @@ export function makeEmptySession(): Session {
     midiInputName: null,
     metaController: makeMetaController()
   }
-  session.sequence[0] = scene.id
+  // Default sequence is empty — users drag scenes into slots explicitly.
+  // Previously slot 0 was pre-filled with the default scene, which was
+  // confusing when experimenting in Edit view (the Transport's Next /
+  // Any / etc. would fire from a slot the user never placed).
   scene.cells[track.id] = makeCell({
     destIp: session.defaultDestIp,
     destPort: session.defaultDestPort,

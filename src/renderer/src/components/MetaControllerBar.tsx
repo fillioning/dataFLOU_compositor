@@ -14,6 +14,7 @@ import { META_BANK_COUNT, META_KNOBS_PER_BANK, META_MAX_DESTS } from '@shared/ty
 import type { MetaCurve, MetaKnob as MetaKnobModel } from '@shared/types'
 import { META_MAX_HEIGHT, META_MAX_SMOOTH_MS, META_MIN_HEIGHT } from '@shared/factory'
 import { BoundedNumberInput } from './BoundedNumberInput'
+import { DestHealthDot } from './DestHealthDot'
 import MetaKnob from './MetaKnob'
 import { ResizeHandle } from './ResizeHandle'
 
@@ -353,6 +354,7 @@ function KnobDetails({
                 title={d.enabled ? 'Destination enabled' : 'Destination muted'}
                 className="shrink-0"
               />
+              <DestHealthDot ip={d.destIp} port={d.destPort} />
               <input
                 className="input w-[140px]"
                 value={d.destIp}

@@ -11,7 +11,7 @@ import type {
   RandomValueType,
   SeqSyncMode
 } from '@shared/types'
-import { DIVISIONS, rateHzToSlider, sliderToRateHz } from '@shared/factory'
+import { DIVISIONS, euclidean, rateHzToSlider, sliderToRateHz } from '@shared/factory'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { UncontrolledTextInput } from './UncontrolledInput'
 
@@ -292,8 +292,11 @@ function CellInspector(): JSX.Element {
         headerRight={
           cell.modulation.enabled ? (
             <select
+              // 148 px fits the widest entry ("Sample & Hold") plus the
+              // native dropdown arrow across Win + macOS + Linux font
+              // renderings. Previous 120 px was cropping "Sample & Hol…".
               className="input text-[11px] py-0.5"
-              style={{ width: 120 }}
+              style={{ width: 148 }}
               value={cell.modulation.type}
               onChange={(e) => {
                 const nextType = e.target.value as ModType
@@ -318,6 +321,9 @@ function CellInspector(): JSX.Element {
               <option value="envelope">Envelope</option>
               <option value="arpeggiator">Arpeggiator</option>
               <option value="random">Random</option>
+              <option value="sh">Sample &amp; Hold</option>
+              <option value="slew">Slew</option>
+              <option value="chaos">Chaos</option>
             </select>
           ) : null
         }
@@ -330,8 +336,14 @@ function CellInspector(): JSX.Element {
           <EnvelopeEditor cell={c} u={u} />
         ) : cell.modulation.type === 'arpeggiator' ? (
           <ArpEditor cell={c} u={u} />
-        ) : (
+        ) : cell.modulation.type === 'random' ? (
           <RandomEditor cell={c} u={u} />
+        ) : cell.modulation.type === 'sh' ? (
+          <SampleHoldEditor cell={c} u={u} />
+        ) : cell.modulation.type === 'slew' ? (
+          <SlewEditor cell={c} u={u} />
+        ) : (
+          <ChaosEditor cell={c} u={u} />
         )}
       </CollapsibleSection>
 
@@ -341,6 +353,19 @@ function CellInspector(): JSX.Element {
         onToggle={(v) => uSeq({ enabled: v })}
       >
         <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center">
+          <span className="label">Pattern</span>
+          <select
+            className="input col-span-2"
+            value={cell.sequencer.mode}
+            onChange={(e) =>
+              uSeq({ mode: e.target.value as import('@shared/types').SeqMode })
+            }
+            title="Steps = cycle through step values in order. Euclidean = distribute `Pulses` hits evenly across `Steps` total slots; misses emit no OSC."
+          >
+            <option value="steps">Steps (cycle)</option>
+            <option value="euclidean">Euclidean</option>
+          </select>
+
           <span className="label">Steps</span>
           <input
             type="range"
@@ -358,6 +383,53 @@ function CellInspector(): JSX.Element {
             max={16}
             integer
           />
+
+          {cell.sequencer.mode === 'euclidean' && (
+            <>
+              <span className="label">Pulses</span>
+              <input
+                type="range"
+                min={0}
+                max={cell.sequencer.steps}
+                step={1}
+                value={Math.min(cell.sequencer.pulses, cell.sequencer.steps)}
+                onChange={(e) =>
+                  uSeq({ pulses: clamp(Math.round(Number(e.target.value)), 0, 16) })
+                }
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.pulses}
+                onChange={(v) => uSeq({ pulses: v })}
+                min={0}
+                max={cell.sequencer.steps}
+                integer
+              />
+
+              <span className="label">Rotate</span>
+              <input
+                type="range"
+                min={0}
+                max={Math.max(0, cell.sequencer.steps - 1)}
+                step={1}
+                value={Math.min(
+                  cell.sequencer.rotation,
+                  Math.max(0, cell.sequencer.steps - 1)
+                )}
+                onChange={(e) =>
+                  uSeq({ rotation: clamp(Math.round(Number(e.target.value)), 0, 15) })
+                }
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.rotation}
+                onChange={(v) => uSeq({ rotation: v })}
+                min={0}
+                max={Math.max(0, cell.sequencer.steps - 1)}
+                integer
+              />
+            </>
+          )}
 
           <span className="label">Mode</span>
           <select
@@ -433,8 +505,23 @@ function CellInspector(): JSX.Element {
           )}
         </div>
 
+        {cell.sequencer.mode === 'euclidean' && (
+          <EuclideanPreview
+            steps={cell.sequencer.steps}
+            pulses={cell.sequencer.pulses}
+            rotation={cell.sequencer.rotation}
+            currentStep={
+              cell.sequencer.enabled && currentStep !== undefined ? currentStep : -1
+            }
+          />
+        )}
+
         <div className="mt-2 flex flex-col gap-1">
-          <div className="label">Step values (1…{cell.sequencer.steps})</div>
+          <div className="label">
+            {cell.sequencer.mode === 'euclidean'
+              ? `Step values (1…${cell.sequencer.steps}) — hits emit, misses skip`
+              : `Step values (1…${cell.sequencer.steps})`}
+          </div>
           <div className="grid grid-cols-4 gap-1">
             {Array.from({ length: cell.sequencer.steps }, (_, i) => (
               <StepInput
@@ -451,8 +538,9 @@ function CellInspector(): JSX.Element {
             ))}
           </div>
           <div className="text-[10px] text-muted mt-1">
-            Auto-detect per step (bool / int / float / string). With Modulation also on, the LFO
-            oscillates around the current step value.
+            {cell.sequencer.mode === 'euclidean'
+              ? 'Euclidean: active ("hit") steps emit their value; inactive steps emit nothing (receiver holds last value). With Modulation also on, the modulator affects hit values only.'
+              : 'Auto-detect per step (bool / int / float / string). With Modulation also on, the LFO oscillates around the current step value.'}
           </div>
         </div>
       </CollapsibleSection>
@@ -982,6 +1070,341 @@ function RandomEditor({
   )
 }
 
+// Reusable rate controls (Free Hz / BPM-synced with dotted/triplet). The
+// LFO editor has its own expanded version; the new modulators (S&H,
+// Slew, Chaos) share this compact one so the rate controls feel
+// identical across all clock-driven modulators.
+function CompactRateControls({
+  m,
+  uMod
+}: {
+  m: import('@shared/types').Modulation
+  uMod: (patch: Partial<import('@shared/types').Modulation>) => void
+}): JSX.Element {
+  return (
+    <>
+      <span className="label">Rate</span>
+      {m.sync === 'free' ? (
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={0.1}
+          value={rateHzToSlider(m.rateHz)}
+          onChange={(e) => uMod({ rateHz: sliderToRateHz(Number(e.target.value)) })}
+        />
+      ) : (
+        <input
+          type="range"
+          min={0}
+          max={DIVISIONS.length - 1}
+          step={1}
+          value={m.divisionIdx}
+          onChange={(e) => uMod({ divisionIdx: Number(e.target.value) })}
+        />
+      )}
+      <div className="flex items-center gap-1 justify-end">
+        {m.sync === 'free' ? (
+          <>
+            <BoundedNumberInput
+              className="input w-14 text-right"
+              min={0.01}
+              max={100}
+              value={m.rateHz}
+              onChange={(v) => uMod({ rateHz: v })}
+            />
+            <span className="text-muted text-[11px] w-5 shrink-0">Hz</span>
+          </>
+        ) : (
+          <span
+            className="text-[11px] font-mono text-right w-full"
+            title="BPM-synced division"
+          >
+            {DIVISIONS[m.divisionIdx]?.label ?? ''}
+          </span>
+        )}
+      </div>
+
+      <span className="label">Sync</span>
+      <div className="flex items-center gap-2 text-[11px] min-w-0 col-span-2">
+        <select
+          className="input text-[11px] py-0.5 shrink-0"
+          style={{ width: 96 }}
+          value={m.sync}
+          onChange={(e) => uMod({ sync: e.target.value as LfoSync })}
+        >
+          <option value="free">Free (Hz)</option>
+          <option value="bpm">BPM</option>
+        </select>
+        <label
+          className={`flex items-center gap-1 shrink-0 ${m.sync !== 'bpm' ? 'opacity-40' : ''}`}
+        >
+          <input
+            type="checkbox"
+            disabled={m.sync !== 'bpm'}
+            checked={m.dotted}
+            onChange={(e) => uMod({ dotted: e.target.checked })}
+          />
+          <span>Dotted</span>
+        </label>
+        <label
+          className={`flex items-center gap-1 shrink-0 ${m.sync !== 'bpm' ? 'opacity-40' : ''}`}
+        >
+          <input
+            type="checkbox"
+            disabled={m.sync !== 'bpm'}
+            checked={m.triplet}
+            onChange={(e) => uMod({ triplet: e.target.checked })}
+          />
+          <span>Triplet</span>
+        </label>
+      </div>
+    </>
+  )
+}
+
+// Depth + bipolar/unipolar mode controls, also shared by the clock-driven
+// modulators.
+function CompactDepthMode({
+  m,
+  uMod
+}: {
+  m: import('@shared/types').Modulation
+  uMod: (patch: Partial<import('@shared/types').Modulation>) => void
+}): JSX.Element {
+  return (
+    <>
+      <span className="label">Depth</span>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={m.depthPct}
+        onChange={(e) => uMod({ depthPct: clamp(Number(e.target.value), 0, 100) })}
+      />
+      <div className="flex items-center gap-1 justify-end">
+        <BoundedNumberInput
+          className="input w-14 text-right"
+          integer
+          min={0}
+          max={100}
+          value={m.depthPct}
+          onChange={(v) => uMod({ depthPct: v })}
+        />
+        <span className="text-muted text-[11px] w-5 shrink-0">%</span>
+      </div>
+
+      <span className="label">Mode</span>
+      <select
+        className="input text-[11px] py-0.5 col-span-2"
+        value={m.mode}
+        onChange={(e) => uMod({ mode: e.target.value as LfoMode })}
+        title="Unipolar = one-sided positive sweep. Bipolar = swings around center."
+      >
+        <option value="unipolar">Unipolar</option>
+        <option value="bipolar">Bipolar</option>
+      </select>
+    </>
+  )
+}
+
+// Sample & Hold editor — held-value stair / cosine-smoothed stair with
+// a probability knob that holds samples across multiple clocks.
+function SampleHoldEditor({
+  cell,
+  u
+}: {
+  cell: import('@shared/types').Cell
+  u: CellUpdate
+}): JSX.Element {
+  const m = cell.modulation
+  const sh = m.sh
+  function uMod(patch: Partial<typeof m>): void {
+    u({ modulation: { ...m, ...patch } })
+  }
+  function uSh(patch: Partial<typeof sh>): void {
+    u({ modulation: { ...m, sh: { ...sh, ...patch } } })
+  }
+  return (
+    <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
+      <CompactDepthMode m={m} uMod={uMod} />
+      <CompactRateControls m={m} uMod={uMod} />
+
+      <span className="label">Smooth</span>
+      <label className="flex items-center gap-1 col-span-2 text-[11px]">
+        <input
+          type="checkbox"
+          checked={sh.smooth}
+          onChange={(e) => uSh({ smooth: e.target.checked })}
+        />
+        <span>Cosine-interpolate between samples (analog S&amp;H)</span>
+      </label>
+
+      <span className="label">Prob.</span>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={Math.round(sh.probability * 100)}
+        onChange={(e) => uSh({ probability: clamp(Number(e.target.value), 0, 100) / 100 })}
+      />
+      <div className="flex items-center gap-1 justify-end">
+        <BoundedNumberInput
+          className="input w-14 text-right"
+          integer
+          min={0}
+          max={100}
+          value={Math.round(sh.probability * 100)}
+          onChange={(v) => uSh({ probability: v / 100 })}
+        />
+        <span className="text-muted text-[11px] w-5 shrink-0">%</span>
+      </div>
+
+      <div className="col-span-3 text-[10px] text-muted italic">
+        Below 100 % the modulator sometimes holds its previous sample
+        across clocks — Turing-Machine-style locked-in feel.
+      </div>
+    </div>
+  )
+}
+
+// Slew editor — random target at the clock rate, exponential glide.
+function SlewEditor({
+  cell,
+  u
+}: {
+  cell: import('@shared/types').Cell
+  u: CellUpdate
+}): JSX.Element {
+  const m = cell.modulation
+  const s = m.slew
+  function uMod(patch: Partial<typeof m>): void {
+    u({ modulation: { ...m, ...patch } })
+  }
+  function uSlew(patch: Partial<typeof s>): void {
+    u({ modulation: { ...m, slew: { ...s, ...patch } } })
+  }
+  return (
+    <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
+      <CompactDepthMode m={m} uMod={uMod} />
+      <CompactRateControls m={m} uMod={uMod} />
+
+      <span className="label">Rise</span>
+      <input
+        type="range"
+        min={1}
+        max={5000}
+        step={1}
+        value={s.riseMs}
+        onChange={(e) => uSlew({ riseMs: clamp(Number(e.target.value), 1, 60000) })}
+      />
+      <div className="flex items-center gap-1 justify-end">
+        <BoundedNumberInput
+          className="input w-14 text-right"
+          integer
+          min={1}
+          max={60000}
+          value={s.riseMs}
+          onChange={(v) => uSlew({ riseMs: v })}
+        />
+        <span className="text-muted text-[11px] w-5 shrink-0">ms</span>
+      </div>
+
+      <span className="label">Fall</span>
+      <input
+        type="range"
+        min={1}
+        max={5000}
+        step={1}
+        value={s.fallMs}
+        onChange={(e) => uSlew({ fallMs: clamp(Number(e.target.value), 1, 60000) })}
+      />
+      <div className="flex items-center gap-1 justify-end">
+        <BoundedNumberInput
+          className="input w-14 text-right"
+          integer
+          min={1}
+          max={60000}
+          value={s.fallMs}
+          onChange={(v) => uSlew({ fallMs: v })}
+        />
+        <span className="text-muted text-[11px] w-5 shrink-0">ms</span>
+      </div>
+
+      <span className="label">Target</span>
+      <label className="flex items-center gap-1 col-span-2 text-[11px]">
+        <input
+          type="checkbox"
+          checked={s.randomTarget}
+          onChange={(e) => uSlew({ randomTarget: e.target.checked })}
+        />
+        <span>Random target each clock (off = ±1 square)</span>
+      </label>
+
+      <div className="col-span-3 text-[10px] text-muted italic">
+        Rise / Fall are half-life times (63 % of the move). Tune them
+        asymmetrically for slow-rise / fast-fall envelope feel, or both
+        equal for smooth symmetric glide.
+      </div>
+    </div>
+  )
+}
+
+// Chaos editor — logistic map r parameter. 3.5..4.0 covers period-doubling
+// cascade through full chaos; below 3.5 the map converges to a stable
+// cycle (boring). Above 4.0 it escapes (0..1 invariant fails).
+function ChaosEditor({
+  cell,
+  u
+}: {
+  cell: import('@shared/types').Cell
+  u: CellUpdate
+}): JSX.Element {
+  const m = cell.modulation
+  const c = m.chaos
+  function uMod(patch: Partial<typeof m>): void {
+    u({ modulation: { ...m, ...patch } })
+  }
+  function uChaos(patch: Partial<typeof c>): void {
+    u({ modulation: { ...m, chaos: { ...c, ...patch } } })
+  }
+  return (
+    <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
+      <CompactDepthMode m={m} uMod={uMod} />
+      <CompactRateControls m={m} uMod={uMod} />
+
+      <span className="label">r</span>
+      <input
+        type="range"
+        min={3.4}
+        max={4.0}
+        step={0.001}
+        value={c.r}
+        onChange={(e) => uChaos({ r: clamp(Number(e.target.value), 3.4, 4.0) })}
+        title="3.5 ~ stable 4-cycle · 3.57 onset of chaos · 3.83 period-3 window · 4.0 fully chaotic"
+      />
+      <div className="flex items-center gap-1 justify-end">
+        <BoundedNumberInput
+          className="input w-14 text-right"
+          min={3.4}
+          max={4.0}
+          value={Number(c.r.toFixed(3))}
+          onChange={(v) => uChaos({ r: v })}
+        />
+        <span className="text-muted text-[11px] w-5 shrink-0" />
+      </div>
+
+      <div className="col-span-3 text-[10px] text-muted italic">
+        Logistic map x ← r · x · (1 − x). 3.57 is the onset of chaos;
+        3.83 hides a brief period-3 window (audible structure in a sea
+        of noise); 4.0 is fully chaotic.
+      </div>
+    </div>
+  )
+}
+
 // One-shot ramp modulator editor. Layout mirrors the Envelope editor so
 // the two feel like siblings: sync picker on top, then the time field,
 // curve, depth, and a small live visualizer.
@@ -1468,6 +1891,53 @@ function CollapsibleSection({
         {headerRight}
       </div>
       {enabled && <div className="flex flex-col gap-2 mt-1">{children}</div>}
+    </div>
+  )
+}
+
+// Euclidean pattern preview — row of N squares, filled for hit steps and
+// empty for misses. The currently-playing step gets an accent ring when
+// the sequencer is running. Pure visualization; editing happens through
+// the Pulses / Rotation sliders above.
+function EuclideanPreview({
+  steps,
+  pulses,
+  rotation,
+  currentStep
+}: {
+  steps: number
+  pulses: number
+  rotation: number
+  currentStep: number
+}): JSX.Element {
+  const s = Math.max(1, Math.min(16, Math.floor(steps)))
+  const p = Math.max(0, Math.min(s, Math.floor(pulses)))
+  const r = Math.max(0, Math.min(s - 1, Math.floor(rotation)))
+  const pat = euclidean(p, s, r)
+  return (
+    <div className="mt-2 flex items-center gap-1">
+      <span className="label shrink-0">Pattern</span>
+      <div className="flex gap-[3px] flex-wrap">
+        {pat.map((hit, i) => (
+          <div
+            key={i}
+            className="w-4 h-4 rounded-sm border"
+            style={{
+              borderColor: hit ? 'rgb(var(--c-accent))' : 'rgb(var(--c-border))',
+              background: hit
+                ? i === currentStep
+                  ? 'rgb(var(--c-accent))'
+                  : 'rgb(var(--c-accent) / 0.3)'
+                : i === currentStep
+                  ? 'rgb(var(--c-border))'
+                  : 'transparent',
+              outline: i === currentStep ? '1px solid rgb(var(--c-accent2))' : 'none',
+              outlineOffset: i === currentStep ? '1px' : undefined
+            }}
+            title={`Step ${i + 1} — ${hit ? 'hit' : 'rest'}`}
+          />
+        ))}
+      </div>
     </div>
   )
 }

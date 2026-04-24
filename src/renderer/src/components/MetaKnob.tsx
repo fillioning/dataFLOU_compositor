@@ -13,7 +13,7 @@
 // Drag sensitivity: 200 px of vertical travel = full 0..1 range. Shift = 4×
 // slower. Double-click resets to 0.
 
-import { useRef } from 'react'
+import { memo, useRef } from 'react'
 import { useStore } from '../store'
 import { scaleMetaValue } from '@shared/factory'
 import type { MetaKnob as MetaKnobModel } from '@shared/types'
@@ -32,7 +32,14 @@ function formatValue(v: number): string {
   return v.toFixed(3)
 }
 
-export default function MetaKnob({
+// Memoized: the parent re-renders the whole knob row whenever ANY bank-wide
+// state changes (e.g. a different knob's tween ticks metaKnobDisplayValues).
+// With 8 visible knobs each subscribing to ~6 store slices, an un-memoized
+// MetaKnob re-rendered all 8 tiles every tween frame. memo() with the
+// default shallow-prop comparison means only the knob whose parent props
+// actually changed renders — and each knob's own useStore subscriptions
+// still trigger its individual re-renders when its slice updates.
+function MetaKnobImpl({
   knob,
   index,
   selected
@@ -237,3 +244,6 @@ export default function MetaKnob({
     </div>
   )
 }
+
+const MetaKnob = memo(MetaKnobImpl)
+export default MetaKnob

@@ -14,8 +14,8 @@ You build a grid of **Messages** (rows — each row is one OSC message destinati
 - **Per‑clip triggers** let you fire individual messages without launching the whole scene.
 - **Multi‑value OSC** — space‑separated entries in a clip's Value field become multiple OSC args in a single message. Every modulator treats each entry independently.
 - **Scale 0.0–1.0** — clamps each output channel to `[0, 1]`; with the Arpeggiator it proportionally normalizes the ladder instead of clipping.
-- **Five modulation types** — pick per clip: **LFO**, **Ramp**, **Envelope (ADSR)**, **Arpeggiator**, **Random Generator**.
-- **Sequencer (1–16 steps)** — cycles through per‑step values at BPM (session‑locked), Tempo (per‑clip slider), or Free (ms). With Modulation also on, the modulator operates on the current step value.
+- **Eight modulation types** — pick per clip: **LFO**, **Ramp**, **Envelope (ADSR)**, **Arpeggiator**, **Random Generator**, **Sample & Hold**, **Slew**, **Chaos** (logistic map). All share one clock-rate control (Free Hz or BPM-synced with dotted/triplet).
+- **Sequencer (1–16 steps) with Euclidean mode** — classic step cycle, or **Euclidean**: N pulses distributed evenly across M steps with rotation. Runs at BPM (session-locked), Tempo (per-clip slider), or Free (ms). With Modulation also on, the modulator operates on the current step value.
 - **Transitions** morph the previous clip's value into the new one over a configurable time, even while the LFO keeps running.
 - **Ableton‑style follow actions** — Stop / Loop / Next / Previous / First / Last / Any / Other, plus a per‑scene **×Multiplicator** (how many times the scene plays before the follow action fires).
 - **Sequence grid** — 1–128‑step drag‑laid sequence in the Sequence view, with a floating drag preview while you drop scenes into slots.
@@ -157,11 +157,25 @@ Each clip carries the full per‑scene settings for one Message. Open a clip in 
   - **Rate**: same Free/BPM/dotted/triplet as LFO.
   - Multi‑value Value fields emit one random per entry (3 per entry in Colour mode).
 
+  **Sample & Hold** — classic modular-synth S&H. Emits a fresh sample in [−1, 1] on each clock tick, holds between:
+  - **Smooth** — on = cosine-interpolate prev → held across the sample period (analog S&H); off = hard digital stair.
+  - **Probability** 0–100 % — below 100 %, a clock tick sometimes holds the previous sample instead of drawing a new one (Turing-Machine-style "locked-in" feel).
+  - **Mode** Unipolar (0…1) or Bipolar (−1…1), same semantics as LFO.
+
+  **Slew** — generates an internal target at the clock rate and glides toward it with independent rise/fall time constants. Feels like a tamed random LFO with analog glide:
+  - **Rise / Fall** 1 ms … 60 s, half-life (63 % of the move). Asymmetric rise/fall gives you slow-attack / fast-release (or vice versa).
+  - **Target** — Random each clock (default, unpredictable wander), or OFF = bipolar ±1 square wave (predictable glide ramps).
+
+  **Chaos** — logistic-map iteration `x ← r · x · (1 − x)` at the clock rate:
+  - **r** 3.4 – 4.0: below 3.57 = stable cycle (boring), 3.57+ = onset of chaos, 3.83 hides a brief period-3 window (audible structure in a noise sea), 4.0 = fully chaotic.
+  - Deterministic (per-trigger seed with small jitter so adjacent cells diverge) but feels random. Output in [−1, 1] (bipolar) or [0, 1] (unipolar).
+
 - **Sequencer** (collapsed by default — tick the checkbox to expand)
+  - **Pattern**: **Steps (cycle)** — classic 1…N step cycle; or **Euclidean** — N `Pulses` distributed as evenly as possible across N `Steps` total slots, with `Rotate` offset. Hit steps emit their step-value normally; miss steps emit nothing (receiver holds its last value). A live preview row shows the computed pattern and the currently-playing step.
   - Steps: 1 – 16 (default 8)
   - **Sync mode**: **Sync (BPM)** — lock to session global BPM; **Sync (Tempo)** — use the clip's own tempo slider; **Free (ms)** — independent step duration.
-  - Per‑step values, auto‑detected like the main Value field
-  - The currently playing step is highlighted in the inspector and pulses orange. With Modulation also on, the modulator operates on the current step's value.
+  - Per‑step values, auto‑detected like the main Value field.
+  - The currently playing step is highlighted in the inspector and pulses orange. With Modulation also on, the modulator operates on the current step's value (on hit steps only, in Euclidean mode).
 
 #### Visual cues
 
@@ -382,6 +396,34 @@ src/
 ```
 
 ---
+
+## Release notes — 0.3.6
+
+Three new modulators, Euclidean sequencing, and a stack of correctness + performance fixes.
+
+### New modulators
+- **Sample & Hold** — classic S&H with optional cosine-smoothed output and a `Probability` knob that holds samples across multiple clocks (Turing-Machine locked-in feel).
+- **Slew** — random target at the clock rate, glides toward it with **independent rise/fall half-life** (1 ms – 60 s each). Asymmetric rise/fall gives analog envelope character; off-target mode produces predictable ±1 square-wave glides.
+- **Chaos** — logistic-map iteration (`r` 3.4 – 4.0). Deterministic but feels random; 3.83 hides the famous period-3 window.
+- All three share the existing Free Hz / BPM-synced (dotted/triplet) clock controls and Unipolar / Bipolar output modes, so they drop in alongside LFO-style workflows.
+
+### Euclidean sequencer
+- New **Pattern: Steps (cycle) | Euclidean** selector at the top of the Sequencer block. Euclidean mode exposes **Pulses**, **Rotate**, and a live preview row of boxes (filled for hits, outlined for misses, accent-ringed on the playing step).
+- Hit steps emit `stepValues[i]` normally; miss steps emit no OSC (receiver holds its last value). Pattern comes from Toussaint's angle method (equivalent to Bjorklund for our purposes), memoized per (pulses, steps, rotation) triple.
+- Cell badge shows `EUC 3/8` (or `EUC 5/8 +2` with rotation).
+
+### Engine / correctness fixes
+- **Follow actions finally work everywhere.** Two bugs fixed: (1) the scene passed to the duration-timer closure was captured by reference, so edits made mid-duration (changing `nextMode` or `multiplicator` in the UI) never took effect until the next retrigger; (2) `next/prev/first/last/any/other` silently turned into Stop when the Sequence grid was empty. The engine now re-reads the scene from the live session on every timer fire, and falls back to the palette as the walk list when the grid is empty.
+- **Stop actually stops.** Previously the engine kept a scene "alive" as long as any cell had modulation or sequencer enabled (original "keep-alive carve-out"). Now `Stop` morphs every armed cell to 0 over its `transitionMs` and clears `activeSceneId`. Clean full stop.
+- **S&H smooth mode math fixed.** Cosine period was `2π` instead of `π`, causing output to wobble prev → held → prev inside every sample period instead of smoothly tweening prev → held. Now interpolates correctly.
+- **Shutdown sequencing.** Duplicate `before-quit` handlers consolidated into a single idempotent `shutdown()` so `autosave.stopAutosave` can't run twice, and the OSC flush interval is cleared in the right order relative to `engine.stop()`.
+
+### UI polish
+- **Next dropdown widened** (`Previous`, `First`, `Last`, etc. no longer crop on narrow scene columns).
+- **MetaKnob is memoized** — during knob tweens / bank switches, the parent `MetaControllerBar` re-renders but the individual knob components now skip when their `{knob, index, selected}` props haven't changed. Noticeable smoother during MIDI CC sweeps and drag gestures.
+
+### Cleanup
+- Dead `StatusBar` component removed from `SequenceView` (~100 lines) — the global `TransportBar` has been doing the job since 0.3.5.
 
 ## Release notes — 0.3.5
 

@@ -27,8 +27,18 @@ export type NextMode =
   | 'other'
 
 // Order here matters for the Inspector dropdown order: Ramp sits second,
-// right before Envelope, so the "one-shot" options are grouped.
-export type ModType = 'lfo' | 'ramp' | 'envelope' | 'arpeggiator' | 'random'
+// right before Envelope, so the "one-shot" options are grouped. The
+// three modular-synth-inspired additions (sh / slew / chaos) live at the
+// end, after Random, since they're kindred spirits.
+export type ModType =
+  | 'lfo'
+  | 'ramp'
+  | 'envelope'
+  | 'arpeggiator'
+  | 'random'
+  | 'sh'
+  | 'slew'
+  | 'chaos'
 export type LfoMode = 'unipolar' | 'bipolar'
 export type LfoSync = 'free' | 'bpm'
 // Envelope / Ramp sync:
@@ -88,6 +98,45 @@ export interface EnvelopeParams {
   totalMs: number
 }
 
+// Sample & Hold — emits a fresh sample on every clock tick, holds between.
+// Additive: the held value is scaled by depthPct and added to center (same
+// signal path as the LFO). Mode picks bipolar (-1..1) vs unipolar (0..1)
+// range, shared with LFO semantics.
+export interface SampleHoldParams {
+  // Smooth between samples (cosine-interpolated, like LFO's rndSmooth) vs
+  // hard step. Smooth = analog S&H with built-in slew; step = classic
+  // digital stair.
+  smooth: boolean
+  // Probability in [0, 1] that a clock tick produces a NEW sample. Below
+  // 1.0 the output occasionally "holds" across multiple ticks, giving
+  // that Music-Thing-Turing-Machine locked-in feel without the full state
+  // machine.
+  probability: number
+}
+
+// Slew limiter — generates an internal random target on each clock tick,
+// then slews from the current value toward that target at independent
+// rise/fall rates. Feels like a tamed random LFO with analog glide.
+// Additive like LFO.
+export interface SlewParams {
+  // Rise / fall half-life in ms (time for 63 % of the move, exponential).
+  // Split so you can dial in a slow-up / fast-down envelope feel.
+  riseMs: number
+  fallMs: number
+  // Whether each clock tick draws a fresh random target (true) or just
+  // follows a bipolar square wave at the clock rate (false — useful for
+  // predictable glide ramps).
+  randomTarget: boolean
+}
+
+// Chaos — iterates the logistic map x ← r · x · (1 − x) at the clock rate.
+// Parameter `r` in [3.4, 4.0] tips the map from stable 2-/4-/8-cycles
+// through the period-doubling cascade into full chaos. Produces values in
+// (0, 1), mapped to bipolar at output.
+export interface ChaosParams {
+  r: number // 3.4 .. 4.0
+}
+
 // Ramp modulator — one-shot 0→target ramp over `rampMs` (or scene fraction
 // when synced). Curve bends the interpolation: 0% = linear, +100% = strong
 // ease-out (fast rise, long tail), -100% = strong ease-in (slow rise,
@@ -121,6 +170,10 @@ export interface Modulation {
   arpeggiator: ArpeggiatorParams
   // Random Generator params (used when type='random'). Rate also shared.
   random: RandomParams
+  // S&H / Slew / Chaos params (all share the LFO's rate controls).
+  sh: SampleHoldParams
+  slew: SlewParams
+  chaos: ChaosParams
 }
 
 // Sequencer tempo source:
@@ -129,13 +182,26 @@ export interface Modulation {
 //   'free'  — use the per-clip stepMs value (independent of any BPM)
 export type SeqSyncMode = 'bpm' | 'tempo' | 'free'
 
+// Sequencer drive mode:
+//   'steps'     — classic 1..16 step cycle, each step plays stepValues[i].
+//   'euclidean' — Bjorklund pattern: `pulses` active hits distributed as
+//                 evenly as possible over `steps` total, rotated by
+//                 `rotation`. Active step i still emits stepValues[i];
+//                 inactive steps are silent (no OSC sent, cell output
+//                 stays at its last sent value).
+export type SeqMode = 'steps' | 'euclidean'
+
 export interface SequencerParams {
   enabled: boolean
-  steps: number // 1..16, active count
+  steps: number // 1..16, active count (also euclidean total steps)
   syncMode: SeqSyncMode
   bpm: number // 10..500 — used when syncMode='sync' (1 step per beat)
   stepMs: number // used when syncMode='free'
   stepValues: string[] // fixed length 16; only first `steps` fire at runtime
+  // Euclidean fields — only meaningful when mode === 'euclidean'.
+  mode: SeqMode
+  pulses: number   // 1..steps
+  rotation: number // 0..steps-1
 }
 
 export interface Cell {
@@ -311,6 +377,13 @@ export interface EngineState {
   currentValueBySceneAndTrack: Record<string, Record<string, string>>
   activeSceneId: string | null
   activeSceneStartedAt: number | null
+  // Which sequence slot was the source of the current activeSceneId.
+  // Used by the Sequence-view grid to highlight ONLY the specific slot
+  // that fired — a scene placed at multiple positions in the grid should
+  // not highlight every instance simultaneously. `null` when the scene
+  // was triggered from the palette / column header / MIDI / cue and
+  // didn't originate from a specific sequence slot.
+  activeSequenceSlotIdx: number | null
   tickRateHz: number
 }
 
@@ -332,6 +405,17 @@ export interface OscEvent {
   args: { type: 'i' | 'f' | 's' | 'T' | 'F'; value: number | string | boolean }[]
 }
 
+// Fired when a send fails — surfaced in the UI as a red health dot next
+// to destinations and as [ERR] rows in the OSC monitor. Socket-level
+// errors that can't be attributed to one destination use ip='*', port=0.
+export interface OscErrorEvent {
+  timestamp: number
+  ip: string
+  port: number
+  address: string
+  message: string
+}
+
 // Window.api signature — consumed by renderer.
 // MIDI is handled via Web MIDI in the renderer (not through IPC).
 export interface ExposedApi {
@@ -339,10 +423,16 @@ export interface ExposedApi {
   triggerCell: (sceneId: string, trackId: string) => Promise<void>
   stopCell: (sceneId: string, trackId: string) => Promise<void>
   // `opts.morphMs` — optional scene-to-scene morph duration in ms. When
-  // set, every cell in the scene glides over this time, and any tracks
-  // active from the previous scene that don't exist in this one fade
-  // out over the same duration.
-  triggerScene: (sceneId: string, opts?: { morphMs?: number }) => Promise<void>
+  //   set, every cell in the scene glides over this time, and any tracks
+  //   active from the previous scene that don't exist in this one fade
+  //   out over the same duration.
+  // `opts.sourceSlotIdx` — slot index (0-based into session.sequence) the
+  //   trigger originated from. Sequence view uses it to highlight the
+  //   specific slot that fired when a scene is placed multiple times.
+  triggerScene: (
+    sceneId: string,
+    opts?: { morphMs?: number; sourceSlotIdx?: number | null }
+  ) => Promise<void>
   stopScene: (sceneId: string) => Promise<void>
   stopAll: () => Promise<void>
   panic: () => Promise<void>
@@ -368,4 +458,7 @@ export interface ExposedApi {
   // Batched outgoing OSC events (for the OSC monitor panel). Each callback
   // fire delivers a batch of messages accumulated on the main side.
   onOscEvents: (cb: (batch: OscEvent[]) => void) => () => void
+  // Batched OSC send errors. Rendered as the health dot next to each
+  // destination + as [ERR] rows in the OSC monitor drawer.
+  onOscErrors: (cb: (batch: OscErrorEvent[]) => void) => () => void
 }

@@ -6,6 +6,8 @@ import EditView from './components/EditView'
 import MetaControllerBar from './components/MetaControllerBar'
 import SequenceView from './components/SequenceView'
 import OscMonitor from './components/OscMonitor'
+import { attachOscErrorStream } from './hooks/oscHealth'
+import { IntegrityPromptHost } from './components/IntegrityPromptHost'
 import CrashRecoveryPrompt from './components/CrashRecoveryPrompt'
 import TransportBar from './components/TransportBar'
 
@@ -56,6 +58,14 @@ export default function App(): JSX.Element {
   // Init MIDI once.
   useEffect(() => {
     midi.init()
+  }, [])
+
+  // Attach the main → renderer OSC-error stream once on startup. This
+  // populates the per-destination health map that `useOscDestHealth()`
+  // reads from; the IPC listener stays attached for the process lifetime
+  // (App never unmounts in practice).
+  useEffect(() => {
+    attachOscErrorStream()
   }, [])
 
   // Global Ctrl+wheel zoom for everything below the main toolbar. Scroll
@@ -211,14 +221,15 @@ export default function App(): JSX.Element {
         if (isEditableTarget(e.target)) return
         if (e.key >= '1' && e.key <= '9') {
           e.preventDefault()
-          const id = sceneIdAtSlot(Number(e.key) - 1)
-          if (id) useStore.getState().triggerSceneWithMorph(id)
+          const slot = Number(e.key) - 1
+          const id = sceneIdAtSlot(slot)
+          if (id) useStore.getState().triggerSceneWithMorph(id, slot)
           return
         }
         if (e.key === '0') {
           e.preventDefault()
           const id = sceneIdAtSlot(9)
-          if (id) useStore.getState().triggerSceneWithMorph(id)
+          if (id) useStore.getState().triggerSceneWithMorph(id, 9)
           return
         }
       }
@@ -329,6 +340,10 @@ export default function App(): JSX.Element {
       {/* Shown once at startup if we detect the previous run crashed
           (autosave sentinel file was left behind). No-op otherwise. */}
       <CrashRecoveryPrompt />
+      {/* Integrity-check modal — shown by the store when a session load
+          (Open dialog or crash recovery restore) finds malformed fields.
+          Idle / null when there's nothing to resolve. */}
+      <IntegrityPromptHost />
     </div>
   )
 }

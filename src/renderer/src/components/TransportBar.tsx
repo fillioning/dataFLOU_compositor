@@ -11,6 +11,7 @@
 
 import { useEffect, useState } from 'react'
 import { useStore } from '../store'
+import { formatRemaining, useSceneCountdown } from '../hooks/useSceneCountdown'
 import { BoundedNumberInput } from './BoundedNumberInput'
 
 export default function TransportBar(): JSX.Element {
@@ -158,6 +159,10 @@ export default function TransportBar(): JSX.Element {
       <div className="flex items-center gap-2 text-muted">
         {activeSceneId && !paused && <span className="text-accent">● playing</span>}
         {paused && <span className="text-accent2">⏸ paused</span>}
+        {/* Live countdown on the currently-playing scene. Reads from the
+            engine's active-scene-started-at timestamp; hides when nothing
+            is playing or the sequence is paused (duration is frozen). */}
+        {activeSceneId && !paused && <ActiveSceneCountdown sceneId={activeSceneId} />}
       </div>
 
       <div className="h-6 w-px bg-border" />
@@ -410,6 +415,24 @@ function MorphSection(): JSX.Element {
 
 // Human-readable labels for a MidiBinding. `bindingLabel` is for tooltips
 // (full info), `bindingShort` for compact chips.
+// Live-countdown badge for the transport-bar "● playing" strip. Looks up
+// the active scene in the session to read its duration, then uses the
+// shared useSceneCountdown hook to self-tick.
+function ActiveSceneCountdown({ sceneId }: { sceneId: string }): JSX.Element | null {
+  const scene = useStore((s) => s.session.scenes.find((sc) => sc.id === sceneId))
+  const durationSec = scene?.durationSec ?? 0
+  const { active, remainingMs } = useSceneCountdown(sceneId, durationSec)
+  if (!active || !scene) return null
+  return (
+    <span
+      className="text-accent font-mono tabular-nums text-[11px]"
+      title={`Scene "${scene.name}" — time remaining in its duration`}
+    >
+      {formatRemaining(remainingMs)} left
+    </span>
+  )
+}
+
 function bindingLabel(b: {
   kind: 'note' | 'cc'
   channel: number

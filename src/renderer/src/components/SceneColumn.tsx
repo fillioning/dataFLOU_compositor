@@ -273,7 +273,12 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           <span className="text-muted">s</span>
           <span className="label ml-1">Next</span>
           <select
-            className="input flex-1 min-w-0 text-[11px] py-0.5"
+            // select-compact swaps the bulky native dropdown arrow (~20 px
+            // on Windows, ~24 px on macOS) for a small 8 px SVG chevron —
+            // reclaims enough room that even "Previous" + chevron fit in
+            // ~70 px without the overflowing-column look we had with the
+            // native control. min-w-0 lets flex-1 shrink naturally.
+            className="input select-compact flex-1 min-w-0 text-[11px] py-0.5"
             value={scene.nextMode}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
