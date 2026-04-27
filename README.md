@@ -2,6 +2,8 @@
 
 **Send OSC data to many destinations as triggerable scenes.** A rotated‑Ableton‑Session‑style editor that fires multiple OSC messages at once with optional modulation, sequencing, transitions, delays, and MIDI control.
 
+![dataFLOU_compositor — Edit view](docs/images/dataFLOU_Compositor_EditMode.png)
+
 Built as a desktop app for Windows and macOS using Electron + React. Sessions are saved as plain JSON files and round‑trip cleanly between machines.
 
 ---
