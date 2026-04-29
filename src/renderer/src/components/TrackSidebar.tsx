@@ -51,7 +51,10 @@ export default function TrackSidebar(): JSX.Element {
   const showMode = useStore((s) => s.showMode)
   const instantiateTemplate = useStore((s) => s.instantiateTemplate)
   const instantiateFunction = useStore((s) => s.instantiateFunction)
-  const addFunctionToTemplate = useStore((s) => s.addFunctionToTemplate)
+  const addInstrumentRow = useStore((s) => s.addInstrumentRow)
+  const addFunctionToInstrumentRow = useStore((s) => s.addFunctionToInstrumentRow)
+  const saveAsTemplate = useStore((s) => s.saveAsTemplate)
+  const oscMonitorOpen = useStore((s) => s.oscMonitorOpen)
   const setOscMonitorOpen = useStore((s) => s.setOscMonitorOpen)
   // Show mode forces the compact layout even when the user had the bar
   // expanded pre-entry — performers see more rows/scenes at once and the
@@ -241,11 +244,11 @@ export default function TrackSidebar(): JSX.Element {
                 </button>
                 <button
                   data-hide-in-show="true"
-                  className="btn"
-                  onClick={() => setOscMonitorOpen(true)}
-                  title="Open the OSC monitor + Pool drawer to drag in Templates"
+                  className={`btn ${oscMonitorOpen ? 'bg-accent text-black border-accent' : ''}`}
+                  onClick={() => setOscMonitorOpen(!oscMonitorOpen)}
+                  title="Toggle the OSC monitor + Pool drawer"
                 >
-                  Pool…
+                  Pool
                 </button>
               </div>
             </div>
@@ -353,102 +356,126 @@ export default function TrackSidebar(): JSX.Element {
       {menu &&
         createPortal(
           <div
-            className="fixed z-50 bg-panel border border-border rounded shadow-lg py-1 text-[12px] min-w-[200px]"
+            className="fixed z-50 bg-panel border border-border rounded shadow-lg py-1 text-[12px] min-w-[220px]"
             style={{ left: menu.x, top: menu.y }}
             onMouseDown={(e) => e.stopPropagation()}
           >
-            {/* Add Template / Add Function — always available. Both open
-                the Pool drawer because that's where authoring lives. */}
-            <button
-              className="w-full text-left px-3 py-1 hover:bg-panel2"
-              onClick={() => {
-                setMenu(null)
-                setOscMonitorOpen(true)
-              }}
-            >
-              Open Pool drawer…
-            </button>
-            <div className="border-t border-border my-1" />
-            <button
-              className="w-full text-left px-3 py-1 hover:bg-panel2"
-              onClick={() => {
-                setMenu(null)
-                addTrack() // orphan Function row, default name
-              }}
-            >
-              Add orphan Function (blank row)
-            </button>
-            {/* Add a Function inside an existing template group. Available
-                when the right-click anchor was a Template row OR a
-                Function row that already has a parent. */}
+            {/* Resolve the "anchor template" once — i.e. the Template
+                row this right-click is "inside" (either it WAS a
+                Template row, or it was a Function row whose parent is
+                a Template row). Drives the conditional menu items. */}
             {(() => {
-              if (!menu.anchorTrackId) return null
-              const anchor = tracks.find((tt) => tt.id === menu.anchorTrackId)
-              if (!anchor) return null
-              const groupTpl =
-                anchor.kind === 'template'
-                  ? anchor
-                  : anchor.parentTrackId
-                    ? tracks.find((tt) => tt.id === anchor.parentTrackId)
-                    : null
-              if (!groupTpl) return null
-              const tplDef = groupTpl.sourceTemplateId
-                ? templateById.get(groupTpl.sourceTemplateId)
+              const anchor = menu.anchorTrackId
+                ? tracks.find((tt) => tt.id === menu.anchorTrackId) ?? null
                 : null
+              const groupTpl =
+                anchor?.kind === 'template'
+                  ? anchor
+                  : anchor?.parentTrackId
+                    ? tracks.find((tt) => tt.id === anchor.parentTrackId) ?? null
+                    : null
+              const groupTplName = groupTpl?.name ?? ''
               return (
-                <button
-                  className="w-full text-left px-3 py-1 hover:bg-panel2"
-                  disabled={!tplDef}
-                  onClick={() => {
-                    setMenu(null)
-                    if (!tplDef) return
-                    // Add a NEW function spec to the source Template,
-                    // then instantiate it into the live group.
-                    const newFnId = addFunctionToTemplate(tplDef.id)
-                    if (!newFnId) return
-                    instantiateFunction(
-                      tplDef.id,
-                      newFnId,
-                      groupTpl.id,
-                      groupTpl.id
-                    )
-                  }}
-                  title={
-                    tplDef
-                      ? `Adds a new Function to "${tplDef.name}" and instantiates it here`
-                      : 'Source template no longer in the Pool'
-                  }
-                >
-                  Add Function to "{groupTpl.name}"…
-                </button>
+                <>
+                  {/* 1. Add Instrument — creates an empty draft Template
+                         row in the sidebar (Pool gets a hidden draft entry
+                         behind it). Always available. */}
+                  <button
+                    className="w-full text-left px-3 py-1 hover:bg-panel2"
+                    onClick={() => {
+                      const insertAfter = menu.anchorTrackId
+                      setMenu(null)
+                      addInstrumentRow(insertAfter)
+                    }}
+                  >
+                    Add Instrument
+                  </button>
+
+                  {/* 2. Add orphan Function — the old "+ Message" path,
+                         creates a no-parent Function row. */}
+                  <button
+                    className="w-full text-left px-3 py-1 hover:bg-panel2"
+                    onClick={() => {
+                      setMenu(null)
+                      addTrack()
+                    }}
+                  >
+                    Add orphan Function
+                  </button>
+
+                  {/* 3. Add Function to <Instrument> — only when right-
+                         clicked inside an Instrument group. */}
+                  {groupTpl && (
+                    <button
+                      className="w-full text-left px-3 py-1 hover:bg-panel2"
+                      onClick={() => {
+                        setMenu(null)
+                        addFunctionToInstrumentRow(groupTpl.id)
+                      }}
+                      title={`Add a new Function to "${groupTplName}"`}
+                    >
+                      Add Function to "{groupTplName}"
+                    </button>
+                  )}
+
+                  {/* 4. Save as Template — only when the anchor is a
+                         Template row (i.e. the user right-clicked the
+                         header itself). Prompts for a name and flips
+                         the linked Pool entry from draft → saved. */}
+                  {anchor?.kind === 'template' && anchor.sourceTemplateId && (
+                    <>
+                      <div className="border-t border-border my-1" />
+                      <button
+                        className="w-full text-left px-3 py-1 hover:bg-panel2"
+                        onClick={() => {
+                          setMenu(null)
+                          const proposed = anchor.name || 'My Instrument'
+                          const name = prompt(
+                            'Save Instrument as Template — name?',
+                            proposed
+                          )
+                          if (name && name.trim()) {
+                            saveAsTemplate(anchor.id, name.trim())
+                          }
+                        }}
+                        title="Save this Instrument + all its Functions as a reusable Template in the Pool"
+                      >
+                        Save as Template…
+                      </button>
+                    </>
+                  )}
+
+                  {/* 5. Delete (existing). */}
+                  {menu.targets.length > 0 && (
+                    <>
+                      <div className="border-t border-border my-1" />
+                      <button
+                        className="w-full text-left px-3 py-1 hover:bg-panel2 text-danger"
+                        onClick={() => {
+                          const ids = menu.targets
+                          setMenu(null)
+                          const n = ids.length
+                          if (n === 0) return
+                          const target = tracks.find((t) => t.id === ids[0])
+                          const label =
+                            n === 1
+                              ? `Delete "${target?.name ?? ''}"?` +
+                                (target?.kind === 'template'
+                                  ? ' (Will also delete its Function children.)'
+                                  : '')
+                              : `Delete ${n} instruments?`
+                          if (confirm(label)) removeTracks(ids)
+                        }}
+                      >
+                        {menu.targets.length > 1
+                          ? `Delete ${menu.targets.length} instruments`
+                          : 'Delete instrument'}
+                      </button>
+                    </>
+                  )}
+                </>
               )
             })()}
-            {menu.targets.length > 0 && (
-              <>
-                <div className="border-t border-border my-1" />
-                <button
-                  className="w-full text-left px-3 py-1 hover:bg-panel2 text-danger"
-                  onClick={() => {
-                    const ids = menu.targets
-                    setMenu(null)
-                    const n = ids.length
-                    if (n === 0) return
-                    const label =
-                      n === 1
-                        ? `Delete "${tracks.find((t) => t.id === ids[0])?.name ?? ''}"?` +
-                          (tracks.find((t) => t.id === ids[0])?.kind === 'template'
-                            ? ' (Will also delete its Function children.)'
-                            : '')
-                        : `Delete ${n} instruments?`
-                    if (confirm(label)) removeTracks(ids)
-                  }}
-                >
-                  {menu.targets.length > 1
-                    ? `Delete ${menu.targets.length} instruments`
-                    : 'Delete instrument'}
-                </button>
-              </>
-            )}
           </div>,
           document.body
         )}

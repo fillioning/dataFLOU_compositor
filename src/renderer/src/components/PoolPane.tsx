@@ -1,13 +1,19 @@
 // Pool pane — middle section of the OSC-monitor drawer. Lists every
-// Instrument Template and its Functions. Clicking selects (drives the
-// Inspector pane to the right). Dragging instantiates into the Edit
-// view's left sidebar (drop targets live there).
+// (non-draft) Instrument Template and its Functions. Clicking selects
+// (drives the Edit-view Inspector to the right side of the editor, NOT
+// the drawer — Pool selection now reuses the main Inspector real-estate
+// because it needs more vertical room than the drawer can provide).
 //
-// Templates render Reaper-style: a parent header row in the template's
-// color, each Function indented underneath. The "+" buttons next to each
-// header add a new Function to user-authored templates (builtins are
-// read-only).
+// Templates render Reaper-style with a chevron toggle: click ▶ / ▾ to
+// expand a template's Function list. Templates start COLLAPSED so the
+// Pool stays scannable when the library grows. Selection itself doesn't
+// auto-expand — selecting a Template just shows its Inspector.
+//
+// Drafts (the auto-created backing templates behind sidebar "Add
+// Instrument" rows) are hidden from this list — they only become visible
+// after the user runs "Save as Template".
 
+import { useState } from 'react'
 import { useStore } from '../store'
 import type { InstrumentTemplate, InstrumentFunction } from '@shared/types'
 
@@ -27,7 +33,7 @@ export interface PoolFunctionDragPayload {
 }
 
 export default function PoolPane(): JSX.Element {
-  const templates = useStore((s) => s.session.pool.templates)
+  const allTemplates = useStore((s) => s.session.pool.templates)
   const selection = useStore((s) => s.poolSelection)
   const setSelection = useStore((s) => s.setPoolSelection)
   const addTemplate = useStore((s) => s.addTemplate)
@@ -35,6 +41,23 @@ export default function PoolPane(): JSX.Element {
   const removeTemplate = useStore((s) => s.removeTemplate)
   const removeFunction = useStore((s) => s.removeFunction)
   const duplicateTemplate = useStore((s) => s.duplicateTemplate)
+  // Drafts back the live "Add Instrument" sidebar rows; keep them out
+  // of the Pool browser until the user explicitly Saves-as-Template.
+  const templates = allTemplates.filter((t) => !t.draft)
+
+  // Per-template expand/collapse — local UI state, not persisted. By
+  // default everything is COLLAPSED; you click the chevron to peek
+  // inside a template's Function list. Selection (clicking the header
+  // body) is independent — it doesn't auto-expand.
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
+  function toggleExpand(id: string): void {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -56,13 +79,18 @@ export default function PoolPane(): JSX.Element {
       <div className="flex-1 min-h-0 overflow-y-auto py-1">
         {templates.length === 0 ? (
           <div className="p-3 text-muted text-[11px]">
-            No templates. Click <span className="label">+ Template</span> to author one.
+            No saved Templates yet. Add an Instrument from the sidebar (right-click
+            → <span className="label">Add Instrument</span>) and save it as a
+            Template, or click <span className="label">+ Template</span> here to
+            author one from scratch.
           </div>
         ) : (
           templates.map((t) => (
             <TemplateRow
               key={t.id}
               template={t}
+              expanded={expanded.has(t.id)}
+              onToggleExpand={() => toggleExpand(t.id)}
               selection={selection}
               onSelect={(sel) => setSelection(sel)}
               onAddFunction={() => addFunction(t.id)}
@@ -83,6 +111,8 @@ export default function PoolPane(): JSX.Element {
 
 function TemplateRow({
   template,
+  expanded,
+  onToggleExpand,
   selection,
   onSelect,
   onAddFunction,
@@ -91,6 +121,8 @@ function TemplateRow({
   onDuplicate
 }: {
   template: InstrumentTemplate
+  expanded: boolean
+  onToggleExpand: () => void
   selection: ReturnType<typeof useStore.getState>['poolSelection']
   onSelect: (
     sel: ReturnType<typeof useStore.getState>['poolSelection']
@@ -111,20 +143,28 @@ function TemplateRow({
 
   return (
     <div className="flex flex-col">
-      {/* Template header — parent row, drag source for "instantiate
-          template + all its functions" */}
+      {/* Template header — parent row, drag source. */}
       <div
         draggable
         onDragStart={onTemplateDragStart}
         onClick={() => onSelect({ kind: 'template', templateId: template.id })}
-        className={`relative flex items-center gap-1 px-2 py-1 cursor-grab text-[12px] ${
+        className={`relative flex items-center gap-1 px-1 py-1 cursor-grab text-[12px] ${
           isSelectedTemplate ? 'bg-panel2' : 'hover:bg-panel2/60'
         }`}
-        style={{
-          borderLeft: `3px solid ${template.color}`
-        }}
-        title="Drag onto the Edit-view sidebar to instantiate. Click to edit."
+        style={{ borderLeft: `3px solid ${template.color}` }}
+        title="Drag onto the Edit-view sidebar to instantiate. Click to edit in the right Inspector."
       >
+        {/* Chevron — explicit toggle, never auto-expands on selection */}
+        <button
+          className="text-muted hover:text-text text-[10px] w-4 shrink-0"
+          onClick={(e) => {
+            e.stopPropagation()
+            onToggleExpand()
+          }}
+          title={expanded ? 'Collapse' : `Expand (${template.functions.length} fn)`}
+        >
+          {expanded ? '▾' : '▸'}
+        </button>
         <span className="font-semibold truncate">{template.name}</span>
         {template.builtin && (
           <span
@@ -139,34 +179,35 @@ function TemplateRow({
         </span>
         <div className="flex-1" />
         <button
-          className="text-muted hover:text-text text-[10px] px-1"
+          className="btn text-[10px] py-0.5 px-1.5 shrink-0"
           onClick={(e) => {
             e.stopPropagation()
             onDuplicate()
           }}
-          title="Duplicate as user-editable template"
+          title="Duplicate as a user-editable Template"
         >
-          ⎘
+          Dupl
         </button>
         {!template.builtin && (
           <>
             <button
-              className="text-muted hover:text-text text-[10px] px-1"
+              className="btn text-[10px] py-0.5 px-1.5 shrink-0"
               onClick={(e) => {
                 e.stopPropagation()
                 onAddFunction()
               }}
               title="Add a Function to this Template"
             >
-              +fn
+              + Fn
             </button>
             <button
-              className="text-muted hover:text-danger text-[10px] px-1"
+              className="btn text-[10px] py-0.5 px-1.5 shrink-0"
               onClick={(e) => {
                 e.stopPropagation()
                 onRemoveTemplate()
               }}
               title="Delete this Template"
+              style={{ borderColor: 'rgb(var(--c-danger))', color: 'rgb(var(--c-danger))' }}
             >
               ✕
             </button>
@@ -174,29 +215,29 @@ function TemplateRow({
         )}
       </div>
 
-      {/* Functions — child rows, indented and tinted with the template
-          color so the Reaper-style group is unmistakable */}
-      {template.functions.map((fn) => (
-        <FunctionRow
-          key={fn.id}
-          template={template}
-          fn={fn}
-          isSelected={
-            selection?.kind === 'function' &&
-            selection.templateId === template.id &&
-            selection.functionId === fn.id
-          }
-          onSelect={() =>
-            onSelect({
-              kind: 'function',
-              templateId: template.id,
-              functionId: fn.id
-            })
-          }
-          onRemove={() => onRemoveFunction(fn.id, fn.name)}
-          allowRemove={!template.builtin}
-        />
-      ))}
+      {/* Functions — child rows, hidden when collapsed. */}
+      {expanded &&
+        template.functions.map((fn) => (
+          <FunctionRow
+            key={fn.id}
+            template={template}
+            fn={fn}
+            isSelected={
+              selection?.kind === 'function' &&
+              selection.templateId === template.id &&
+              selection.functionId === fn.id
+            }
+            onSelect={() =>
+              onSelect({
+                kind: 'function',
+                templateId: template.id,
+                functionId: fn.id
+              })
+            }
+            onRemove={() => onRemoveFunction(fn.id, fn.name)}
+            allowRemove={!template.builtin}
+          />
+        ))}
     </div>
   )
 }
@@ -233,12 +274,10 @@ function FunctionRow({
         e.stopPropagation()
         onSelect()
       }}
-      className={`flex items-center gap-2 pl-6 pr-2 py-0.5 cursor-grab text-[11px] ${
+      className={`flex items-center gap-2 pl-7 pr-1 py-0.5 cursor-grab text-[11px] ${
         isSelected ? 'bg-panel2' : 'hover:bg-panel2/60'
       }`}
-      style={{
-        borderLeft: `3px solid ${template.color}33`
-      }}
+      style={{ borderLeft: `3px solid ${template.color}33` }}
       title="Drag onto the Edit-view sidebar to instantiate just this Function."
     >
       <span className="truncate">{fn.name}</span>
@@ -253,12 +292,13 @@ function FunctionRow({
       <div className="flex-1" />
       {allowRemove && (
         <button
-          className="text-muted hover:text-danger text-[10px] px-1"
+          className="btn text-[10px] py-0.5 px-1.5 shrink-0"
           onClick={(e) => {
             e.stopPropagation()
             onRemove()
           }}
           title="Delete this Function"
+          style={{ borderColor: 'rgb(var(--c-danger))', color: 'rgb(var(--c-danger))' }}
         >
           ✕
         </button>

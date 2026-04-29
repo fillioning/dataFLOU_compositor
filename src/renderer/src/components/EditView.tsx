@@ -3,6 +3,7 @@ import { NOTES_ONE_LINE_HEIGHT, useStore } from '../store'
 import TrackSidebar from './TrackSidebar'
 import SceneColumn from './SceneColumn'
 import Inspector from './Inspector'
+import InstrumentsInspectorPane from './InstrumentsInspectorPane'
 import { ResizeHandle } from './ResizeHandle'
 import { Modal } from './Modal'
 
@@ -45,6 +46,12 @@ export default function EditView(): JSX.Element {
   const scenes = useStore((s) => s.session.scenes)
   const selectedCell = useStore((s) => s.selectedCell)
   const selectedTrack = useStore((s) => s.selectedTrack)
+  // Pool selection (an item picked in the Pool drawer) takes priority
+  // over cell / track selection because it's the most-recent-action and
+  // because clicking a Pool item explicitly clears the others (see
+  // setPoolSelection in store.ts). The right-side Inspector's switch
+  // therefore reads: poolSelection > selectedCell > selectedTrack.
+  const poolSelection = useStore((s) => s.poolSelection)
   const tracks = useStore((s) => s.session.tracks)
   const rowHeight = useEffectiveRowHeight()
   const trackColumnWidth = useStore((s) => s.trackColumnWidth)
@@ -107,7 +114,9 @@ export default function EditView(): JSX.Element {
           />
           <SettingsBox />
           <div className="flex-1 min-h-0 overflow-y-auto">
-            {selectedCell ? (
+            {poolSelection ? (
+              <InstrumentsInspectorPane />
+            ) : selectedCell ? (
               <Inspector mode="cell" />
             ) : selectedTrack ? (
               <Inspector mode="track" />

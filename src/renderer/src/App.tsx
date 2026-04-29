@@ -95,7 +95,8 @@ export default function App(): JSX.Element {
   //   Tab           → toggle Edit ↔ Sequence
   //   Ctrl+T        → add a Message
   //   Alt+S         → add a Scene
-  //   Delete        → (Sequence view only) remove focused scene
+  //   Delete        → Sequence view: remove focused scene
+  //                   Edit view:     remove selected Instrument row(s)
   //
   // Performance (always active, even in show mode):
   //   1–9           → trigger scenes 1–9 in the sequence (sequenceLength slots)
@@ -269,16 +270,34 @@ export default function App(): JSX.Element {
         addScene()
         return
       }
-      // Delete → remove focused scene in Sequence view.
+      // Delete →
+      //   Sequence view : remove focused scene
+      //   Edit view     : remove the currently selected Instrument(s)
+      //                   (Templates cascade to their Function children)
       if (e.key === 'Delete' || e.key === 'Del') {
         if (isEditableTarget(e.target)) return
         const st = useStore.getState()
         if (st.showMode) return
-        if (st.view !== 'sequence') return
-        const focusedId = st.session.focusedSceneId
-        if (!focusedId) return
+        if (st.view === 'sequence') {
+          const focusedId = st.session.focusedSceneId
+          if (!focusedId) return
+          e.preventDefault()
+          removeScene(focusedId)
+          return
+        }
+        // Edit view — delete selected Instrument rows. selectedTrackIds
+        // is the multi-selection (shift-click range / single-click);
+        // selectedTrack is the single-selection fallback when nothing's
+        // multi-selected. Use whichever is non-empty.
+        const ids =
+          st.selectedTrackIds.length > 0
+            ? st.selectedTrackIds
+            : st.selectedTrack
+              ? [st.selectedTrack]
+              : []
+        if (ids.length === 0) return
         e.preventDefault()
-        removeScene(focusedId)
+        st.removeTracks(ids)
         return
       }
       // Tab → toggle view. Active in both authoring and show mode — in

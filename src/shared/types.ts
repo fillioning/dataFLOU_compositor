@@ -339,6 +339,12 @@ export interface InstrumentTemplate {
   // True when this template is shipped by the app rather than authored
   // by the user. Read-only in the inspector.
   builtin?: boolean
+  // True for the auto-created backing template behind an "Add Instrument"
+  // sidebar row that hasn't been Saved-as-Template yet. The Pool drawer
+  // hides drafts; they exist only to give the live Instrument row a
+  // place to store function specs. "Save as Template" flips this to
+  // undefined and the user can give the entry a name.
+  draft?: boolean
 }
 
 export interface Pool {

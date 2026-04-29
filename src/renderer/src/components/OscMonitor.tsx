@@ -1,11 +1,11 @@
-// OSC monitor — bottom drawer that hosts THREE panes side-by-side:
-//   1. OSC log (left)            — outgoing OSC traffic, the original use.
-//   2. Pool (center)              — Instrument Templates + Functions library.
-//   3. Instruments Inspector (right) — edit the Pool selection's params.
+// OSC monitor — bottom drawer hosting two panes:
+//   1. OSC log (left, larger)  — outgoing OSC traffic, the original use.
+//   2. Pool (right)            — Instrument Templates + Functions library.
 //
-// All three live in the same drawer so the user has one place to manage
-// "what instruments exist + what they're sending." Pool drag handles
-// instantiate Templates / Functions into the Edit-view sidebar.
+// The Instruments Inspector lives in the EDIT VIEW's right-side Inspector
+// panel (not in this drawer) — it needs more vertical room than a bottom
+// drawer can give, and it's where every other inspector already lives.
+// Selecting an item in the Pool re-points that Inspector at the Pool item.
 //
 // Default-off (per the simplex principle). The toggle lives in the top
 // toolbar. When closed, this component unmounts entirely — no subscription,
@@ -15,7 +15,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { OscErrorEvent, OscEvent } from '@shared/types'
 import { useStore } from '../store'
 import PoolPane from './PoolPane'
-import InstrumentsInspectorPane from './InstrumentsInspectorPane'
 
 // Discriminated-union row so the log can interleave successful sends
 // with failures. Kind is the only distinguishing field; everything else
@@ -118,12 +117,12 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
 
   return (
     <div
-      // Bumped from 168 → 260 because we now host 3 panes side-by-side:
-      // OSC log | Pool | Instruments Inspector. The Pool needs vertical
-      // room to comfortably show 3-4 templates expanded, and the Inspector
-      // needs to fit the typical Function form (~9 fields).
+      // Two-pane drawer: OSC log + Pool. Inspector for Pool selection
+      // lives in the Edit-view Inspector instead. 220 px is tall enough
+      // for ~10 OSC log rows + a couple of expanded Templates without
+      // taking over the whole window.
       className="border-t border-border bg-panel flex flex-col shrink-0"
-      style={{ height: 260 }}
+      style={{ height: 220 }}
     >
       {/* Top header strip — close button on the right; per-pane controls
           live inside each pane's own header so each is self-contained. */}
@@ -135,11 +134,11 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
         </button>
       </div>
 
-      {/* Three-pane body. Borders between panes give the user a clear
-          read on "this is one widget with three sections." Each pane
-          owns its own scroll. */}
+      {/* Two-pane body. Border between panes gives the user a clear read
+          on "this is one widget with two sections." Each pane owns its
+          own scroll. */}
       <div className="flex-1 min-h-0 flex">
-        {/* Pane 1 — OSC log (left, ~50%). */}
+        {/* Pane 1 — OSC log (left, ~65%). */}
         <div className="flex flex-col min-h-0 border-r border-border" style={{ flex: '2 1 0' }}>
           {/* Log toolbar */}
           <div className="flex items-center gap-2 px-2 py-1 border-b border-border shrink-0">
@@ -218,19 +217,11 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
           </div>
         </div>
 
-        {/* Pane 2 — Pool (center). Lists Templates + Functions, drag
-            sources for the Edit-view sidebar. */}
-        <div
-          className="flex flex-col min-h-0 border-r border-border"
-          style={{ flex: '1 1 0', minWidth: 220 }}
-        >
-          <PoolPane />
-        </div>
-
-        {/* Pane 3 — Instruments Inspector (right). Edits the Pool's
-            current selection. */}
+        {/* Pane 2 — Pool (right). Lists Templates + Functions, drag
+            sources for the Edit-view sidebar. Selecting an item here
+            re-points the Edit-view's right-side Inspector at it. */}
         <div className="flex flex-col min-h-0" style={{ flex: '1 1 0', minWidth: 240 }}>
-          <InstrumentsInspectorPane />
+          <PoolPane />
         </div>
       </div>
     </div>

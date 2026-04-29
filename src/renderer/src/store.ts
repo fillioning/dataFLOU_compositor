@@ -286,6 +286,19 @@ interface Actions {
     insertAfterTrackId: string | null,
     parentTrackId?: string | null
   ) => void
+  // Sidebar authoring (no Pool browse needed). "Add Instrument" creates
+  // a fresh draft Template in the Pool (hidden from the Pool drawer
+  // until the user runs "Save as Template") and instantiates it. The
+  // returned id is the new sidebar header row, useful for selection.
+  addInstrumentRow: (insertAfterTrackId: string | null) => string
+  // "Add Function" right-clicked on an Instrument header row (or a
+  // Function row that already lives inside one). Adds a new Function
+  // spec to the linked Pool template AND instantiates it as a child row.
+  addFunctionToInstrumentRow: (templateRowId: string) => void
+  // "Save as Template" — finds the draft Template behind a sidebar
+  // header row, gives it the user's chosen name, flips draft → false
+  // so the Pool drawer surfaces it for re-use across scenes / sessions.
+  saveAsTemplate: (templateRowId: string, name: string) => void
 
   // Tracks
   addTrack: () => void
@@ -808,7 +821,22 @@ export const useStore = create<State>((set, get) => ({
             : st.poolSelection
       }
     }),
-  setPoolSelection: (sel) => set({ poolSelection: sel }),
+  // Pool selection is mutually exclusive with cell/track selection. The
+  // right-side Edit-view Inspector renders whichever is current, so
+  // exclusivity keeps the inspector unambiguous (no "I picked a cell
+  // AND a Pool template, what should the inspector show?").
+  setPoolSelection: (sel) =>
+    set((st) =>
+      sel
+        ? {
+            poolSelection: sel,
+            selectedCell: null,
+            selectedCells: [],
+            selectedTrack: null,
+            selectedTrackIds: []
+          }
+        : { poolSelection: null }
+    ),
 
   // ─── Pool → Edit-view instantiation ───────────────────────────────────
   instantiateTemplate: (templateId, insertAfterTrackId) =>
@@ -862,6 +890,115 @@ export const useStore = create<State>((set, get) => ({
             ]
           : [...st.session.tracks, row]
       return { session: { ...st.session, tracks } }
+    }),
+
+  addInstrumentRow: (insertAfterTrackId) => {
+    // Allocate ids up-front so we can return the row id synchronously.
+    const tplId = `tpl_user_${Math.random().toString(36).slice(2, 9)}`
+    const rowId = `t_${Math.random().toString(36).slice(2, 9)}`
+    set((st) => {
+      // 1 row added — guard against the 128 cap before we mutate either
+      // the Pool or the tracks list.
+      if (st.session.tracks.length >= 128) return st
+      // How many user (non-builtin) Templates exist? Used for the
+      // default "Instrument N" name. Drafts count too so the numbering
+      // matches what the user sees in the sidebar.
+      const userIdx = st.session.pool.templates.filter((t) => !t.builtin).length
+      const tplSpec = makeTemplateSpec(userIdx)
+      const tpl: InstrumentTemplate = {
+        ...tplSpec,
+        id: tplId,
+        name: `Instrument ${userIdx + 1}`,
+        // Empty by default — the user will right-click "Add Function"
+        // to populate. Otherwise makeTemplateSpec would seed one stub
+        // function which would surprise the user when they expand the
+        // row.
+        functions: [],
+        draft: true
+      }
+      const row: Track = {
+        id: rowId,
+        name: tpl.name,
+        kind: 'template',
+        sourceTemplateId: tplId,
+        defaultOscAddress: tpl.oscAddressBase,
+        defaultDestIp: tpl.destIp,
+        defaultDestPort: tpl.destPort
+      }
+      const idx = insertAfterTrackId
+        ? st.session.tracks.findIndex((t) => t.id === insertAfterTrackId)
+        : -1
+      const tracks =
+        idx >= 0
+          ? [
+              ...st.session.tracks.slice(0, idx + 1),
+              row,
+              ...st.session.tracks.slice(idx + 1)
+            ]
+          : [...st.session.tracks, row]
+      return {
+        session: {
+          ...st.session,
+          tracks,
+          pool: { templates: [...st.session.pool.templates, tpl] }
+        }
+      }
+    })
+    return rowId
+  },
+  addFunctionToInstrumentRow: (templateRowId) =>
+    set((st) => {
+      const row = st.session.tracks.find((t) => t.id === templateRowId)
+      if (!row || row.kind !== 'template' || !row.sourceTemplateId) return st
+      const tpl = st.session.pool.templates.find((t) => t.id === row.sourceTemplateId)
+      if (!tpl || tpl.builtin) return st
+      if (st.session.tracks.length >= 128) return st
+      const fn = makeFunctionSpec(tpl.functions.length)
+      // Insert the new Function row immediately after the LAST existing
+      // child of this Instrument header (so groups stay contiguous), or
+      // immediately after the header itself if it has no children yet.
+      const tracks = st.session.tracks
+      const headerIdx = tracks.findIndex((t) => t.id === templateRowId)
+      let insertIdx = headerIdx + 1
+      while (
+        insertIdx < tracks.length &&
+        tracks[insertIdx].parentTrackId === templateRowId
+      ) {
+        insertIdx++
+      }
+      const fnRow = makeFunctionTrack(tpl, fn, templateRowId)
+      const newTracks = [
+        ...tracks.slice(0, insertIdx),
+        fnRow,
+        ...tracks.slice(insertIdx)
+      ]
+      const newTemplates = st.session.pool.templates.map((t) =>
+        t.id === tpl.id ? { ...t, functions: [...t.functions, fn] } : t
+      )
+      return {
+        session: { ...st.session, tracks: newTracks, pool: { templates: newTemplates } }
+      }
+    }),
+  saveAsTemplate: (templateRowId, name) =>
+    set((st) => {
+      const row = st.session.tracks.find((t) => t.id === templateRowId)
+      if (!row || row.kind !== 'template' || !row.sourceTemplateId) return st
+      const trimmed = name.trim()
+      if (!trimmed) return st
+      // Flip the draft flag off and apply the user's chosen name. The
+      // template now appears in the Pool drawer's main list so it can be
+      // re-instantiated elsewhere.
+      const newTemplates = st.session.pool.templates.map((t) =>
+        t.id === row.sourceTemplateId ? { ...t, draft: false, name: trimmed } : t
+      )
+      // Also rename the live Instrument row in the sidebar so it
+      // matches the saved Template name.
+      const newTracks = st.session.tracks.map((t) =>
+        t.id === templateRowId ? { ...t, name: trimmed } : t
+      )
+      return {
+        session: { ...st.session, tracks: newTracks, pool: { templates: newTemplates } }
+      }
     }),
 
   addTrack: () =>
@@ -1149,7 +1286,10 @@ export const useStore = create<State>((set, get) => ({
       selectedCell: { sceneId, trackId },
       selectedCells: [{ sceneId, trackId }],
       selectedTrack: null,
-      selectedTrackIds: []
+      selectedTrackIds: [],
+      // Mutually exclusive with Pool selection — see setPoolSelection for
+      // the explanation.
+      poolSelection: null
     }),
   toggleCellSelection: (sceneId, trackId) =>
     set((st) => {
@@ -1171,7 +1311,8 @@ export const useStore = create<State>((set, get) => ({
         selectedCell: primary,
         selectedCells: nextCells,
         selectedTrack: null,
-        selectedTrackIds: []
+        selectedTrackIds: [],
+        poolSelection: null
       }
     }),
   applyDefaultOscToCells: (refs) =>
@@ -1200,12 +1341,17 @@ export const useStore = create<State>((set, get) => ({
       return { session: { ...st.session, scenes } }
     }),
   selectTrack: (id) =>
-    set({
+    set((st) => ({
       selectedTrack: id,
       selectedTrackIds: id ? [id] : [],
       selectedCell: null,
-      selectedCells: []
-    }),
+      selectedCells: [],
+      // Selecting a track drives the Edit-view Inspector AWAY from a
+      // Pool selection so the right pane reflects the row the user just
+      // clicked. If they wanted to keep editing the Pool item, they can
+      // re-select it from the Pool drawer.
+      poolSelection: id ? null : st.poolSelection
+    })),
   selectTrackRange: (id) =>
     set((st) => {
       const order = st.session.tracks.map((t) => t.id)
@@ -2035,6 +2181,7 @@ function sanitizeTemplate(raw: unknown): InstrumentTemplate | null {
     voices:
       typeof r.voices === 'number' && r.voices >= 1 ? Math.floor(r.voices) : 1,
     builtin: r.builtin === true,
+    draft: r.draft === true,
     functions: fns
   }
 }
