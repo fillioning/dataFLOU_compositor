@@ -374,8 +374,16 @@ interface Actions {
   // the engine skips this track on any trigger path.
   setTrackEnabled: (id: string, enabled: boolean) => void
   // Set the persistence flag for a single arg position on a track
-  // that has an argSpec. Out-of-range indices are no-ops.
-  setTrackPersistentSlot: (id: string, slotIdx: number, persistent: boolean) => void
+  // that has an argSpec. Out-of-range indices are no-ops. When
+  // pinning (persistent=true), pass the current cell-value token
+  // for that slot so the engine has a concrete value to emit. The
+  // captured value is stored on the track and used until unpinned.
+  setTrackPersistentSlot: (
+    id: string,
+    slotIdx: number,
+    persistent: boolean,
+    capturedValue?: string
+  ) => void
   // Reorder a track. `dragId` is dropped immediately AFTER `targetId` (or
   // at the very top of the list when `targetId` is null). When `dragId`
   // is a Template-header, every child Function row tagged with
@@ -1358,22 +1366,40 @@ export const useStore = create<State>((set, get) => ({
         )
       }
     })),
-  setTrackPersistentSlot: (id, slotIdx, persistent) =>
+  setTrackPersistentSlot: (id, slotIdx, persistent, capturedValue) =>
     set((st) => ({
       session: {
         ...st.session,
         tracks: st.session.tracks.map((t) => {
           if (t.id !== id) return t
-          // Allocate the array lazily; it's sparse for tracks that
+          // Allocate the arrays lazily; sparse for tracks that
           // never persist anything. Length stretches to slotIdx+1
           // so untouched entries stay undefined → falsy.
           const slots = t.persistentSlots ? t.persistentSlots.slice() : []
+          const values = t.persistentValues ? t.persistentValues.slice() : []
           while (slots.length <= slotIdx) slots.push(false)
+          while (values.length <= slotIdx) values.push('')
           slots[slotIdx] = persistent
-          // Drop the array entirely when nothing's persistent so
+          if (persistent) {
+            // Capture the current cell-value token for this slot.
+            // Caller (Inspector) reads it from the focused scene's
+            // cell.value at pin time. Empty string is fine — engine
+            // parses it as 0.
+            values[slotIdx] = capturedValue ?? ''
+          } else {
+            // Unpin — clear the captured value so the next pin
+            // captures fresh data instead of resurrecting a stale
+            // snapshot.
+            values[slotIdx] = ''
+          }
+          // Drop the arrays entirely when nothing's persistent so
           // saved sessions stay tidy.
           const anyPersistent = slots.some((b) => b)
-          return { ...t, persistentSlots: anyPersistent ? slots : undefined }
+          return {
+            ...t,
+            persistentSlots: anyPersistent ? slots : undefined,
+            persistentValues: anyPersistent ? values : undefined
+          }
         })
       }
     })),
@@ -2292,6 +2318,11 @@ function propagateDefaults(s: Session): Session {
             : undefined,
         persistentSlots: Array.isArray((t as Partial<Track>).persistentSlots)
           ? (t as Partial<Track>).persistentSlots!.map((b) => b === true)
+          : undefined,
+        persistentValues: Array.isArray((t as Partial<Track>).persistentValues)
+          ? (t as Partial<Track>).persistentValues!.map((v) =>
+              typeof v === 'string' ? v : ''
+            )
           : undefined
       })),
     // Pool — pre-merger sessions don't have one; ship the builtin library

@@ -282,11 +282,15 @@ export interface Track {
   enabled?: boolean
   // Per-arg-position persistence flags. Same length / order as
   // argSpec when present. When persistentSlots[i] is true, the
-  // engine FREEZES that arg position at its last-sent value: scene
-  // triggers won't overwrite it, modulators won't drive it. Lets
-  // the performer "pin" a few knobs while letting the rest morph
-  // through scene transitions.
+  // engine emits persistentValues[i] for that slot regardless of
+  // scene triggers, modulators, or sequencer steps. Lets the
+  // performer "pin" a few knobs while letting the rest morph.
   persistentSlots?: boolean[]
+  // Captured pinned values, parallel to persistentSlots. Stored as
+  // raw token strings so they round-trip cleanly through the
+  // existing value parser (autoDetectOscArg). Captured at pin time
+  // from the focused scene's cell.value[i]; cleared when unpinned.
+  persistentValues?: string[]
 }
 
 // Pool / Instrument Templates

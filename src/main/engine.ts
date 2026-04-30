@@ -1241,23 +1241,29 @@ export class SceneEngine {
         }
         if (cell.scaleToUnit) out = clamp01(out)
 
-        // Per-arg-position persistence — if this slot is pinned on the
-        // track, freeze it at its last sent value (and don't update
-        // the lastSentNumeric cache for this slot). Lets the user
-        // pin a few knobs while the rest still morph through scenes.
+        // Per-arg-position persistence — if this slot is pinned on
+        // the track, override the computed value with the user-
+        // captured token from track.persistentValues[idx]. Pin
+        // captures whatever the inspector showed at pin moment;
+        // the engine just emits that value forever until unpinned.
+        // Modulators / scene triggers / morphing all bypass.
         const persistArr = track?.persistentSlots
+        const persistVals = track?.persistentValues
         const persistThis = !!persistArr && persistArr[idx] === true
-        if (persistThis && ts.lastSentNumeric[idx] !== undefined) {
-          out = ts.lastSentNumeric[idx]
+        if (persistThis && persistVals && persistVals[idx] !== undefined) {
+          const parsed = parseFloat(persistVals[idx])
+          if (Number.isFinite(parsed)) {
+            out = cell.scaleToUnit ? clamp01(parsed) : parsed
+          }
         }
 
         const sendType: 'i' | 'f' =
           a.type === 'i' && !cell.modulation.enabled && !cell.scaleToUnit ? 'i' : 'f'
         const finalVal = sendType === 'i' ? Math.round(out) : out
         // Cache the value we just decided to send — non-persistent
-        // slots update freely; persistent slots keep their cached
-        // value (we used it above) so subsequent ticks reuse it
-        // unless the user toggles persistence off.
+        // slots update freely. (Pinned slots are sourced from the
+        // track's stored persistentValues, not from this cache, so
+        // we don't need to keep the cache in sync for them.)
         if (!persistThis) ts.lastSentNumeric[idx] = finalVal
         outs.push({ type: sendType, value: finalVal })
         liveParts.push(sendType === 'i' ? String(finalVal) : finalVal.toFixed(3))

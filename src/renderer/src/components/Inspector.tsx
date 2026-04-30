@@ -137,14 +137,16 @@ function TrackInspector(): JSX.Element {
             argSpec={track.argSpec}
             cellValue={cellOnFocused.value}
             persistentSlots={track.persistentSlots ?? []}
-            onToggle={(idx, persistent) =>
-              setTrackPersistentSlot(trackId, idx, persistent)
+            persistentValues={track.persistentValues ?? []}
+            onToggle={(idx, persistent, capturedValue) =>
+              setTrackPersistentSlot(trackId, idx, persistent, capturedValue)
             }
           />
           <div className="text-[10px] text-muted mt-1 leading-snug">
-            A pinned value freezes at its last sent value — modulators
-            don't drive it, scene triggers don't overwrite it. Untick
-            to make it controllable again.
+            Pin captures the value shown next to it and the engine
+            emits THAT value forever — modulators don't drive it,
+            scene triggers don't overwrite it. To change a pinned
+            value, untick first, edit the clip, then re-pin.
           </div>
         </Section>
       )}
@@ -207,26 +209,35 @@ function TrackInspector(): JSX.Element {
 }
 
 // Per-arg persistence toggle list. One row per editable arg in the
-// track's argSpec — shows the current value parsed from the focused
-// scene's cell + a checkbox that pins/unpins the slot.
+// track's argSpec — shows the current value (from the focused
+// scene's cell when not pinned, or the captured pinned value when
+// pinned) + a checkbox that pins/unpins the slot. Pin captures the
+// CURRENT VALUE at toggle time; that captured value is what the
+// engine emits forever until unpinned.
 function PersistentSlotList({
   argSpec,
   cellValue,
   persistentSlots,
+  persistentValues,
   onToggle
 }: {
   argSpec: ParamArgSpec[]
   cellValue: string
   persistentSlots: boolean[]
-  onToggle: (idx: number, persistent: boolean) => void
+  persistentValues: string[]
+  onToggle: (idx: number, persistent: boolean, capturedValue?: string) => void
 }): JSX.Element {
   const tokens = cellValue.trim().split(/\s+/).filter((t) => t.length > 0)
   return (
     <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center">
       {argSpec.map((a, i) => {
         if (a.fixed !== undefined) return null
-        const val = tokens[i] ?? ''
+        const cellVal = tokens[i] ?? ''
         const pinned = persistentSlots[i] === true
+        const pinnedVal = persistentValues[i] ?? ''
+        // While pinned, show the captured value (what the engine is
+        // emitting). While unpinned, show the live cell token.
+        const displayVal = pinned ? pinnedVal : cellVal
         return (
           <Fragment key={i}>
             <span
@@ -236,23 +247,37 @@ function PersistentSlotList({
               {a.name}
             </span>
             <span
-              className="font-mono text-[11px] text-right truncate"
-              title={val || '(empty)'}
+              className={`font-mono text-[11px] text-right truncate ${
+                pinned ? 'text-accent' : ''
+              }`}
+              title={
+                pinned
+                  ? `pinned at ${pinnedVal || '(empty)'}`
+                  : displayVal || '(empty)'
+              }
             >
-              {val || '—'}
+              {pinned && '🔒 '}
+              {displayVal || '—'}
             </span>
             <label
               className="flex items-center gap-1 text-[10px] shrink-0"
               title={
                 pinned
                   ? 'Unpin — re-enable scene triggers + modulators on this slot'
-                  : 'Pin — freeze this slot at its last sent value'
+                  : 'Pin — freeze this slot at the value shown'
               }
             >
               <input
                 type="checkbox"
                 checked={pinned}
-                onChange={(e) => onToggle(i, e.target.checked)}
+                onChange={(e) => {
+                  if (e.target.checked) {
+                    // Capture the live cell value at pin moment.
+                    onToggle(i, true, cellVal)
+                  } else {
+                    onToggle(i, false)
+                  }
+                }}
               />
               <span>pin</span>
             </label>
