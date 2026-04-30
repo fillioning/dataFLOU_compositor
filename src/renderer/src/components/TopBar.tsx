@@ -137,7 +137,7 @@ export default function TopBar(): JSX.Element {
       <div data-hide-in-show="true" className="flex items-center gap-1">
         <button className="btn" onClick={newSession}>New</button>
         <button className="btn" onClick={onOpen}>Open</button>
-        <button ref={saveRef} className="btn" onClick={onSave}>Save</button>
+        <button ref={saveRef} data-save-button="true" className="btn" onClick={onSave}>Save</button>
         <button className="btn" onClick={onSaveAs}>Save As</button>
       </div>
 

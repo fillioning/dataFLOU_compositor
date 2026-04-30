@@ -93,6 +93,7 @@ export default function App(): JSX.Element {
   //
   // Authoring (suppressed inside text fields):
   //   Tab           → toggle Edit ↔ Sequence
+  //   Ctrl+S        → save the session (Save if path known, else Save As)
   //   Ctrl+T        → add a new Instrument (draft Template + sidebar header)
   //   Ctrl+P        → add a new Parameter to the selected Instrument
   //                   group (or to the parent of a selected Parameter row).
@@ -236,6 +237,42 @@ export default function App(): JSX.Element {
       // ------- Authoring hotkeys (suppressed in show mode)
       const showMode = useStore.getState().showMode
 
+      // Ctrl/Cmd + S → save the current session. If we have a known
+      // file path, write to it directly (Save). Otherwise prompt for a
+      // location (Save As) and remember the path. Suppressed in show
+      // mode and inside text fields so a performer typing into a name
+      // field doesn't accidentally save with every keystroke.
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 's') {
+        if (showMode) return
+        if (isEditableTarget(e.target)) return
+        e.preventDefault()
+        const st = useStore.getState()
+        const sess = st.session
+        const path = st.currentFilePath
+        // Briefly flash the Save button so the user gets the same visual
+        // confirmation they'd get from clicking it. Located by data-attr
+        // on the toolbar's Save button.
+        const flashSave = (): void => {
+          const el = document.querySelector<HTMLElement>('[data-save-button="true"]')
+          if (!el) return
+          el.classList.remove('flash-blue')
+          void el.offsetWidth
+          el.classList.add('flash-blue')
+        }
+        if (path) {
+          void window.api.sessionSave(sess, path).then((ok) => {
+            if (ok) flashSave()
+          })
+        } else {
+          void window.api.sessionSaveAs(sess).then((p) => {
+            if (p) {
+              useStore.getState().setCurrentFilePath(p)
+              flashSave()
+            }
+          })
+        }
+        return
+      }
       // Ctrl/Cmd + T → add a new Instrument (draft Template + header
       // row). Replaces the older "+Message" path; orphan Parameters are
       // created via the right-click "Add orphan Parameter" menu or by

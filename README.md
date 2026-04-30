@@ -276,6 +276,7 @@ The Save button **flashes blue** on a successful write. Old sessions migrate cle
 | **P** | Toggle the Pool inside the OSC Monitor (opens drawer if closed) |
 | **I** | Toggle the right‑side Inspector panel (Edit view) |
 | **S** | Toggle the focused‑Scene info panel (Sequence view) |
+| **Ctrl + S** *(Cmd + S on macOS)* | Save the current session (Save if path known, else Save As) |
 | **Ctrl + T** *(Cmd + T on macOS)* | Add a new Instrument (draft Template + seeded Parameter) |
 | **Ctrl + P** *(Cmd + P on macOS)* | Add a Parameter to the selected Instrument's group |
 | **Alt + S** | Add a Scene |
@@ -331,6 +332,42 @@ src/
     ├── midi.ts                      # Web MIDI manager (handles instrument-group bindings too)
     └── styles.css
 ```
+
+---
+
+## Release notes — 0.4.1
+
+A polish pass on top of v0.4.0 with two user‑reported papercuts fixed and a deeper authoring loop for clips that send multi‑arg OSC.
+
+### Open dialog now actually loads
+- **Open → click a saved session → it loads.** v0.4.0 silently swallowed a `ReferenceError` (`require is not defined`) inside `requestSessionLoad`, so the dialog closed and nothing changed. Replaced the dynamic `require` of the integrity‑check module with a static ESM import — Vite's renderer is ESM‑only and never had `require` at runtime.
+
+### Ctrl+S saves
+- **Ctrl + S** *(Cmd + S on macOS)* saves the current session. Behaves like the toolbar Save button: writes to the known file path, or prompts Save As if the session has never been saved. Briefly flashes the toolbar Save button on success. Suppressed inside text fields and in show mode.
+
+### OCTOCOSME builtin retargeted at the software, not the hardware
+- The shipped **OCTOCOSME** Instrument Template now targets port 1986 with 8 bundle Parameters that match the Pure Data show‑control patch's `list split 2` convention (2 prefix tokens + payload). Previously it was wired to the LED hardware itself, which was the wrong direction for show authoring.
+- **Auto‑prefix** (`fixed` tokens in `argSpec`) is rendered next to the Value/Values title so you can see exactly what gets prepended without typing it into every cell.
+
+### Schema‑driven multi‑arg editor
+- Pool Parameters can now declare a typed list of args (`ParamArgSpec[]`) — name, type (`number | bool`), bounds, default, and an optional `fixed` prefix token.
+- Cells inheriting an `argSpec` show a **Values** section (vs. the old single Value field) with one bounded numeric input per arg, labelled by name. Bool args render as numeric `[0, 1]` inputs (not checkboxes) so modulators can drive them.
+- Each arg participates in modulation independently: LFO, Ramp, Sequencer, etc. all run per‑arg with one shared clock.
+- Snapshot at instantiation: dragging a Pool Parameter onto the sidebar copies its `argSpec` onto the new Track, so editing the blueprint later doesn't retroactively rewrite live cells.
+
+### Per‑Track enable / disable + per‑slot persistence
+- **Click an Instrument row in the sidebar** to see its child Parameters listed in the Inspector with an **Enable** checkbox each. Cascades — disabling the Template silences every child.
+- **Click a Parameter row** to see its current cell's values with a **pin** beside each one. Pinning freezes that arg to whatever value you typed in the Inspector at the moment you clicked the pin — modulation keeps running on the other args, the pinned arg emits the captured value forever until unpinned. Works through tick changes, scene morphs, and loop transitions.
+- Disabled rows render at `opacity-40` everywhere they appear (sidebar + Scene cells) so it's obvious at a glance.
+
+### Scene cells auto‑size to widest clip
+- A Scene column is now `width: fit-content` with the widest cell setting the floor. Multi‑arg clips that previously truncated their value text now show the full value list inline.
+
+### Track‑defaults auto‑inheritance
+- Adding a clip to an Instrument‑Template‑instantiated row now **inherits the track's IP / port / OSC base path** instead of always falling back to the session default. Track defaults win → session defaults win → built‑in defaults win.
+
+### Drop‑focus stickiness fix
+- After dragging a Pool item onto the sidebar, clicking a Track name input now accepts keystrokes immediately. Previously you had to alt‑tab away and back. The drop handler now releases `document.activeElement` on the next animation frame.
 
 ---
 

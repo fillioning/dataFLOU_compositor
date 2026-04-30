@@ -50,6 +50,7 @@ import {
   makeTemplateTrack,
   makeTrack
 } from '@shared/factory'
+import { checkSessionIntegrity } from './hooks/sessionIntegrity'
 
 // ---- Clip templates: persisted in localStorage so they survive app restarts.
 
@@ -1862,10 +1863,10 @@ export const useStore = create<State>((set, get) => ({
     }),
   requestFocusDuration: () => set((s) => ({ focusDurationToken: s.focusDurationToken + 1 })),
   requestSessionLoad: (session, path) => {
-    // Lazy-import to avoid a circular dep (sessionIntegrity is a hook
-    // module that might reference store types in the future).
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { checkSessionIntegrity } = require('./hooks/sessionIntegrity') as typeof import('./hooks/sessionIntegrity')
+    // NOTE: this used to dynamic-`require` the integrity module, but Vite's
+    // ESM-only renderer has no CommonJS `require` at runtime — the call
+    // threw a silent ReferenceError that was swallowed by the IPC promise,
+    // so Open looked like a no-op. Static import (top of file) fixes it.
     const issues = checkSessionIntegrity(session)
     if (issues.length === 0) {
       get().setSession(session)

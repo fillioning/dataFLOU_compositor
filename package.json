@@ -1,6 +1,6 @@
 {
   "name": "dataflou-compositor",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "OSC scene compositor — Pool of Instruments + Parameters, Timeline view, group triggers, multi-scene authoring",
   "main": "out/main/index.js",
   "author": "Vincent Fillion",
