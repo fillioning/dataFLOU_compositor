@@ -312,6 +312,18 @@ export default function TrackSidebar(): JSX.Element {
         const isSelected = selectedTrackIds.includes(t.id)
         const effectiveRowH = tracksCollapsed ? 32 : rowHeight
         const isTemplate = t.kind === 'template'
+        // A track is "effectively disabled" when its own enabled flag
+        // is false OR its parent Template's flag is false. Children
+        // inherit the parent's disabled state visually + behaviorally
+        // (the engine reads the per-track flag — we propagate via
+        // the inspector, but the visual cue here is just the OR of
+        // both flags).
+        const parentTrack = t.parentTrackId
+          ? tracks.find((tt) => tt.id === t.parentTrackId)
+          : null
+        const ownDisabled = t.enabled === false
+        const parentDisabled = parentTrack?.enabled === false
+        const effectivelyDisabled = ownDisabled || parentDisabled
         // Resolve the color stripe. Template-row → its own template's
         // color. Function-row with a parent → look up parent's
         // sourceTemplateId. Function-row without a parent → no stripe.
@@ -353,7 +365,7 @@ export default function TrackSidebar(): JSX.Element {
                 : 'flex-col justify-center gap-1 px-3'
             } ${isSelected ? 'bg-panel2' : 'hover:bg-panel3/30'} ${
               isTemplate ? 'bg-panel/80' : ''
-            }`}
+            } ${effectivelyDisabled ? 'opacity-40' : ''}`}
             style={{
               height: effectiveRowH,
               // Color stripe on the left edge — solid for templates,

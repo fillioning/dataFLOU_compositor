@@ -86,6 +86,10 @@ interface TrackState {
   lastSentString: string | null
   lastStringAtSceneId: string | null
   lastStringAtStep: number
+  // Last numeric value sent per arg position. Persistence reads from
+  // here on every tick to freeze pinned slots at their last value.
+  // Grows on demand to match the sent-out array length.
+  lastSentNumeric: number[]
 }
 
 function makeTrackState(): TrackState {
@@ -121,6 +125,7 @@ function makeTrackState(): TrackState {
     armed: false,
     delayTimer: null,
     lastSentString: null,
+    lastSentNumeric: [],
     lastStringAtSceneId: null,
     lastStringAtStep: -1
   }
@@ -350,6 +355,11 @@ export class SceneEngine {
     if (!cell) return
     const ts = this.tracks.get(trackId)
     if (!ts) return
+    // Track may be explicitly disabled from the Instrument Inspector
+    // — skip every trigger path so no OSC fires until re-enabled.
+    // Disabling a Template (Instrument) also silences its children
+    // (their own enabled flag may still be true; parent overrides).
+    if (this.isTrackEffectivelyDisabled(trackId)) return
 
     if (ts.delayTimer) {
       clearTimeout(ts.delayTimer)
@@ -869,6 +879,10 @@ export class SceneEngine {
       if (!ts.armed && !ts.stopping) continue
       const cell = this.getActiveCell(trackId)
       if (!cell) continue
+      // Resolve the session-side Track entry for engine-aware flags
+      // (enabled, persistentSlots) read further down the loop.
+      const track = this.session.tracks.find((tt) => tt.id === trackId)
+      if (this.isTrackEffectivelyDisabled(trackId)) continue
 
       // Advance LFO phase (only for LFO modulation; envelope uses real time).
       if (cell.modulation.enabled && cell.modulation.type === 'lfo') {
@@ -1227,9 +1241,24 @@ export class SceneEngine {
         }
         if (cell.scaleToUnit) out = clamp01(out)
 
+        // Per-arg-position persistence — if this slot is pinned on the
+        // track, freeze it at its last sent value (and don't update
+        // the lastSentNumeric cache for this slot). Lets the user
+        // pin a few knobs while the rest still morph through scenes.
+        const persistArr = track?.persistentSlots
+        const persistThis = !!persistArr && persistArr[idx] === true
+        if (persistThis && ts.lastSentNumeric[idx] !== undefined) {
+          out = ts.lastSentNumeric[idx]
+        }
+
         const sendType: 'i' | 'f' =
           a.type === 'i' && !cell.modulation.enabled && !cell.scaleToUnit ? 'i' : 'f'
         const finalVal = sendType === 'i' ? Math.round(out) : out
+        // Cache the value we just decided to send — non-persistent
+        // slots update freely; persistent slots keep their cached
+        // value (we used it above) so subsequent ticks reuse it
+        // unless the user toggles persistence off.
+        if (!persistThis) ts.lastSentNumeric[idx] = finalVal
         outs.push({ type: sendType, value: finalVal })
         liveParts.push(sendType === 'i' ? String(finalVal) : finalVal.toFixed(3))
       }
@@ -1294,6 +1323,21 @@ export class SceneEngine {
     if (!ts || !ts.activeSceneId || !this.session) return null
     const scene = this.session.scenes.find((s) => s.id === ts.activeSceneId)
     return scene?.cells[trackId] ?? null
+  }
+
+  // True when this track is disabled, OR its parent Template is.
+  // Disabling an Instrument cascades to all its child Parameters
+  // (their own enabled flag may still be true — parent overrides).
+  private isTrackEffectivelyDisabled(trackId: string): boolean {
+    if (!this.session) return false
+    const t = this.session.tracks.find((tt) => tt.id === trackId)
+    if (!t) return false
+    if (t.enabled === false) return true
+    if (t.parentTrackId) {
+      const parent = this.session.tracks.find((tt) => tt.id === t.parentTrackId)
+      if (parent && parent.enabled === false) return true
+    }
+    return false
   }
 
   private computeCurrentOutputs(trackId: string): number[] {

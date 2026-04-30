@@ -132,12 +132,14 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         isInSelection ? 'ring-1 ring-inset ring-accent/30' : ''
       }`}
       style={{
-        // When scenes are collapsed, each column auto-sizes to its own
-        // content (play button + scene name + whatever's in the cells)
-        // instead of a fixed 132 px. Shorter names → tighter columns;
-        // fits many more scenes on screen at once.
-        width: scenesCollapsed ? 'fit-content' : sceneColumnWidth,
-        minWidth: scenesCollapsed ? SCENE_COL_COLLAPSED_MIN_W : undefined,
+        // Each column auto-sizes to its widest cell — multi-arg
+        // bundles like OCTOCOSME's 12-float Voice Pots make a
+        // wide cell, the column grows to fit. The user's slider
+        // becomes a MINIMUM width (so single-value scenes still
+        // honour the manual size) and `fit-content` lets the
+        // column expand past it when content needs more room.
+        width: 'fit-content',
+        minWidth: scenesCollapsed ? SCENE_COL_COLLAPSED_MIN_W : sceneColumnWidth,
         background: tint
       }}
       onClick={onHeaderClick}
@@ -349,11 +351,20 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
           but we render a centered group-trigger button at their
           intersection: clicking fires every child Parameter's clip
           on this scene at once. Stopping toggles them all off. */}
-      {tracks.map((t) =>
-        t.kind === 'template' ? (
+      {tracks.map((t) => {
+        // A track is effectively disabled when its own enabled flag
+        // is false OR when its parent Template's flag is. Visual:
+        // dim the cell to match the sidebar row's grey-out.
+        const parent = t.parentTrackId
+          ? tracks.find((tt) => tt.id === t.parentTrackId)
+          : null
+        const dimmed = t.enabled === false || parent?.enabled === false
+        return t.kind === 'template' ? (
           <div
             key={t.id}
-            className="border-b border-border shrink-0 bg-panel/40"
+            className={`border-b border-border shrink-0 bg-panel/40 ${
+              dimmed ? 'opacity-40' : ''
+            }`}
             style={{ height: rowHeight }}
           >
             <InstrumentTriggerCell sceneId={sceneId} templateRowId={t.id} />
@@ -361,13 +372,13 @@ export default function SceneColumn({ sceneId }: { sceneId: string }): JSX.Eleme
         ) : (
           <div
             key={t.id}
-            className="border-b border-border shrink-0"
+            className={`border-b border-border shrink-0 ${dimmed ? 'opacity-40' : ''}`}
             style={{ height: rowHeight }}
           >
             <CellTile sceneId={sceneId} trackId={t.id} />
           </div>
         )
-      )}
+      })}
 
       {/* Right-click context menu — portaled to <body> so it isn't clipped
           by the column's overflow boundary. Closes on click-outside or

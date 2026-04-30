@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
 import type {
   ArpMode,
@@ -28,25 +28,128 @@ function TrackInspector(): JSX.Element {
   const renameTrack = useStore((s) => s.renameTrack)
   const setTrackDefaults = useStore((s) => s.setTrackDefaults)
   const sendTrackDefaultsToClips = useStore((s) => s.sendTrackDefaultsToClips)
+  const setTrackEnabled = useStore((s) => s.setTrackEnabled)
+  const setTrackPersistentSlot = useStore((s) => s.setTrackPersistentSlot)
   const scenesCount = useStore((s) => s.session.scenes.length)
   const cellsCount = useStore((s) =>
     s.session.scenes.reduce((n, sc) => n + (sc.cells[trackId] ? 1 : 0), 0)
   )
+  // For Parameter-row inspector: pull the focused scene's cell so we
+  // can show the current per-arg values + per-slot persistence
+  // toggles. When no scene is focused, fall back to whatever scene
+  // currently has a clip on this track (if any).
+  const focusedSceneId = useStore((s) => s.session.focusedSceneId)
+  const cellOnFocused = useStore((s) => {
+    const sc = s.session.scenes.find((x) => x.id === focusedSceneId)
+    return sc?.cells[trackId]
+  })
+  // Children of a Template row — used only when track.kind === 'template'.
+  const children = useStore((s) =>
+    s.session.tracks.filter((t) => t.parentTrackId === trackId)
+  )
 
-  if (!track) return <div className="p-4 text-muted text-[12px]">Message removed.</div>
+  if (!track) return <div className="p-4 text-muted text-[12px]">Track removed.</div>
+
+  const isTemplate = track.kind === 'template'
+  const enabled = track.enabled !== false
+  const noun = isTemplate ? 'Instrument' : 'Parameter'
 
   return (
     <div className="p-3 flex flex-col gap-3 text-[12px]">
-      <Section title="Message name">
-        <UncontrolledTextInput
-          className="input w-full"
-          value={track.name}
-          onChange={(v) => renameTrack(trackId, v)}
-          placeholder="Message name"
-        />
+      <Section title={`${noun} name`}>
+        <div className="flex items-center gap-2">
+          <UncontrolledTextInput
+            className="input flex-1"
+            value={track.name}
+            onChange={(v) => renameTrack(trackId, v)}
+            placeholder={`${noun} name`}
+          />
+          <label
+            className="flex items-center gap-1 text-[11px] shrink-0"
+            title={
+              enabled
+                ? `Disable this ${noun.toLowerCase()} — engine will skip every trigger path until re-enabled`
+                : `Re-enable this ${noun.toLowerCase()}`
+            }
+          >
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) => setTrackEnabled(trackId, e.target.checked)}
+            />
+            <span>Enabled</span>
+          </label>
+        </div>
       </Section>
 
-      <Section title="Message default destination">
+      {/* Parameter list — only for Template (Instrument) rows. Each
+          child gets its own enable/disable toggle, mirroring the
+          per-track flag. Disabled children grey out in the sidebar
+          and the engine skips them on every trigger. */}
+      {isTemplate && (
+        <Section title={`Parameters (${children.length})`}>
+          {children.length === 0 ? (
+            <div className="text-[10px] text-muted">
+              No Parameters yet. Click the +PARAM chip on this Instrument's
+              row, or right-click → Add Parameter.
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1">
+              {children.map((child) => {
+                const childEnabled = child.enabled !== false
+                return (
+                  <label
+                    key={child.id}
+                    className={`flex items-center gap-2 px-2 py-1 rounded border ${
+                      childEnabled ? 'border-border' : 'border-border/40 opacity-60'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={childEnabled}
+                      onChange={(e) => setTrackEnabled(child.id, e.target.checked)}
+                    />
+                    <span className="flex-1 truncate">{child.name}</span>
+                    {child.argSpec && child.argSpec.length > 0 && (
+                      <span
+                        className="text-[9px] text-muted shrink-0"
+                        title={`${child.argSpec.length} args (${child.argSpec.filter((a) => a.fixed === undefined).length} editable)`}
+                      >
+                        {child.argSpec.filter((a) => a.fixed === undefined).length}-arg
+                      </span>
+                    )}
+                  </label>
+                )
+              })}
+            </div>
+          )}
+        </Section>
+      )}
+
+      {/* Per-slot persistence — only for Parameter rows that have
+          an argSpec AND the focused scene has a clip on this track
+          (so we can show concrete current values next to each
+          toggle). Persistent slots ignore scene triggers and
+          modulators, freezing at their last-sent value. */}
+      {!isTemplate && track.argSpec && track.argSpec.length > 0 && cellOnFocused && (
+        <Section title="Values · pin to freeze">
+          <PersistentSlotList
+            argSpec={track.argSpec}
+            cellValue={cellOnFocused.value}
+            persistentSlots={track.persistentSlots ?? []}
+            onToggle={(idx, persistent) =>
+              setTrackPersistentSlot(trackId, idx, persistent)
+            }
+          />
+          <div className="text-[10px] text-muted mt-1 leading-snug">
+            A pinned value freezes at its last sent value — modulators
+            don't drive it, scene triggers don't overwrite it. Untick
+            to make it controllable again.
+          </div>
+        </Section>
+      )}
+
+      <Section title={`${noun} default destination`}>
         <div className="flex gap-1 items-center">
           <UncontrolledTextInput
             className="input flex-1"
@@ -72,7 +175,7 @@ function TrackInspector(): JSX.Element {
         </div>
       </Section>
 
-      <Section title="Message default OSC address">
+      <Section title={`${noun} default OSC address`}>
         <UncontrolledTextInput
           className="input w-full"
           value={track.defaultOscAddress ?? ''}
@@ -86,8 +189,8 @@ function TrackInspector(): JSX.Element {
         onClick={() => {
           const msg =
             cellsCount === scenesCount
-              ? `Apply this message's defaults to all ${cellsCount} clip(s) on this row? Overwrites existing values.`
-              : `Apply this message's defaults to all ${scenesCount} scenes on this row? Overwrites the ${cellsCount} existing clip(s) and auto-creates clips on the ${scenesCount - cellsCount} empty scene(s).`
+              ? `Apply this ${noun.toLowerCase()}'s defaults to all ${cellsCount} clip(s) on this row? Overwrites existing values.`
+              : `Apply this ${noun.toLowerCase()}'s defaults to all ${scenesCount} scenes on this row? Overwrites the ${cellsCount} existing clip(s) and auto-creates clips on the ${scenesCount - cellsCount} empty scene(s).`
           if (scenesCount === 0) return
           if (confirm(msg)) sendTrackDefaultsToClips(trackId)
         }}
@@ -99,6 +202,63 @@ function TrackInspector(): JSX.Element {
       <div className="text-[10px] text-muted leading-snug">
         Only fields with a value get sent. Leave a field blank to skip it.
       </div>
+    </div>
+  )
+}
+
+// Per-arg persistence toggle list. One row per editable arg in the
+// track's argSpec — shows the current value parsed from the focused
+// scene's cell + a checkbox that pins/unpins the slot.
+function PersistentSlotList({
+  argSpec,
+  cellValue,
+  persistentSlots,
+  onToggle
+}: {
+  argSpec: ParamArgSpec[]
+  cellValue: string
+  persistentSlots: boolean[]
+  onToggle: (idx: number, persistent: boolean) => void
+}): JSX.Element {
+  const tokens = cellValue.trim().split(/\s+/).filter((t) => t.length > 0)
+  return (
+    <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center">
+      {argSpec.map((a, i) => {
+        if (a.fixed !== undefined) return null
+        const val = tokens[i] ?? ''
+        const pinned = persistentSlots[i] === true
+        return (
+          <Fragment key={i}>
+            <span
+              className="text-[10px] text-muted truncate"
+              title={a.name}
+            >
+              {a.name}
+            </span>
+            <span
+              className="font-mono text-[11px] text-right truncate"
+              title={val || '(empty)'}
+            >
+              {val || '—'}
+            </span>
+            <label
+              className="flex items-center gap-1 text-[10px] shrink-0"
+              title={
+                pinned
+                  ? 'Unpin — re-enable scene triggers + modulators on this slot'
+                  : 'Pin — freeze this slot at its last sent value'
+              }
+            >
+              <input
+                type="checkbox"
+                checked={pinned}
+                onChange={(e) => onToggle(i, e.target.checked)}
+              />
+              <span>pin</span>
+            </label>
+          </Fragment>
+        )
+      })}
     </div>
   )
 }
@@ -215,6 +375,7 @@ function CellInspector(): JSX.Element {
               ? 'Values'
               : 'Value'
           }
+          rightContent={<ArgPrefixLabel argSpec={track.argSpec} />}
         >
           <MultiArgValueEditor
             cell={c}
@@ -1901,10 +2062,25 @@ function EnvelopeEditor({
   )
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }): JSX.Element {
+function Section({
+  title,
+  children,
+  rightContent
+}: {
+  title: string
+  children: React.ReactNode
+  // Optional inline content rendered to the right of the title on
+  // the same row. Used by the multi-arg Value editor to show its
+  // "Auto-prefix:" badges next to the section header instead of
+  // wasting a full row on them.
+  rightContent?: React.ReactNode
+}): JSX.Element {
   return (
     <div className="flex flex-col gap-1 pt-2 border-t border-border first:border-t-0 first:pt-0">
-      <div className="label">{title}</div>
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="label shrink-0">{title}</span>
+        {rightContent && <span className="flex items-center gap-1 min-w-0 truncate">{rightContent}</span>}
+      </div>
       {children}
     </div>
   )
@@ -2105,39 +2281,45 @@ function MultiArgValueEditor({
     })
     onChange(final.join(' '))
   }
-  const fixedTokens = argSpec.filter((a) => a.fixed !== undefined)
   return (
-    <div className="flex flex-col gap-2">
-      {fixedTokens.length > 0 && (
-        <div className="text-[10px] text-muted leading-tight">
-          <span>Auto-prefix:</span>
-          {fixedTokens.map((a, k) => (
-            <span
-              key={k}
-              className="font-mono ml-1.5 px-1 py-px rounded bg-panel2 border border-border"
-              title={`${a.name} (${a.type}, fixed)`}
-            >
-              {formatTok(a.fixed!)}
-            </span>
-          ))}
-        </div>
-      )}
-      <div className="grid grid-cols-2 gap-x-2 gap-y-1.5">
-        {argSpec.map((a, i) => {
-          if (a.fixed !== undefined) return null
-          return (
-            <ArgInput
-              key={i}
-              spec={a}
-              value={tokens[i] ?? ''}
-              disabled={disabled}
-              onChange={(v) => setAt(i, v)}
-              onCommitTrigger={onCommitTrigger}
-            />
-          )
-        })}
-      </div>
+    <div className="grid grid-cols-2 gap-x-2 gap-y-1.5">
+      {argSpec.map((a, i) => {
+        if (a.fixed !== undefined) return null
+        return (
+          <ArgInput
+            key={i}
+            spec={a}
+            value={tokens[i] ?? ''}
+            disabled={disabled}
+            onChange={(v) => setAt(i, v)}
+            onCommitTrigger={onCommitTrigger}
+          />
+        )
+      })}
     </div>
+  )
+}
+
+// Inline label rendered next to the Value/Values section title:
+//   "Auto-prefix: [compositor] [0]"
+// Each fixed token is shown as a tiny read-only chip so the user
+// sees what's being silently prepended.
+function ArgPrefixLabel({ argSpec }: { argSpec: ParamArgSpec[] }): JSX.Element | null {
+  const fixedTokens = argSpec.filter((a) => a.fixed !== undefined)
+  if (fixedTokens.length === 0) return null
+  return (
+    <span className="flex items-center gap-1 text-[10px] text-muted truncate">
+      <span className="shrink-0">Auto-prefix:</span>
+      {fixedTokens.map((a, k) => (
+        <span
+          key={k}
+          className="font-mono px-1 py-px rounded bg-panel2 border border-border shrink-0"
+          title={`${a.name} (${a.type}, fixed)`}
+        >
+          {formatTok(a.fixed!)}
+        </span>
+      ))}
+    </span>
   )
 }
 
@@ -2154,22 +2336,12 @@ function ArgInput({
   onChange: (v: string) => void
   onCommitTrigger: () => void
 }): JSX.Element {
-  if (spec.type === 'bool') {
-    const checked = value === '1' || value === 'true' || value === 'TRUE' || value === 'True'
-    return (
-      <label className="flex items-center gap-1.5 text-[11px] py-0.5">
-        <input
-          type="checkbox"
-          checked={checked}
-          disabled={disabled}
-          onChange={(e) => {
-            onChange(e.target.checked ? '1' : '0')
-          }}
-        />
-        <span className="truncate" title={spec.name}>{spec.name}</span>
-      </label>
-    )
-  }
+  // Bools use a numeric editor (0..1, integer) — same widget as int
+  // — so modulators and sequencer-step values can drive them too.
+  // The engine still emits the underlying int as an OSC arg; the
+  // receiver coerces 0/1 → bool. Modulating a "bool" continuously
+  // alternates 0 and 1 (or stays at the modulated value, clamped),
+  // letting the user wire e.g. an LFO to a kill switch.
   if (spec.type === 'string') {
     return (
       <label className="flex flex-col gap-0.5 min-w-0">
@@ -2191,27 +2363,34 @@ function ArgInput({
       </label>
     )
   }
-  // float / int
-  const integer = spec.type === 'int'
+  // float / int / bool — bool is rendered as an integer 0/1 editor so
+  // modulators can drive it like any other numeric arg.
+  const integer = spec.type === 'int' || spec.type === 'bool'
   const parsed = integer ? parseInt(value, 10) : parseFloat(value)
-  const fallback =
-    typeof spec.init === 'number'
-      ? spec.init
-      : typeof spec.min === 'number'
-        ? spec.min
-        : 0
-  const safeNum = Number.isFinite(parsed) ? parsed : fallback
+  // Bool defaults to a 0..1 range when not explicitly set, and falls
+  // back to its boolean init coerced to 0/1.
+  const minBound =
+    spec.min !== undefined ? spec.min : spec.type === 'bool' ? 0 : undefined
+  const maxBound =
+    spec.max !== undefined ? spec.max : spec.type === 'bool' ? 1 : undefined
+  let initFallback: number
+  if (typeof spec.init === 'number') initFallback = spec.init
+  else if (typeof spec.init === 'boolean') initFallback = spec.init ? 1 : 0
+  else if (typeof spec.min === 'number') initFallback = spec.min
+  else initFallback = 0
+  const safeNum = Number.isFinite(parsed) ? parsed : initFallback
   return (
     <label className="flex flex-col gap-0.5 min-w-0">
       <span className="text-[9px] text-muted uppercase tracking-wide truncate">
         {spec.name}
+        {spec.type === 'bool' && <span className="ml-1 text-[8px]">(0/1)</span>}
       </span>
       <BoundedNumberInput
         className="input text-[11px] py-0.5"
         value={safeNum}
         onChange={(v) => onChange(integer ? String(Math.round(v)) : String(v))}
-        min={spec.min}
-        max={spec.max}
+        min={minBound}
+        max={maxBound}
         integer={integer}
         disabled={disabled}
       />

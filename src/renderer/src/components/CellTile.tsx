@@ -377,7 +377,7 @@ export default function CellTile({
           {cell.oscAddress}
         </span>
         <span
-          className={`text-[12px] font-mono font-semibold truncate shrink-0 max-w-[40%] text-right ${
+          className={`text-[12px] font-mono font-semibold whitespace-nowrap shrink-0 text-right ${
             isPlaying && liveValue !== undefined ? 'text-accent' : ''
           }`}
         >
@@ -463,7 +463,7 @@ export default function CellTile({
       </div>
       <div className="flex-1 flex items-center">
         <span
-          className={`text-[14px] font-mono font-semibold truncate ${
+          className={`text-[14px] font-mono font-semibold whitespace-nowrap ${
             isPlaying && liveValue !== undefined ? 'text-accent' : ''
           }`}
         >

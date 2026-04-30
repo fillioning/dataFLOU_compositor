@@ -272,6 +272,21 @@ export interface Track {
   // seeds initial cell values. Tracks are snapshots — Pool edits
   // don't propagate retroactively (drag the entry again to refresh).
   argSpec?: ParamArgSpec[]
+  // Disable flag — when explicitly false, the engine skips this
+  // track on any trigger path (cell or scene). Sidebar row renders
+  // greyed out. Undefined / true means enabled (default). Used by
+  // the Instrument-row Inspector's "enable/disable each Parameter"
+  // toggles. On a Template (header) row, disabling cascades to its
+  // Parameter children visually but each child still has its own
+  // independent flag.
+  enabled?: boolean
+  // Per-arg-position persistence flags. Same length / order as
+  // argSpec when present. When persistentSlots[i] is true, the
+  // engine FREEZES that arg position at its last-sent value: scene
+  // triggers won't overwrite it, modulators won't drive it. Lets
+  // the performer "pin" a few knobs while letting the rest morph
+  // through scene transitions.
+  persistentSlots?: boolean[]
 }
 
 // Pool / Instrument Templates
