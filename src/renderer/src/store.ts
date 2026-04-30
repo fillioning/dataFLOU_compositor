@@ -41,6 +41,7 @@ import {
   makeEmptySession,
   makeFunctionSpec,
   makeFunctionTrack,
+  buildInitialValueFromArgSpec,
   makeMetaController,
   makeMetaKnob,
   makeParameterSpec,
@@ -629,7 +630,7 @@ export const useStore = create<State>((set, get) => ({
   clipTemplates: loadTemplates(),
 
   setSession: (s) => {
-    const next = propagateDefaults(s)
+    const next = backfillTrackArgSpecsFromPool(propagateDefaults(s))
     // Reset display values to each knob's persisted value so the UI opens
     // at the right position after loading a session.
     const display = next.metaController.knobs.map((k) => k.value)
@@ -1216,7 +1217,9 @@ export const useStore = create<State>((set, get) => ({
         parentTrackId: parentTrackId || undefined,
         defaultOscAddress: p.oscPath.startsWith('/') ? p.oscPath : `/${p.oscPath}`,
         defaultDestIp: p.destIp,
-        defaultDestPort: p.destPort
+        defaultDestPort: p.destPort,
+        // Snapshot the blueprint's argSpec onto the row.
+        argSpec: p.argSpec ? p.argSpec.map((a) => ({ ...a })) : undefined
       }
       const tracks = st.session.tracks
       const idx = insertAfterTrackId
@@ -1495,6 +1498,15 @@ export const useStore = create<State>((set, get) => ({
             // track default is NOT tracking the session default.
             cell.destLinkedToDefault = def.destLinked
             cell.addressLinkedToDefault = def.addressLinked
+            // If the track was instantiated from a multi-arg spec
+            // (e.g. OCTOCOSME's /A/strips/pots which expects a
+            // [sender] [ts] + 12 floats bundle), seed the cell's
+            // value with the spec's fixed prefix + per-arg inits
+            // joined by space. The user then edits N labeled
+            // inputs in the inspector instead of one big string.
+            if (track?.argSpec && track.argSpec.length > 0) {
+              cell.value = buildInitialValueFromArgSpec(track.argSpec)
+            }
             return {
               ...s,
               cells: { ...s.cells, [trackId]: cell }
@@ -2230,7 +2242,16 @@ function propagateDefaults(s: Session): Session {
         defaultDestIp: typeof t.defaultDestIp === 'string' ? t.defaultDestIp : undefined,
         defaultDestPort:
           typeof t.defaultDestPort === 'number' ? t.defaultDestPort : undefined,
-        midiTrigger: sanitizeMidiBinding(t.midiTrigger)
+        midiTrigger: sanitizeMidiBinding(t.midiTrigger),
+        // argSpec is initialized from the saved track if present.
+        // A second pass below re-resolves it against the FINAL
+        // (builtin-merged) pool so older OCTOCOSME rows pick up the
+        // new schema without manual re-instantiation.
+        argSpec: Array.isArray((t as Partial<Track>).argSpec)
+          ? ((t as Partial<Track>).argSpec!
+              .map((a) => sanitizeArgSpec(a))
+              .filter((a): a is import('@shared/types').ParamArgSpec => a !== null))
+          : undefined
       })),
     // Pool — pre-merger sessions don't have one; ship the builtin library
     // so the user sees the OCTOCOSME / XYZ / Pandore starter templates
@@ -2452,6 +2473,24 @@ function propagateDefaults(s: Session): Session {
   }
 }
 
+// Second pass — once the pool has been merged with the builtin
+// library (sanitizePool), walk every track and re-resolve its
+// argSpec against the final pool. Tracks that already had a saved
+// argSpec keep theirs (user data wins); tracks instantiated before
+// argSpec existed (e.g. pre-this-commit OCTOCOSME rows) inherit the
+// builtin Function's argSpec automatically.
+function backfillTrackArgSpecsFromPool(s: Session): Session {
+  const tracksUpdated = s.tracks.map((t) => {
+    if (Array.isArray(t.argSpec) && t.argSpec.length > 0) return t
+    if (!t.sourceTemplateId || !t.sourceFunctionId) return t
+    const tpl = s.pool.templates.find((tt) => tt.id === t.sourceTemplateId)
+    const fn = tpl?.functions.find((f) => f.id === t.sourceFunctionId)
+    if (!fn?.argSpec || fn.argSpec.length === 0) return t
+    return { ...t, argSpec: fn.argSpec.map((a) => ({ ...a })) }
+  })
+  return { ...s, tracks: tracksUpdated }
+}
+
 // Shared defensive cleanup for MIDI bindings on Tracks, Scenes, and Cells.
 // A binding must have kind ∈ {note, cc} and finite channel/number; anything
 // else is treated as "no binding" rather than leaving a malformed object in
@@ -2526,6 +2565,21 @@ const VALID_NATURES = new Set<FunctionParamNature>(['lin', 'log', 'exp'])
 const VALID_STREAM_MODES = new Set<FunctionStreamMode>([
   'streaming', 'discrete', 'polling'
 ])
+
+function sanitizeArgSpec(raw: unknown): import('@shared/types').ParamArgSpec | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Partial<import('@shared/types').ParamArgSpec>
+  const t = r.type
+  if (t !== 'float' && t !== 'int' && t !== 'bool' && t !== 'string') return null
+  return {
+    name: typeof r.name === 'string' ? r.name : '',
+    type: t,
+    fixed: r.fixed,
+    min: typeof r.min === 'number' ? r.min : undefined,
+    max: typeof r.max === 'number' ? r.max : undefined,
+    init: r.init
+  }
+}
 
 function sanitizeFunction(raw: unknown, idx: number): InstrumentFunction | null {
   if (!raw || typeof raw !== 'object') return null

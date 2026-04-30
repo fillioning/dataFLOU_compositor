@@ -267,6 +267,11 @@ export interface Track {
   defaultDestPort?: number
   // MIDI binding for triggering this track's cell in the focused scene.
   midiTrigger?: MidiBinding
+  // Snapshot of the source Function/Parameter's argSpec at
+  // instantiation time. Drives the cell editor's split-input UI and
+  // seeds initial cell values. Tracks are snapshots — Pool edits
+  // don't propagate retroactively (drag the entry again to refresh).
+  argSpec?: ParamArgSpec[]
 }
 
 // Pool / Instrument Templates
@@ -321,6 +326,35 @@ export interface InstrumentFunction {
   smoothMs?: number
   // Free-form notes for the player.
   notes?: string
+  // Multi-arg bundle spec — when present, every clip on a row
+  // instantiated from this Function expects exactly `argSpec.length`
+  // OSC args in this order. The cell editor renders one labeled
+  // input per non-fixed entry; entries with `fixed` are invisibly
+  // prepended on send (useful for protocol header pairs like the
+  // Octocosme Pure Data patch's `[sender] [timestamp]` prefix that
+  // its `list split 2` discards).
+  argSpec?: ParamArgSpec[]
+}
+
+// Per-arg spec for a multi-arg OSC bundle. Drives the UI's split
+// data-entry strip + initial value seeding.
+export interface ParamArgSpec {
+  // Display label shown above the input (or used as a tooltip on
+  // fixed args). Free text, e.g. "HAUTEUR1".
+  name: string
+  // Type drives the input widget choice (number / bool / text) and
+  // the value-token formatting at send time.
+  type: 'float' | 'int' | 'bool' | 'string'
+  // When set, this arg is invisibly prepended to every clip's value
+  // string and never shown as an editable input. Used for protocol
+  // prefixes the receiver discards (see Octocosme `list split 2`).
+  fixed?: number | string | boolean
+  // For editable numeric args.
+  min?: number
+  max?: number
+  // Initial value used to seed a freshly-created cell. If omitted,
+  // falls back to 0 / "" depending on `type`.
+  init?: number | string | boolean
 }
 
 export interface InstrumentTemplate {
@@ -378,6 +412,10 @@ export interface ParameterTemplate {
   smoothMs?: number
   notes?: string
   builtin?: boolean
+  // See InstrumentFunction.argSpec — same semantics applied to a
+  // standalone Parameter blueprint. Drag-drop instantiation
+  // snapshots this onto the resulting Track.
+  argSpec?: ParamArgSpec[]
 }
 
 export interface Pool {

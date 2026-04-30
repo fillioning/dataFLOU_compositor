@@ -11,6 +11,7 @@ import type {
   MetaKnob,
   Modulation,
   MultMode,
+  ParamArgSpec,
   Pool,
   RampParams,
   RandomParams,
@@ -434,8 +435,34 @@ export function makeFunctionTrack(
     sourceFunctionId: fn.id,
     defaultOscAddress: resolvedOscAddress,
     defaultDestIp: fn.destIpOverride ?? template.destIp,
-    defaultDestPort: fn.destPortOverride ?? template.destPort
+    defaultDestPort: fn.destPortOverride ?? template.destPort,
+    // Snapshot the Function's argSpec onto the Track so the cell
+    // editor can read it without round-tripping through the Pool
+    // (which may be edited / replaced / hidden behind a draft).
+    argSpec: fn.argSpec ? fn.argSpec.map((a) => ({ ...a })) : undefined
   }
+}
+
+// Build the initial Cell.value string for a freshly-created cell on
+// a track that has an argSpec. Fixed args use their `fixed` value;
+// editable args use `init` (or 0 / "" / false based on `type`). The
+// resulting tokens are space-joined the same way the cell value
+// parser expects.
+export function buildInitialValueFromArgSpec(spec: ParamArgSpec[]): string {
+  return spec
+    .map((a) => {
+      let v: number | string | boolean
+      if (a.fixed !== undefined) v = a.fixed
+      else if (a.init !== undefined) v = a.init
+      else if (a.type === 'string') v = ''
+      else if (a.type === 'bool') v = false
+      else v = 0
+      // Bools serialise as 0/1 — that's what Pd's `unpack f f f f`
+      // expects (and what auto-detect emits as int OSC args).
+      if (typeof v === 'boolean') return v ? '1' : '0'
+      return String(v)
+    })
+    .join(' ')
 }
 
 // Default for "Add Parameter" inside a Template authoring flow. Name
@@ -597,14 +624,13 @@ export function makeBuiltinPool(): Pool {
         name: 'OCTOCOSME',
         description:
           'Octocosme V9 — sends OSC to the Pure Data software (port 1986). ' +
-          'Each Parameter is a complete bundle expected by the patch\'s else/osc.route ' +
-          'receivers. The Teensy hardware controller and the compositor can both feed ' +
-          'the same patch in parallel without conflict (UDP allows multiple senders); ' +
+          'Each Parameter is a complete bundle the patch\'s else/osc.route ' +
+          'receivers expect. The Teensy hardware controller and the compositor ' +
+          'can both feed the same patch in parallel without conflict; ' +
           'just don\'t fight over the same control at the same moment. ' +
-          'IMPORTANT: every bundle must be prefixed with 2 dummy header args ' +
-          '(string + int) — e.g. "compositor 0 0.5 0.5 …" — because the Pd patch\'s ' +
-          '`list split 2` strips a sender_ip + timestamp pair before the data unpack. ' +
-          'See each Parameter\'s notes for the per-bundle order.',
+          'Every bundle prepends a 2-arg [sender, timestamp] header (the patch ' +
+          'discards them via `list split 2`); the cell editor handles the ' +
+          'header automatically — you only see the musical fields.',
         color: '#ff7a3d',
         destIp: '127.0.0.1',
         destPort: 1986,
@@ -623,12 +649,24 @@ export function makeBuiltinPool(): Pool {
             max: 1,
             init: 0.5,
             notes:
-              '12 floats after the 2-arg prefix, in order: ' +
-              'HAUTEUR1, HAUTEUR2, HAUTEUR3, HAUTEUR4, ' +
-              'MODA1, MODA2, MODA3, MODA4, ' +
-              'MODB1, MODB2, MODB3, MODB4. ' +
-              'Each 0–1. Drives per-voice pitch + ModA + ModB on Voices 1–4. ' +
-              'Example clip Value: "compositor 0 0.5 0.5 0.5 0.5 0 0 0 0 0 0 0 0".'
+              'HAUTEUR1-4, MODA1-4, MODB1-4 — per-voice pitch + ModA + ModB ' +
+              '(0–1 each). Voices 1–4.',
+            argSpec: [
+              { name: 'sender', type: 'string', fixed: 'compositor' },
+              { name: 'timestamp', type: 'int', fixed: 0 },
+              { name: 'HAUTEUR1', type: 'float', min: 0, max: 1, init: 0.5 },
+              { name: 'HAUTEUR2', type: 'float', min: 0, max: 1, init: 0.5 },
+              { name: 'HAUTEUR3', type: 'float', min: 0, max: 1, init: 0.5 },
+              { name: 'HAUTEUR4', type: 'float', min: 0, max: 1, init: 0.5 },
+              { name: 'MODA1', type: 'float', min: 0, max: 1, init: 0 },
+              { name: 'MODA2', type: 'float', min: 0, max: 1, init: 0 },
+              { name: 'MODA3', type: 'float', min: 0, max: 1, init: 0 },
+              { name: 'MODA4', type: 'float', min: 0, max: 1, init: 0 },
+              { name: 'MODB1', type: 'float', min: 0, max: 1, init: 0 },
+              { name: 'MODB2', type: 'float', min: 0, max: 1, init: 0 },
+              { name: 'MODB3', type: 'float', min: 0, max: 1, init: 0 },
+              { name: 'MODB4', type: 'float', min: 0, max: 1, init: 0 }
+            ]
           },
           {
             id: 'fn_octo_voice_volumes',
@@ -640,10 +678,15 @@ export function makeBuiltinPool(): Pool {
             min: 0,
             max: 1,
             init: 0.5,
-            notes:
-              '4 floats after the prefix: VOLUME1, VOLUME2, VOLUME3, VOLUME4. ' +
-              'Each 0–1. Per-voice gain. ' +
-              'Example: "compositor 0 0.5 0.5 0.5 0.5".'
+            notes: 'VOLUME1-4 — per-voice gain (0–1).',
+            argSpec: [
+              { name: 'sender', type: 'string', fixed: 'compositor' },
+              { name: 'timestamp', type: 'int', fixed: 0 },
+              { name: 'VOLUME1', type: 'float', min: 0, max: 1, init: 0.5 },
+              { name: 'VOLUME2', type: 'float', min: 0, max: 1, init: 0.5 },
+              { name: 'VOLUME3', type: 'float', min: 0, max: 1, init: 0.5 },
+              { name: 'VOLUME4', type: 'float', min: 0, max: 1, init: 0.5 }
+            ]
           },
           {
             id: 'fn_octo_voice_instruments',
@@ -656,11 +699,17 @@ export function makeBuiltinPool(): Pool {
             max: 7,
             init: 0,
             notes:
-              '4 ints after the prefix: INSTRU1, INSTRU2, INSTRU3, INSTRU4. ' +
-              'Each 0–7, picks one of 8 instruments per voice ' +
+              'INSTRU1-4 — picks one of 8 instruments per voice ' +
               '(0=SuperMorpher, 1=MeloWave, 2=TremWave, 3=VibeWave, ' +
-              '4=Electric, 5=ResoNoise, 6=TremNoise, 7=RandomNoise). ' +
-              'Example: "compositor 0 0 1 2 3".'
+              '4=Electric, 5=ResoNoise, 6=TremNoise, 7=RandomNoise).',
+            argSpec: [
+              { name: 'sender', type: 'string', fixed: 'compositor' },
+              { name: 'timestamp', type: 'int', fixed: 0 },
+              { name: 'INSTRU1', type: 'int', min: 0, max: 7, init: 0 },
+              { name: 'INSTRU2', type: 'int', min: 0, max: 7, init: 0 },
+              { name: 'INSTRU3', type: 'int', min: 0, max: 7, init: 0 },
+              { name: 'INSTRU4', type: 'int', min: 0, max: 7, init: 0 }
+            ]
           },
           {
             id: 'fn_octo_voice_kills',
@@ -672,9 +721,15 @@ export function makeBuiltinPool(): Pool {
             min: 0,
             max: 1,
             init: 0,
-            notes:
-              '4 bools after the prefix: KILL1, KILL2, KILL3, KILL4 ' +
-              '(send 0 or 1 each). Example: "compositor 0 0 0 0 0".'
+            notes: 'KILL1-4 — bool flag per voice.',
+            argSpec: [
+              { name: 'sender', type: 'string', fixed: 'compositor' },
+              { name: 'timestamp', type: 'int', fixed: 0 },
+              { name: 'KILL1', type: 'bool', init: false },
+              { name: 'KILL2', type: 'bool', init: false },
+              { name: 'KILL3', type: 'bool', init: false },
+              { name: 'KILL4', type: 'bool', init: false }
+            ]
           },
           {
             id: 'fn_octo_global_fx',
@@ -686,10 +741,17 @@ export function makeBuiltinPool(): Pool {
             min: 0,
             max: 1,
             init: 0.5,
-            notes:
-              '6 floats after the prefix: VOLUME, FILTRE, MOUVEMENT, DELAI, ' +
-              'AMBIANCE, DISTORSION. Each 0–1. Master FX chain controls. ' +
-              'Example: "compositor 0 0.5 0.5 0 0 0.2 0".'
+            notes: 'Master FX chain (0–1 each).',
+            argSpec: [
+              { name: 'sender', type: 'string', fixed: 'compositor' },
+              { name: 'timestamp', type: 'int', fixed: 0 },
+              { name: 'VOLUME', type: 'float', min: 0, max: 1, init: 0.5 },
+              { name: 'FILTRE', type: 'float', min: 0, max: 1, init: 0.5 },
+              { name: 'MOUVEMENT', type: 'float', min: 0, max: 1, init: 0 },
+              { name: 'DELAI', type: 'float', min: 0, max: 1, init: 0 },
+              { name: 'AMBIANCE', type: 'float', min: 0, max: 1, init: 0.2 },
+              { name: 'DISTORSION', type: 'float', min: 0, max: 1, init: 0 }
+            ]
           },
           {
             id: 'fn_octo_global_notes',
@@ -701,10 +763,14 @@ export function makeBuiltinPool(): Pool {
             min: 0,
             max: 1,
             init: 0,
-            notes:
-              '3 floats after the prefix: NOTES, VARIATION, VITESSE. ' +
-              'Each 0–1. Drives global note generation / arpeggiation. ' +
-              'Example: "compositor 0 0.5 0 0".'
+            notes: 'Global note generation / arpeggiation.',
+            argSpec: [
+              { name: 'sender', type: 'string', fixed: 'compositor' },
+              { name: 'timestamp', type: 'int', fixed: 0 },
+              { name: 'NOTES', type: 'float', min: 0, max: 1, init: 0.5 },
+              { name: 'VARIATION', type: 'float', min: 0, max: 1, init: 0 },
+              { name: 'VITESSE', type: 'float', min: 0, max: 1, init: 0 }
+            ]
           },
           {
             id: 'fn_octo_intervalle',
@@ -716,9 +782,12 @@ export function makeBuiltinPool(): Pool {
             min: 0,
             max: 15,
             init: 0,
-            notes:
-              '1 int after the prefix: INTERVALLE (0–15, 16 chord/scale presets). ' +
-              'Example: "compositor 0 5".'
+            notes: 'INTERVALLE — 16 chord/scale presets (0–15).',
+            argSpec: [
+              { name: 'sender', type: 'string', fixed: 'compositor' },
+              { name: 'timestamp', type: 'int', fixed: 0 },
+              { name: 'INTERVALLE', type: 'int', min: 0, max: 15, init: 0 }
+            ]
           },
           {
             id: 'fn_octo_modes',
@@ -730,9 +799,13 @@ export function makeBuiltinPool(): Pool {
             min: 0,
             max: 1,
             init: 0,
-            notes:
-              '2 bools after the prefix: GLOBAL_MODE, TOUCH_MODE (0 or 1 each). ' +
-              'Example: "compositor 0 0 0".'
+            notes: 'GLOBAL_MODE + TOUCH_MODE — bool flags.',
+            argSpec: [
+              { name: 'sender', type: 'string', fixed: 'compositor' },
+              { name: 'timestamp', type: 'int', fixed: 0 },
+              { name: 'GLOBAL_MODE', type: 'bool', init: false },
+              { name: 'TOUCH_MODE', type: 'bool', init: false }
+            ]
           }
         ]
       },

@@ -2,12 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
 import type {
   ArpMode,
+  Cell,
   EnvSync,
   LfoMode,
   LfoShape,
   LfoSync,
   ModType,
   MultMode,
+  ParamArgSpec,
   RandomValueType,
   SeqSyncMode
 } from '@shared/types'
@@ -199,66 +201,114 @@ function CellInspector(): JSX.Element {
         </div>
       </Section>
 
-      <Section title="Value">
-        <div className="flex items-center gap-2">
-          <UncontrolledTextInput
-            className="input flex-1 font-mono"
-            value={cell.value}
-            onChange={(v) => u({ value: capTokens(v, 16) })}
-            onKeyDown={(e) => {
-              // Enter commits + re-triggers the clip. Engine.triggerCell
-              // is a full restart — it resets LFO phase, envelope clock,
-              // sequencer step, arp index, and the random-generator seed,
-              // so the new value plays cleanly from the beginning of its
-              // modulation/sequence cycle. Falling edge of the keystroke
-              // (keyDown → blur → onChange will have run for the final
-              // character); call triggerCell on a micro-delay so the
-              // updateSession IPC flushes to main first.
-              if (e.key === 'Enter') {
-                e.preventDefault()
-                // Force onChange to fire before we trigger — native input
-                // only dispatches onChange on value change, so if the
-                // user types then hits Enter without losing focus the
-                // last keystroke IS already committed; we just need the
-                // session push to land in main. setTimeout(0) defers the
-                // trigger past this tick so updateSession wins the race.
-                const { sceneId, trackId } = sel
-                setTimeout(() => {
-                  window.api.triggerCell(sceneId, trackId)
-                }, 0)
-              }
-            }}
-            placeholder="0"
+      {/* When the track was instantiated from a multi-arg spec
+          (e.g. OCTOCOSME's /A/strips/pots — 2-arg fixed prefix +
+          12 floats), render N labeled inputs instead of a single
+          space-separated string. Each input edits its position in
+          the cell's value tokens; fixed prefix tokens are auto-
+          prepended on save. Sequencer mode disables the editor
+          since per-step values can't yet be split across args. */}
+      {track.argSpec && track.argSpec.length > 0 ? (
+        <Section
+          title={
+            track.argSpec.filter((a) => a.fixed === undefined).length > 1
+              ? 'Values'
+              : 'Value'
+          }
+        >
+          <MultiArgValueEditor
+            cell={c}
+            argSpec={track.argSpec}
             disabled={cell.sequencer.enabled}
+            onChange={(v) => u({ value: v })}
+            onCommitTrigger={() => {
+              const { sceneId, trackId } = sel
+              setTimeout(() => {
+                window.api.triggerCell(sceneId, trackId)
+              }, 0)
+            }}
           />
-          <label className="flex items-center gap-1 text-[11px] shrink-0" title="Clamp every output to [0.0, 1.0]">
-            <input
-              type="checkbox"
-              checked={cell.scaleToUnit}
-              onChange={(e) => u({ scaleToUnit: e.target.checked })}
+          <div className="flex items-center gap-2 mt-2">
+            <label
+              className="flex items-center gap-1 text-[11px] shrink-0"
+              title="Clamp every output to [0.0, 1.0]"
+            >
+              <input
+                type="checkbox"
+                checked={cell.scaleToUnit}
+                onChange={(e) => u({ scaleToUnit: e.target.checked })}
+              />
+              <span>Scale 0.0–1.0</span>
+            </label>
+            {cell.sequencer.enabled && (
+              <span className="text-accent text-[10px]">
+                (ignored — sequencer on)
+              </span>
+            )}
+          </div>
+        </Section>
+      ) : (
+        <Section title="Value">
+          <div className="flex items-center gap-2">
+            <UncontrolledTextInput
+              className="input flex-1 font-mono"
+              value={cell.value}
+              onChange={(v) => u({ value: capTokens(v, 16) })}
+              onKeyDown={(e) => {
+                // Enter commits + re-triggers the clip. Engine.triggerCell
+                // is a full restart — it resets LFO phase, envelope clock,
+                // sequencer step, arp index, and the random-generator seed,
+                // so the new value plays cleanly from the beginning of its
+                // modulation/sequence cycle. Falling edge of the keystroke
+                // (keyDown → blur → onChange will have run for the final
+                // character); call triggerCell on a micro-delay so the
+                // updateSession IPC flushes to main first.
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  // Force onChange to fire before we trigger — native input
+                  // only dispatches onChange on value change, so if the
+                  // user types then hits Enter without losing focus the
+                  // last keystroke IS already committed; we just need the
+                  // session push to land in main. setTimeout(0) defers the
+                  // trigger past this tick so updateSession wins the race.
+                  const { sceneId, trackId } = sel
+                  setTimeout(() => {
+                    window.api.triggerCell(sceneId, trackId)
+                  }, 0)
+                }
+              }}
+              placeholder="0"
+              disabled={cell.sequencer.enabled}
             />
-            <span>Scale 0.0–1.0</span>
-          </label>
-        </div>
-        <div className="text-[10px] text-muted mt-1">
-          {(() => {
-            const tokens = cell.value.trim().split(/\s+/).filter((t) => t)
-            const tokenCount = tokens.length
-            const types = tokens.map(detectedLabel)
-            return (
-              <>
-                {tokenCount === 1
-                  ? `auto-detected: ${types[0] || 'string (empty)'}`
-                  : `${tokenCount} values: ${types.join(', ')}`}
-                {tokenCount >= 16 && <span className="text-danger ml-2">(max 16)</span>}
-                {cell.sequencer.enabled && (
-                  <span className="text-accent ml-2">(ignored — sequencer on)</span>
-                )}
-              </>
-            )
-          })()}
-        </div>
-      </Section>
+            <label className="flex items-center gap-1 text-[11px] shrink-0" title="Clamp every output to [0.0, 1.0]">
+              <input
+                type="checkbox"
+                checked={cell.scaleToUnit}
+                onChange={(e) => u({ scaleToUnit: e.target.checked })}
+              />
+              <span>Scale 0.0–1.0</span>
+            </label>
+          </div>
+          <div className="text-[10px] text-muted mt-1">
+            {(() => {
+              const tokens = cell.value.trim().split(/\s+/).filter((t) => t)
+              const tokenCount = tokens.length
+              const types = tokens.map(detectedLabel)
+              return (
+                <>
+                  {tokenCount === 1
+                    ? `auto-detected: ${types[0] || 'string (empty)'}`
+                    : `${tokenCount} values: ${types.join(', ')}`}
+                  {tokenCount >= 16 && <span className="text-danger ml-2">(max 16)</span>}
+                  {cell.sequencer.enabled && (
+                    <span className="text-accent ml-2">(ignored — sequencer on)</span>
+                  )}
+                </>
+              )
+            })()}
+          </div>
+        </Section>
+      )}
 
       <Section title="Timing">
         <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center">
@@ -2019,4 +2069,175 @@ function detectedLabel(s: string): string {
   if (/^-?\d+$/.test(t)) return 'int'
   if (/^-?(\d+\.\d*|\.\d+|\d+)([eE][-+]?\d+)?$/.test(t)) return 'float'
   return 'string'
+}
+
+// Cell value editor for tracks instantiated from a multi-arg
+// ParamArgSpec. Renders one labeled input per non-fixed entry plus
+// a small read-only "prefix" strip showing the fixed header tokens
+// (so the user knows what's being prepended even though they can't
+// edit it). Cell.value is stored as a single space-joined string —
+// this component just parses → renders → joins on commit, leaving
+// the engine and persistence paths unchanged.
+function MultiArgValueEditor({
+  cell,
+  argSpec,
+  disabled,
+  onChange,
+  onCommitTrigger
+}: {
+  cell: Cell
+  argSpec: ParamArgSpec[]
+  disabled: boolean
+  onChange: (newValue: string) => void
+  onCommitTrigger: () => void
+}): JSX.Element {
+  const tokens = tokensWithDefaults(tokensFromValue(cell.value), argSpec)
+  function setAt(i: number, raw: string): void {
+    const next = tokens.slice()
+    next[i] = raw
+    // Re-coerce fixed positions back to their declared values in
+    // case anything in the chain corrupted them. Belt-and-braces.
+    const final = next.map((t, idx) => {
+      const a = argSpec[idx]
+      if (!a) return t
+      if (a.fixed !== undefined) return formatTok(a.fixed)
+      return t
+    })
+    onChange(final.join(' '))
+  }
+  const fixedTokens = argSpec.filter((a) => a.fixed !== undefined)
+  return (
+    <div className="flex flex-col gap-2">
+      {fixedTokens.length > 0 && (
+        <div className="text-[10px] text-muted leading-tight">
+          <span>Auto-prefix:</span>
+          {fixedTokens.map((a, k) => (
+            <span
+              key={k}
+              className="font-mono ml-1.5 px-1 py-px rounded bg-panel2 border border-border"
+              title={`${a.name} (${a.type}, fixed)`}
+            >
+              {formatTok(a.fixed!)}
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-x-2 gap-y-1.5">
+        {argSpec.map((a, i) => {
+          if (a.fixed !== undefined) return null
+          return (
+            <ArgInput
+              key={i}
+              spec={a}
+              value={tokens[i] ?? ''}
+              disabled={disabled}
+              onChange={(v) => setAt(i, v)}
+              onCommitTrigger={onCommitTrigger}
+            />
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function ArgInput({
+  spec,
+  value,
+  disabled,
+  onChange,
+  onCommitTrigger
+}: {
+  spec: ParamArgSpec
+  value: string
+  disabled: boolean
+  onChange: (v: string) => void
+  onCommitTrigger: () => void
+}): JSX.Element {
+  if (spec.type === 'bool') {
+    const checked = value === '1' || value === 'true' || value === 'TRUE' || value === 'True'
+    return (
+      <label className="flex items-center gap-1.5 text-[11px] py-0.5">
+        <input
+          type="checkbox"
+          checked={checked}
+          disabled={disabled}
+          onChange={(e) => {
+            onChange(e.target.checked ? '1' : '0')
+          }}
+        />
+        <span className="truncate" title={spec.name}>{spec.name}</span>
+      </label>
+    )
+  }
+  if (spec.type === 'string') {
+    return (
+      <label className="flex flex-col gap-0.5 min-w-0">
+        <span className="text-[9px] text-muted uppercase tracking-wide truncate">
+          {spec.name}
+        </span>
+        <UncontrolledTextInput
+          className="input text-[11px] py-0.5 font-mono"
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              onCommitTrigger()
+            }
+          }}
+        />
+      </label>
+    )
+  }
+  // float / int
+  const integer = spec.type === 'int'
+  const parsed = integer ? parseInt(value, 10) : parseFloat(value)
+  const fallback =
+    typeof spec.init === 'number'
+      ? spec.init
+      : typeof spec.min === 'number'
+        ? spec.min
+        : 0
+  const safeNum = Number.isFinite(parsed) ? parsed : fallback
+  return (
+    <label className="flex flex-col gap-0.5 min-w-0">
+      <span className="text-[9px] text-muted uppercase tracking-wide truncate">
+        {spec.name}
+      </span>
+      <BoundedNumberInput
+        className="input text-[11px] py-0.5"
+        value={safeNum}
+        onChange={(v) => onChange(integer ? String(Math.round(v)) : String(v))}
+        min={spec.min}
+        max={spec.max}
+        integer={integer}
+        disabled={disabled}
+      />
+    </label>
+  )
+}
+
+function tokensFromValue(value: string): string[] {
+  return value.trim().split(/\s+/).filter((t) => t.length > 0)
+}
+
+// Pad the parsed token list out to argSpec.length, filling missing
+// slots with the spec's defaults (init / fixed / type-zero). Used
+// both for first-render of an under-filled cell and for assembling
+// the commit value after edits.
+function tokensWithDefaults(tokens: string[], spec: ParamArgSpec[]): string[] {
+  return spec.map((a, i) => {
+    if (a.fixed !== undefined) return formatTok(a.fixed)
+    if (i < tokens.length && tokens[i] !== undefined) return tokens[i]
+    if (a.init !== undefined) return formatTok(a.init)
+    if (a.type === 'string') return ''
+    return '0'
+  })
+}
+
+function formatTok(v: number | string | boolean): string {
+  if (typeof v === 'boolean') return v ? '1' : '0'
+  return String(v)
 }
