@@ -1,7 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type {
+  DiscoveredOscDevice,
   EngineState,
   ExposedApi,
+  NetworkListenerStatus,
   OscErrorEvent,
   OscEvent,
   Session
@@ -43,6 +45,20 @@ const api: ExposedApi = {
       cb(batch)
     ipcRenderer.on('engine:oscErrors', h)
     return () => ipcRenderer.off('engine:oscErrors', h)
+  },
+
+  // ── Network discovery ────────────────────────────────────────────
+  networkSetEnabled: (enabled, port) =>
+    ipcRenderer.invoke('network:setEnabled', enabled, port),
+  networkList: () => ipcRenderer.invoke('network:list'),
+  networkClear: () => ipcRenderer.invoke('network:clear'),
+  onNetworkDevices: (cb) => {
+    const h = (
+      _e: Electron.IpcRendererEvent,
+      payload: { status: NetworkListenerStatus; devices: DiscoveredOscDevice[] }
+    ): void => cb(payload)
+    ipcRenderer.on('network:devices', h)
+    return () => ipcRenderer.off('network:devices', h)
   }
 }
 

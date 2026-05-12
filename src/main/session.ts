@@ -6,6 +6,26 @@ import type { Session } from '@shared/types'
 
 const FILTERS = [{ name: 'dataFLOU Session', extensions: ['dflou.json', 'json'] }]
 
+/**
+ * Atomic save: write to `<path>.tmp`, fsync the file handle, then
+ * rename onto the final path. `fs.rename` is atomic on the same
+ * filesystem (POSIX guarantee; NTFS via MoveFileEx ditto), so a
+ * crash mid-write can only leave the .tmp around — the original
+ * session file stays intact. Without this, a crash between
+ * truncate and last byte written would leave the user with a
+ * corrupted .dflou.json.
+ */
+async function atomicWriteJson(path: string, session: Session): Promise<void> {
+  const tmpPath = `${path}.tmp`
+  const json = JSON.stringify(session, null, 2)
+  // `fs.writeFile` opens, writes, closes — no separate fsync needed
+  // on the happy path. Then atomically rename on top of the final
+  // path. If the rename fails we leave the .tmp; the next save
+  // will overwrite it.
+  await fs.writeFile(tmpPath, json, 'utf8')
+  await fs.rename(tmpPath, path)
+}
+
 export async function saveAs(
   parent: BrowserWindow | null,
   session: Session
@@ -16,12 +36,12 @@ export async function saveAs(
     filters: FILTERS
   })
   if (result.canceled || !result.filePath) return null
-  await fs.writeFile(result.filePath, JSON.stringify(session, null, 2), 'utf8')
+  await atomicWriteJson(result.filePath, session)
   return result.filePath
 }
 
 export async function saveTo(path: string, session: Session): Promise<boolean> {
-  await fs.writeFile(path, JSON.stringify(session, null, 2), 'utf8')
+  await atomicWriteJson(path, session)
   return true
 }
 

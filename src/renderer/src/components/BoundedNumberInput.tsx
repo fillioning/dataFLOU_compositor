@@ -3,11 +3,15 @@
 //  - allows the field to be EMPTY during editing (instead of snapping to 0)
 //  - clamps to [min, max] and reverts to the previous value on blur if invalid
 //  - hides spinner arrows (handled globally in styles.css)
+//  - in rich themes (Nature, Cream-as-Peaks), gets a "console readout"
+//    look — accent-tinted mono on a dark embedded card — until focused,
+//    then reverts to the standard input chrome for editing
 //
 // Use this anywhere a typical <input type="number"> would otherwise hijack
 // the user's keystrokes (delete-everything snaps to 0, etc.).
 
 import { useEffect, useRef, useState } from 'react'
+import { isRichTheme, useStore } from '../store'
 
 interface Props {
   value: number
@@ -111,10 +115,18 @@ export function BoundedNumberInput({
     setStr(formatValue(clamped, integer))
   }
 
+  // Rich theme overlays the .rich-readout class onto whatever class
+  // the caller passed. The CSS rule for .rich-readout:focus reverts
+  // to the standard input look while editing, so the user gets the
+  // familiar typing chrome on focus and the console-display look at
+  // rest. Re-renders when the theme changes — instant flip.
+  const rich = useStore((s) => isRichTheme(s.theme))
+  const cls = (className ?? 'input') + (rich ? ' rich-readout' : '')
+
   return (
     <input
       ref={inputRef}
-      className={className ?? 'input'}
+      className={cls}
       type="text"
       inputMode={integer ? 'numeric' : 'decimal'}
       value={str}

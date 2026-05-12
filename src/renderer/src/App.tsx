@@ -514,6 +514,28 @@ export default function App(): JSX.Element {
 
   const uiScale = useStore((s) => s.uiScale)
 
+  // Network discovery: subscribe to main-process device updates at
+  // app-level (not inside PoolPane) so the Pool drawer's title-bar
+  // status dot can reflect live bind errors even when the user has
+  // collapsed the drawer. Previously the subscription was tied to
+  // PoolPane mount/unmount and stopped firing the moment the drawer
+  // was hidden.
+  const setNetworkSnapshot = useStore((s) => s.setNetworkSnapshot)
+  useEffect(() => {
+    let cancelled = false
+    window.api?.networkList?.().then((payload) => {
+      if (cancelled) return
+      setNetworkSnapshot(payload.devices, payload.status)
+    })
+    const off = window.api?.onNetworkDevices?.((payload) => {
+      setNetworkSnapshot(payload.devices, payload.status)
+    })
+    return () => {
+      cancelled = true
+      if (off) off()
+    }
+  }, [setNetworkSnapshot])
+
   return (
     <div className="flex flex-col h-full">
       <TopBar />
@@ -535,11 +557,15 @@ export default function App(): JSX.Element {
             scene readout, and running time counter. Sits inside the zoom
             wrapper so Ctrl+wheel scales it alongside the rest of the app. */}
         <TransportBar />
+        {/* Optional OSC monitor drawer — renders null when closed, so
+            there is no subscription / memory cost while off. Lives
+            inside the zoom wrapper so Ctrl+wheel scales the Pool tabs
+            and the OSC log alongside the rest of the app (previously
+            it sat outside so the log read at 100% regardless of zoom —
+            but users expect Ctrl+wheel to scale the entire workspace,
+            drawer included). */}
+        <OscMonitor />
       </div>
-      {/* Optional OSC monitor drawer — renders null when closed, so there
-          is no subscription / memory cost while off. Outside the zoom
-          wrapper so the log stays crisp at 100 % regardless of UI scale. */}
-      <OscMonitor />
       {/* Shown once at startup if we detect the previous run crashed
           (autosave sentinel file was left behind). No-op otherwise. */}
       <CrashRecoveryPrompt />

@@ -17,6 +17,7 @@ import type {
   RandomParams,
   SampleHoldParams,
   Scene,
+  SeqMode,
   SequencerParams,
   SlewParams,
   Session,
@@ -106,7 +107,8 @@ export const DEFAULT_RAMP: RampParams = {
   rampMs: 1000,
   curvePct: 0, // linear
   sync: 'free',
-  totalMs: 1000
+  totalMs: 1000,
+  mode: 'normal'
 }
 
 export const DEFAULT_ARPEGGIATOR: ArpeggiatorParams = {
@@ -264,7 +266,60 @@ export const DEFAULT_SEQUENCER: SequencerParams = {
   // Classic Euclidean default: 3 pulses over 8 steps gives you the
   // cuban tresillo / Cinquillo pattern — useful out of the box.
   pulses: 3,
-  rotation: 0
+  rotation: 0,
+  // Polyrhythm: 3-against-4 is the friendliest "interesting" cross-rhythm.
+  ringALength: 3,
+  ringBLength: 4,
+  combine: 'or',
+  // Density: 50% on a fresh seed gives audible variation without being
+  // either too sparse or saturated.
+  density: 50,
+  seed: 42,
+  // Cellular: rule 90 (Sierpinski) is the most visually rewarding default;
+  // rule 30 is more chaotic; rule 110 has gliders. cellSeed defaults to
+  // a multi-bit pattern (0b0010110100110010 = 11570) so the first cycle
+  // already has several hits — a single-bit seed (cellSeed=0 special
+  // case) plays only ONE step in cycle 1, which felt broken to users.
+  rule: 90,
+  cellSeed: 11570,
+  cellularSeedLfoDepth: 0,
+  cellularSeedLfoRate: 0.5,
+  // Drift: pure random walk by default with wrap edges — safe + organic.
+  bias: 0,
+  edge: 'wrap',
+  // Ratchet: 25% chance of 2..3 subdivisions = subtle burst flavour.
+  ratchetProb: 25,
+  ratchetMaxDiv: 3,
+  ratchetVariation: 0,
+  ratchetMode: 'octaves',
+  // Bounce: 60% maps to e ≈ 0.73 — a clearly-bouncy ball that
+  // settles audibly without dying off after one or two bounces.
+  bounceDecay: 60,
+  // Generative: off by default — opting in is the whole point.
+  // 50% Variation lands a balanced default for the seven modes (none
+  // of them feel either silent or maxed out at 50%).
+  generative: false,
+  genAmount: 50,
+  // Rest behaviour: Hold by default — receivers don't get spammed
+  // with redundant identical values; they hold their last sample
+  // naturally. Was 'last' (continuous re-send) which generated a
+  // lot of redundant OSC traffic for the common case.
+  restBehaviour: 'hold',
+  // Draw — default to a 32-step curve preset to a gentle rising-then-
+  // falling sine across [0.1, 0.9]. Gives the user an immediately
+  // recognisable shape to refine, instead of a dead-flat row.
+  // drawValues backs 1024 cells; the engine only consumes the first
+  // `drawSteps` entries.
+  drawSteps: 32,
+  drawValues: Array.from({ length: 1024 }, (_, i) => {
+    if (i >= 32) return 0
+    const phase = (i / 32) * Math.PI
+    return 0.1 + 0.8 * Math.sin(phase)
+  }),
+  // Default X/Y range: [0, 1]. Maps the drawn 0..1 curve directly to
+  // 0..1 output — drop-in compatible with the previous behaviour.
+  drawValueMin: 0,
+  drawValueMax: 1
 }
 
 export function makeCell(defaults: {
@@ -343,11 +398,534 @@ export function euclidean(pulses: number, steps: number, rotation: number): bool
   return out
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// New sequencer-mode helpers (polyrhythm / density / cellular / drift).
+//
+// All of these are PURE: deterministic given their inputs. State that
+// has to live across ticks (the cellular row, the drift playhead) is
+// owned by the engine's TrackState; these functions just describe one
+// step of the math.
+
+/** Polyrhythm gate at master step `i`. Each ring is a clock divider —
+ *  ring A "fires" at clocks where `i mod ringALength === 0`, ring B at
+ *  multiples of `ringBLength`. The combine op produces the gate.
+ *
+ *  Examples (ringA=3, ringB=4):
+ *    OR  fires at 0, 3, 4, 6, 8, 9, 12, 15
+ *    XOR fires at 3, 4, 6, 8, 9, 15
+ *    AND fires at 0, 12 (every LCM-many clocks)
+ */
+export function polyrhythmGate(
+  i: number,
+  ringALength: number,
+  ringBLength: number,
+  combine: 'or' | 'xor' | 'and'
+): boolean {
+  const a = Math.max(1, Math.min(16, Math.floor(ringALength)))
+  const b = Math.max(1, Math.min(16, Math.floor(ringBLength)))
+  const hitA = i % a === 0
+  const hitB = i % b === 0
+  if (combine === 'or') return hitA || hitB
+  if (combine === 'and') return hitA && hitB
+  return hitA !== hitB // xor
+}
+
+/** Per-step deterministic hash → [0, 1). Used by Density mode to assign
+ *  each step its own personality without any per-cell RNG state.
+ *  Rolling: bit-mix `step` and `seed` into a 32-bit space. Same inputs
+ *  always return the same number, which is exactly what we want — the
+ *  user can lock a "feel" and just ride the Density knob.
+ */
+export function stepHash(step: number, seed: number): number {
+  // Constant XOR'd into the pre-mix so step=0+seed=0 doesn't collapse
+  // the entire imul cascade to 0 (which would make every density gate
+  // fire at step 0 regardless of the density slider). 0x9E3779B9 is
+  // the canonical golden-ratio mixer used by SplitMix etc.
+  let x =
+    ((Math.floor(step) * 2654435761) ^
+      (Math.floor(seed) * 1597334677) ^
+      0x9e3779b9) >>>
+    0
+  x = (x ^ (x >>> 16)) >>> 0
+  x = Math.imul(x, 2246822507) >>> 0
+  x = (x ^ (x >>> 13)) >>> 0
+  x = Math.imul(x, 3266489909) >>> 0
+  x = (x ^ (x >>> 16)) >>> 0
+  return x / 4294967296
+}
+
+/** Density gate: step fires when its personality < density / 100.
+ *  density=0 silences everything, density=100 fires every step. */
+export function densityGate(i: number, seed: number, densityPct: number): boolean {
+  const d = Math.max(0, Math.min(100, densityPct)) / 100
+  if (d <= 0) return false
+  if (d >= 1) return true
+  return stepHash(i, seed) < d
+}
+
+/** One Wolfram-rule iteration of a 1D cellular automaton with cyclic
+ *  boundary conditions. `row` is a bitmask (bit i = step i state),
+ *  `rule` is 0..255. Returns the next-cycle row.
+ *
+ *  Each cell's next state is f(left, self, right) where f is encoded
+ *  by the 8-bit rule number — bit `(L<<2)|(C<<1)|R` of `rule`.
+ */
+export function evolveCellular(row: number, rule: number, steps: number): number {
+  const s = Math.max(1, Math.min(16, Math.floor(steps)))
+  const r = Math.max(0, Math.min(255, Math.floor(rule))) >>> 0
+  // Mask off any high bits that aren't part of this row.
+  const mask = s >= 32 ? 0xffffffff : (1 << s) - 1
+  const cur = (row >>> 0) & mask
+  let next = 0
+  for (let i = 0; i < s; i++) {
+    const left = (cur >>> ((i - 1 + s) % s)) & 1
+    const center = (cur >>> i) & 1
+    const right = (cur >>> ((i + 1) % s)) & 1
+    const idx = (left << 2) | (center << 1) | right
+    if ((r >>> idx) & 1) next |= 1 << i
+  }
+  return next >>> 0
+}
+
+/** Initial cellular row. cellSeed=0 is treated specially as "single
+ *  center cell on" so the automaton always has somewhere to start. */
+export function cellularInitialRow(cellSeed: number, steps: number): number {
+  const s = Math.max(1, Math.min(16, Math.floor(steps)))
+  const rawSeed = Math.floor(cellSeed) >>> 0
+  // At very low step counts (esp. s=1) the user's full cellSeed gets
+  // masked down to a single bit — `cellSeed=11570 & 1 = 0`, falling
+  // through to "center cell". Result: any even cellSeed at steps=1
+  // silently lost the user's setting. Re-fold the high bits into
+  // the visible window so the user's seed still influences the row.
+  const mask = (1 << s) - 1 || 0xffffffff
+  let folded = rawSeed & mask
+  let shift = s
+  while (shift < 32) {
+    folded ^= (rawSeed >>> shift) & mask
+    shift += s
+  }
+  if (folded !== 0) return folded
+  // Center cell — for even step counts there is no exact center, so
+  // bias to the right of the midpoint to avoid a useless 0 at i=0.
+  const center = Math.floor(s / 2)
+  return (1 << center) >>> 0
+}
+
+/** One step of the Brownian playhead. `bias` ∈ [-100, +100] sets the
+ *  forward-skew of a 3-way coin (back / stay / forward). `edge` decides
+ *  whether the head wraps or reflects at the row boundaries. */
+export function advanceDrift(
+  pos: number,
+  steps: number,
+  bias: number,
+  edge: 'wrap' | 'reflect',
+  rng: () => number
+): number {
+  const s = Math.max(1, Math.min(16, Math.floor(steps)))
+  if (s <= 1) return 0
+  const b = Math.max(-100, Math.min(100, bias)) / 100 // -1..1
+  // Three-way distribution: pBack + pStay + pFwd = 1, all in [0, 1].
+  // bias=0 → uniform 1/3 each; bias=+1 → fully forward (pFwd=1);
+  // bias=-1 → fully back (pBack=1). pStay shrinks toward 0 at the
+  // extremes so the walker can become monotonic. Previously pStay
+  // was hardcoded to 1/3 regardless of bias, which capped pFwd at
+  // 2/3 and made the most-aggressive bias still leave the head in
+  // place a third of the time.
+  const absB = Math.abs(b)
+  const pStay = (1 - absB) / 3
+  const pFwd = b >= 0 ? pStay + b * (1 - pStay) : pStay * (1 + b)
+  const pBack = 1 - pStay - pFwd
+  const r = rng()
+  let dir: -1 | 0 | 1
+  if (r < pBack) dir = -1
+  else if (r < pBack + pStay) dir = 0
+  else dir = 1
+  let next = pos + dir
+  if (edge === 'wrap') {
+    next = ((next % s) + s) % s
+  } else {
+    // Reflect: bounce off both boundaries.
+    if (next < 0) next = -next
+    else if (next >= s) next = s - 1 - (next - (s - 1))
+    next = Math.max(0, Math.min(s - 1, next))
+  }
+  return next
+}
+
 // Value-string parsing helpers.
 // Values are space-separated tokens; non-numeric tokens pass through as
 // string/bool OSC args. Capped at MAX_VALUE_TOKENS.
 export function parseValueTokens(raw: string, max = 16): string[] {
   return raw.trim().split(/\s+/).filter((s) => s.length > 0).slice(0, max)
+}
+
+/** Generate a per-step Draw curve from the user's drawValues + a
+ *  cycle index. Each output value = base + hash-driven jitter
+ *  scaled by genAmount (0..1). Each cycle produces a different
+ *  curve because the seed is folded with the cycle index. The
+ *  user's drawValues stay untouched — generation reads from them
+ *  and returns a fresh array.
+ *
+ *  Shared by the engine (mid-playback regeneration) and the
+ *  renderer (live preview when generative is enabled). */
+export function generateDrawCurveFromValues(
+  drawValues: number[],
+  drawSteps: number,
+  seed: number,
+  genAmount: number,
+  cycle: number
+): number[] {
+  const steps = Math.max(4, Math.min(1024, Math.floor(drawSteps)))
+  const amount = Math.max(0, Math.min(100, genAmount)) / 100
+  const cycleSeed = seed + cycle * 137
+  const out: number[] = new Array(steps)
+  for (let i = 0; i < steps; i++) {
+    const base = drawValues[i] ?? 0
+    const jitter = (stepHash(i, cycleSeed) - 0.5) * 2 * amount
+    out[i] = Math.max(0, Math.min(1, base + jitter))
+  }
+  return out
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Generative-mode helpers — one rule per sequencer mode, each rooted in
+// a real-world / physical metaphor. All take a numeric base (the seed
+// from the cell's Value field), the current step index + relevant
+// per-mode params, and return the per-step value as a number.
+//
+// The wrapping helper `generateStepValue` walks the cell's Value tokens
+// and applies the mode's rule to each numeric token (non-numeric tokens
+// pass through unchanged), producing a space-separated string the
+// engine can plug into its existing send path.
+//
+// `amount` is the shared Variation knob in [0, 1]. Each rule scales it
+// to its own natural range. `seed` reuses the existing `seed` field
+// (0..255) so all modes share a single roll-the-dice control.
+
+/** Per-rule helpers for handling the cell's `scaleToUnit` flag.
+ *  When the cell clamps its output to [0, 1], two adjustments are
+ *  needed so generative rules don't immediately saturate at 1:
+ *   - Treat the seed as a [0, 1] value (clamp to that range so a
+ *     user who typed "10" still gets a valid base of 1).
+ *   - Use `1` as the variation reference magnitude instead of
+ *     |base| — at amount=1 the variation is ±1 (full swing across
+ *     the entire 0..1 range), at amount=0.5 it's ±0.5, etc. Without
+ *     this, |base| inflates the variation past the [0, 1] window
+ *     and everything clamps to a single value.
+ *  When scaleToUnit is off, both helpers fall back to the original
+ *  behaviour: variation magnitude = |base| (so a base of 100 swings
+ *  ±50 at 50% amount, which is what feels musical for un-clamped
+ *  ranges like BPM, MIDI velocity, frequency, etc.). */
+function genBase(base: number, scaleToUnit: boolean): number {
+  return scaleToUnit ? Math.max(0, Math.min(1, base)) : base
+}
+function genMag(base: number, scaleToUnit: boolean): number {
+  return scaleToUnit ? 1 : Math.abs(base || 1)
+}
+
+/** Steps → Tide. Smooth sine swell across one cycle, peak position
+ *  shifted by the seed (low seed = peak early, high = late). At
+ *  amount=0 every step equals the base; at amount=1 the swing is full
+ *  ±base around the base value (or ±1 if scaleToUnit is on). */
+export function tideValue(
+  base: number,
+  i: number,
+  steps: number,
+  amount: number,
+  seed: number,
+  scaleToUnit: boolean
+): number {
+  const s = Math.max(1, steps)
+  // Phase offset: -π/2 → +π/2 across seed 0..255. Centre seed (128)
+  // puts the peak at i = steps/2 (a balanced rise-and-fall).
+  const phase = ((seed / 255) - 0.5) * Math.PI
+  const t = (i / s) * Math.PI * 2
+  // sin returns -1..+1; we want the swell to start near base, rise to
+  // base+amount*base, settle back. Half-cycle so we get one rise and
+  // one fall over the full step row.
+  return genBase(base, scaleToUnit) +
+    Math.sin(t * 0.5 + phase) * amount * genMag(base, scaleToUnit)
+}
+
+/** Euclidean → Accent. Hits land harder on the downbeat. */
+export function accentValue(
+  base: number,
+  i: number,
+  steps: number,
+  amount: number,
+  scaleToUnit: boolean
+): number {
+  const s = Math.max(1, steps)
+  const w = (Math.cos((i / s) * Math.PI * 2) + 1) / 2
+  return genBase(base, scaleToUnit) + w * amount * genMag(base, scaleToUnit)
+}
+
+/** Polyrhythm → Voicing. Three voices: Ring A only (low), Ring B only
+ *  (high), both rings hitting (resonance peak). */
+export function voicingValue(
+  base: number,
+  i: number,
+  ringALength: number,
+  ringBLength: number,
+  amount: number,
+  scaleToUnit: boolean
+): number {
+  const a = Math.max(1, Math.min(16, Math.floor(ringALength)))
+  const b = Math.max(1, Math.min(16, Math.floor(ringBLength)))
+  const hitA = i % a === 0
+  const hitB = i % b === 0
+  const b0 = genBase(base, scaleToUnit)
+  const swing = amount * genMag(base, scaleToUnit)
+  if (hitA && hitB) return b0 + swing * 1.5 // resonance peak
+  if (hitB) return b0 + swing               // high voice
+  if (hitA) return b0 - swing * 0.5         // low voice (root)
+  // Gate is closed if neither — engine won't call this branch in
+  // normal flow, but be safe.
+  return b0
+}
+
+/** Density → Wave. A continuous sine wraps the row at a phase shifted
+ *  by the seed; the gate samples its height at each step. */
+export function waveValue(
+  base: number,
+  i: number,
+  steps: number,
+  amount: number,
+  seed: number,
+  scaleToUnit: boolean
+): number {
+  const s = Math.max(1, steps)
+  const phase = (seed / 255) * Math.PI * 2
+  const t = (i / s) * Math.PI * 2
+  return genBase(base, scaleToUnit) +
+    Math.sin(t + phase) * amount * genMag(base, scaleToUnit)
+}
+
+/** Cellular → Crowd. Cell value rises with on-neighbour count. */
+export function crowdValue(
+  base: number,
+  i: number,
+  row: number,
+  steps: number,
+  amount: number,
+  scaleToUnit: boolean
+): number {
+  const s = Math.max(1, steps)
+  const left = (row >>> ((i - 1 + s) % s)) & 1
+  const right = (row >>> ((i + 1) % s)) & 1
+  const neighbours = left + right // 0, 1, or 2
+  const w = neighbours - 1 // -1 / 0 / +1
+  return genBase(base, scaleToUnit) + w * amount * genMag(base, scaleToUnit)
+}
+
+/** Drift → Terrain. Smooth 1D value-noise generated from the seed. */
+export function terrainValue(
+  base: number,
+  i: number,
+  steps: number,
+  amount: number,
+  seed: number,
+  scaleToUnit: boolean
+): number {
+  const s = Math.max(1, steps)
+  const ctrl = [
+    stepHash(0, seed) * 2 - 1,
+    stepHash(1, seed * 37 + 1) * 2 - 1,
+    stepHash(2, seed * 61 + 2) * 2 - 1,
+    stepHash(3, seed * 89 + 3) * 2 - 1
+  ]
+  const u = (i / s) * (ctrl.length - 1)
+  const lo = Math.floor(u)
+  const hi = Math.min(lo + 1, ctrl.length - 1)
+  const f = u - lo
+  const t = f * f * (3 - 2 * f)
+  const h = ctrl[lo] * (1 - t) + ctrl[hi] * t
+  return genBase(base, scaleToUnit) + h * amount * genMag(base, scaleToUnit)
+}
+
+/** Ratchet → Scatter. Each sub-pulse lands on a hashed offset. */
+export function scatterValue(
+  base: number,
+  stepIdx: number,
+  subIdx: number,
+  subdiv: number,
+  seed: number,
+  amount: number,
+  scaleToUnit: boolean
+): number {
+  const b0 = genBase(base, scaleToUnit)
+  // First sub-pulse of any burst lands on the base value — the "loud
+  // first impact". Subsequent sub-pulses scatter from there.
+  if (subIdx <= 0 || subdiv <= 1) return b0
+  const h = stepHash(stepIdx * 32 + subIdx, seed)
+  const offset = (h * 2 - 1) * amount * genMag(base, scaleToUnit)
+  return b0 + offset
+}
+
+/** Map the user-facing 0..100 `bounceDecay` knob to a physical
+ *  coefficient of restitution e ∈ [0.40, 0.95]. The clamped range
+ *  keeps the cycle musically useful — pure 0 would collapse to a
+ *  single hit, pure 1 would never decay at all. */
+export function bounceCoeff(bounceDecay: number): number {
+  const v = Math.max(0, Math.min(100, bounceDecay)) / 100
+  return 0.4 + v * 0.55
+}
+
+/** Duration of bounce-step `i` in ms, given the cycle's average
+ *  step duration `stepDurMs`, total step count `steps`, and the
+ *  decay coefficient.
+ *
+ *  Cycle total time = `stepDurMs * steps` (fixed by the existing
+ *  Tempo / Step / BPM controls). Within that window, step i takes
+ *  T₀ · e^i where T₀ is chosen so the geometric series sums to the
+ *  cycle total. Result: bouncier balls (high e) get nearly-uniform
+ *  intervals; dead bounces (low e) collapse to a long first beat
+ *  followed by tightly clustered last beats — exactly the sound a
+ *  real ball makes settling on the ground.
+ */
+export function bounceStepDuration(
+  stepDurMs: number,
+  steps: number,
+  bounceDecay: number,
+  i: number
+): number {
+  const s = Math.max(1, Math.floor(steps))
+  const e = bounceCoeff(bounceDecay)
+  const total = Math.max(1, stepDurMs) * s
+  // Sum of geometric series e^0 + e^1 + ... + e^(s-1).
+  // Closed form: (1 - e^s) / (1 - e). Falls back to s when e === 1.
+  const sumGeom = e === 1 ? s : (1 - Math.pow(e, s)) / (1 - e)
+  const t0 = total / sumGeom
+  // Step i has duration t0 · e^i. Floor to 1 ms so the engine never
+  // gets stuck on a zero-length step.
+  return Math.max(1, t0 * Math.pow(e, ((i % s) + s) % s))
+}
+
+/** Bounce → Bounce. Generative value rule: step i's amplitude is
+ *  the seed scaled by the same physical decay that drives the
+ *  timing, attenuated by `amount`. amount=0 keeps every step at the
+ *  base (timing still bounces, values stay flat). amount=1 lets the
+ *  full physical decay through (step i = base · e^i — the hand and
+ *  the ear see the same gesture).
+ *  Multiplicative decay naturally stays inside [0, 1] for a clamped
+ *  base, so scaleToUnit only affects the seed pre-clamp. */
+export function bounceValue(
+  base: number,
+  i: number,
+  bounceDecay: number,
+  amount: number,
+  scaleToUnit: boolean
+): number {
+  const e = bounceCoeff(bounceDecay)
+  const k = 1 - amount * (1 - e)
+  return genBase(base, scaleToUnit) * Math.pow(k, i)
+}
+
+/** Single dispatcher: given a cell's base value string and the
+ *  sequencer mode + per-mode params, return the live string to send
+ *  for the current step. Walks each token, applies the rule to
+ *  numerics, leaves strings/bools alone, and rejoins with spaces.
+ *
+ *  Caller passes `subIdx + subdiv` for ratchet bursts (default 0/1
+ *  means "no ratchet sub-pulse, treat the step normally"). */
+export function generateStepValue(args: {
+  baseRaw: string
+  mode: SeqMode
+  stepIdx: number
+  steps: number
+  amount: number    // 0..100 — caller does NOT need to pre-scale
+  seed: number
+  ringALength: number
+  ringBLength: number
+  cellRow: number
+  bounceDecay?: number
+  subIdx?: number
+  subdiv?: number
+  /** When the cell's `scaleToUnit` is on, generative rules treat
+   *  the seed as a [0, 1] value and use 1 as the variation reference
+   *  magnitude (so amount swings ±amount within [0, 1] instead of
+   *  ±|base| which would saturate). Caller passes the cell's
+   *  scaleToUnit flag — defaults to false to keep external usage
+   *  backwards-compatible. */
+  scaleToUnit?: boolean
+}): string {
+  const tokens = parseValueTokens(args.baseRaw)
+  if (tokens.length === 0) return args.baseRaw
+  const amount = Math.max(0, Math.min(100, args.amount)) / 100
+  const subIdx = args.subIdx ?? 0
+  const subdiv = args.subdiv ?? 1
+  const stu = !!args.scaleToUnit
+  const out = tokens.map((tok) => {
+    const num = parseFloat(tok)
+    if (!Number.isFinite(num)) return tok // string / bool — pass through
+    let v: number
+    switch (args.mode) {
+      case 'steps':
+        v = tideValue(num, args.stepIdx, args.steps, amount, args.seed, stu)
+        break
+      case 'euclidean':
+        v = accentValue(num, args.stepIdx, args.steps, amount, stu)
+        break
+      case 'polyrhythm':
+        v = voicingValue(
+          num,
+          args.stepIdx,
+          args.ringALength,
+          args.ringBLength,
+          amount,
+          stu
+        )
+        break
+      case 'density':
+        v = waveValue(num, args.stepIdx, args.steps, amount, args.seed, stu)
+        break
+      case 'cellular':
+        v = crowdValue(num, args.stepIdx, args.cellRow, args.steps, amount, stu)
+        break
+      case 'drift':
+        v = terrainValue(num, args.stepIdx, args.steps, amount, args.seed, stu)
+        break
+      case 'ratchet':
+        v = scatterValue(
+          num,
+          args.stepIdx,
+          subIdx,
+          subdiv,
+          args.seed,
+          amount,
+          stu
+        )
+        break
+      case 'bounce':
+        v = bounceValue(num, args.stepIdx, args.bounceDecay ?? 60, amount, stu)
+        break
+      case 'draw':
+        // Draw mode resolves its own per-step values via
+        // `generateDrawCurveFromValues` (called by the engine /
+        // inspector preview, not this dispatcher). If a caller hits
+        // this branch they want the raw base — flag explicitly so
+        // future readers know it's intentional, not a fallthrough.
+        v = num
+        break
+      default:
+        v = num
+    }
+    // Clamp under scaleToUnit so individual generators (tide/accent/
+    // voicing/wave/crowd/terrain/scatter/bounce) can't smuggle values
+    // outside [0, 1] downstream. The engine re-clamps after modulation
+    // too, but enforcing here keeps the contract self-consistent and
+    // means inspector previews show the same number the engine emits.
+    if (stu) {
+      v = v < 0 ? 0 : v > 1 ? 1 : v
+    }
+    // Format: keep integer-ish bases as integers, otherwise round to
+    // 4 decimals so the read-only display stays compact.
+    if (Number.isInteger(num) && Math.abs(v - Math.round(v)) < 0.0001) {
+      return String(Math.round(v))
+    }
+    return Number(v.toFixed(4)).toString()
+  })
+  return out.join(' ')
 }
 
 // Generate a fully random HSL color, constrained to reasonable saturation/lightness
@@ -520,6 +1098,46 @@ export function makeParameterSpec(
     max: paramType === 'bool' ? 1 : 1,
     init: 0
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Discovery → Instrument paramType inference. Used by the renderer
+// when the user drags a Network-tab device into the Pool: we map the
+// most-recently-observed OSC type tags at each address to one of our
+// FunctionParamType enum values.
+//
+// Conservative — anything we can't classify becomes 'float'. The user
+// can refine in the inspector after instantiation.
+//
+//   1× 'f' or 'd' / unknown numeric  → float
+//   1× 'i'                           → int
+//   1× 'T' or 'F'                    → bool
+//   1× 's'                           → string
+//   2× 'f' | 'd' | 'i'               → v2
+//   3× 'f' | 'd' | 'i'               → v3
+//   4× 'f' | 'd' | 'i'               → v4
+//
+// Colour detection (v3 with values in 0..1) requires runtime sample
+// numbers — left out for now, the user can flip the type to 'colour'
+// from the inspector.
+// ─────────────────────────────────────────────────────────────────────
+export function inferParamTypeFromArgTypes(
+  argTypes: string[]
+): 'bool' | 'int' | 'float' | 'v2' | 'v3' | 'v4' | 'string' {
+  if (argTypes.length === 0) return 'float'
+  if (argTypes.length === 1) {
+    const t = argTypes[0]
+    if (t === 'T' || t === 'F') return 'bool'
+    if (t === 'i') return 'int'
+    if (t === 's') return 'string'
+    return 'float'
+  }
+  const allNumeric = argTypes.every((t) => t === 'f' || t === 'd' || t === 'i')
+  if (!allNumeric) return 'float'
+  if (argTypes.length === 2) return 'v2'
+  if (argTypes.length === 3) return 'v3'
+  if (argTypes.length === 4) return 'v4'
+  return 'float'
 }
 
 // Pre-shipped Parameter templates — small palette of common building

@@ -29,6 +29,11 @@ const sentinelPath = (): string => join(userData(), '.running')
 let currentSession: Session | null = null
 let lastWrittenJson: string | null = null
 let timer: ReturnType<typeof setInterval> | null = null
+// Mutex: only one tickAutosave() ever runs at a time. The 60s interval
+// and the shutdown final-flush both call tickAutosave; without this
+// lock they could race in the middle of fs.writeFile + pruneOldAutosaves
+// and produce a duplicate write + an ENOENT during prune on Windows.
+let inFlight: Promise<void> | null = null
 
 export interface AutosaveEntry {
   path: string
@@ -92,23 +97,44 @@ export function stopAutosave(): void {
 }
 
 async function tickAutosave(): Promise<void> {
-  if (!currentSession) return
-  let json: string
-  try {
-    json = JSON.stringify(currentSession, null, 2)
-  } catch {
+  // Serialise concurrent calls. The interval timer and the shutdown
+  // final-flush can both trip this; waiting on the prior run keeps
+  // writes single-threaded and lets the second caller see the
+  // updated `lastWrittenJson` (so it skips redundant work).
+  if (inFlight) {
+    await inFlight
     return
   }
-  if (json === lastWrittenJson) return
-  const name = sanitizeFileName(currentSession.name || 'session')
-  const stamp = timestampForFilename()
-  const file = join(autosaveDir(), `${name}-${stamp}.dflou.json`)
+  const work = (async (): Promise<void> => {
+    if (!currentSession) return
+    let json: string
+    try {
+      json = JSON.stringify(currentSession, null, 2)
+    } catch {
+      return
+    }
+    if (json === lastWrittenJson) return
+    const name = sanitizeFileName(currentSession.name || 'session')
+    const stamp = timestampForFilename()
+    const file = join(autosaveDir(), `${name}-${stamp}.dflou.json`)
+    try {
+      // Atomic write — same pattern as session.ts. A crash mid-write
+      // leaves only the .tmp; the autosave directory keeps the
+      // previous snapshot intact for restore.
+      const tmp = `${file}.tmp`
+      await fs.writeFile(tmp, json, 'utf8')
+      await fs.rename(tmp, file)
+      lastWrittenJson = json
+      await pruneOldAutosaves()
+    } catch (e) {
+      console.error('[autosave] write failed', (e as Error).message)
+    }
+  })()
+  inFlight = work
   try {
-    await fs.writeFile(file, json, 'utf8')
-    lastWrittenJson = json
-    await pruneOldAutosaves()
-  } catch (e) {
-    console.error('[autosave] write failed', (e as Error).message)
+    await work
+  } finally {
+    inFlight = null
   }
 }
 

@@ -13,17 +13,26 @@
 //    triggers do NOT start the scene duration timer). After durationSec, nextMode
 //    picks the next scene (or off).
 
-import type { Cell, EngineState, LfoShape, Modulation, Scene, Session } from '@shared/types'
+import type { Cell, EngineState, LfoShape, Modulation, Scene, SequencerParams, Session } from '@shared/types'
 import { META_KNOB_COUNT } from '@shared/types'
 import {
+  advanceDrift,
   autoDetectOscArg,
+  bounceStepDuration,
   buildArpLadder,
   buildArpPattern,
+  cellularInitialRow,
+  densityGate,
   effectiveLfoHz,
   euclidean,
+  evolveCellular,
+  generateDrawCurveFromValues,
+  generateStepValue,
+  stepHash,
   hashSeedString,
   mulberry32,
   parseValueTokens,
+  polyrhythmGate,
   readNumber,
   scaleMetaValue
 } from '@shared/factory'
@@ -52,6 +61,52 @@ interface TrackState {
   // Sequencer state
   seqStepIdx: number
   seqStepStart: number // hrtime ms when this step began
+  // Polyrhythm / density / cellular / drift / ratchet — one shared
+  // bookkeeping block. Only the fields relevant to the current mode
+  // are touched per tick; the rest are dormant.
+  // - cellRow: current Wolfram row (bitmask), evolves each cycle
+  // - driftPos: current Brownian playhead position (0..steps-1)
+  // - seqRng: per-track PRNG used by drift + ratchet for determinism
+  //   across triggers; seeded once at trigger time
+  // - ratchetSubdiv: 1 = no ratchet, 2..maxDiv = currently bursting
+  // - ratchetSubIdx: which sub-pulse we're on (0..ratchetSubdiv-1)
+  // - ratchetSubStart: hrtime ms when the current sub-pulse started
+  seqCellRow: number
+  seqDriftPos: number
+  seqRng: (() => number) | null
+  seqRatchetSubdiv: number
+  seqRatchetSubIdx: number
+  seqRatchetSubStart: number
+  // Tracks the previous step idx so we can detect cycle-wrap (idx → 0)
+  // and trigger cellular evolution + ratchet re-rolls there.
+  seqLastStepIdx: number
+  // Draw + generative — at each cycle wrap, the engine generates a
+  // fresh per-step curve BASED on the user's drawn curve (with
+  // hash-driven jitter). The user's drawValues stay intact so they
+  // can revert by turning Generative off. -1 cycle id forces an
+  // initial generation at trigger time.
+  drawGeneratedValues: number[]
+  drawGenCycle: number
+  // Per-token min/max across one full cycle's worth of generated
+  // values — populated at trigger AND at cycle wrap (so cellular's
+  // evolving row gets a fresh range each cycle). Drives the
+  // scaleToUnit auto-range path: instead of blunt clamp([0, 1]),
+  // we remap the cycle's value range to [0, 1] so the user sees
+  // full-range output even when their seed produces values that
+  // would otherwise saturate at 0 or 1.
+  seqGenRanges: Array<{ min: number; max: number }>
+  // Set true the first time the engine emits a numeric OSC payload
+  // for this track. Used by Hold rest-behaviour to allow the
+  // initial emit (so the receiver sees SOMETHING) before deduping
+  // subsequent identical sends.
+  hasEmittedNumeric: boolean
+  // Previous Ramp mode — used to auto-retrigger the ramp when the
+  // user flips Mode mid-flight. Without this, switching Normal →
+  // Inverted while a cell is playing would leave elapsedSec past
+  // lenSec, so the new mode settles at its final value immediately
+  // and the change "doesn't seem to do anything." Resetting
+  // triggerTime makes the new ramp fire from t=0.
+  prevRampMode: 'normal' | 'inverted' | 'loop' | null
   // Arpeggiator state
   arpStepIdx: number        // current step index into the ladder (0..N-1)
   arpPatternIdx: number     // current index into the pattern array (deterministic modes)
@@ -106,6 +161,18 @@ function makeTrackState(): TrackState {
     rndSmoothNext: 0,
     seqStepIdx: 0,
     seqStepStart: 0,
+    seqCellRow: 0,
+    seqDriftPos: 0,
+    seqRng: null,
+    seqRatchetSubdiv: 1,
+    seqRatchetSubIdx: 0,
+    seqRatchetSubStart: 0,
+    seqLastStepIdx: -1,
+    seqGenRanges: [],
+    hasEmittedNumeric: false,
+    prevRampMode: null,
+    drawGeneratedValues: [],
+    drawGenCycle: 0,
     arpStepIdx: 0,
     arpPatternIdx: 0,
     arpLastAdvanceAt: 0,
@@ -129,6 +196,341 @@ function makeTrackState(): TrackState {
     lastStringAtSceneId: null,
     lastStringAtStep: -1
   }
+}
+
+/** Effective step count for value lookup. `draw` mode uses drawSteps
+ *  (caps at 1024 for DAW-grade automation curves); every other mode
+ *  uses `steps` (1..16). The advance loop modulus matches this. */
+function effectiveSteps(cell: Cell): number {
+  if (cell.sequencer.mode === 'draw') {
+    return Math.max(4, Math.min(1024, Math.floor(cell.sequencer.drawSteps)))
+  }
+  return Math.max(1, Math.min(16, Math.floor(cell.sequencer.steps)))
+}
+
+/** Resolve the base value string for a given step index. Encapsulates
+ *  the four-way branch (sequencer off / draw / generative / classic).
+ *  Pulled out so the same logic feeds the per-tick render path,
+ *  scene-morph computation, trigger-time morph target, AND the cycle-
+ *  range precompute below. */
+function resolveStepBaseRaw(
+  cell: Cell,
+  ts: TrackState,
+  stepIdx: number,
+  subIdx: number,
+  subdiv: number
+): string {
+  if (!cell.sequencer.enabled) return cell.value
+  if (cell.sequencer.mode === 'draw') {
+    // Draw mode: the drawn 0..1 curve maps onto [drawValueMin,
+    // drawValueMax]. When Generative is on, the engine substitutes
+    // a per-cycle hash-varied curve (BASED on the user's drawing)
+    // so the pattern doesn't repeat identically across cycles. The
+    // user's drawValues stay untouched in storage.
+    const drawSteps = Math.max(4, Math.min(1024, Math.floor(cell.sequencer.drawSteps)))
+    const idx = ((stepIdx % drawSteps) + drawSteps) % drawSteps
+    const source =
+      cell.sequencer.generative && ts.drawGeneratedValues.length > 0
+        ? ts.drawGeneratedValues
+        : cell.sequencer.drawValues
+    const curve = source[idx] ?? 0
+    const xv = Number.isFinite(cell.sequencer.drawValueMin)
+      ? cell.sequencer.drawValueMin
+      : 0
+    const yv = Number.isFinite(cell.sequencer.drawValueMax)
+      ? cell.sequencer.drawValueMax
+      : 1
+    const v = xv + curve * (yv - xv)
+    const tokens = parseValueTokens(cell.value)
+    // Format: if both X and Y are integers AND the result rounds
+    // cleanly, emit as integer; otherwise 4-decimal float.
+    const intRange =
+      Number.isInteger(xv) &&
+      Number.isInteger(yv) &&
+      Math.abs(v - Math.round(v)) < 0.0001
+    const formatted = intRange
+      ? String(Math.round(v))
+      : Number(v.toFixed(4)).toString()
+    if (tokens.length === 0) return formatted
+    return tokens.map((tok) => (Number.isFinite(parseFloat(tok)) ? formatted : tok)).join(' ')
+  }
+  if (cell.sequencer.generative) {
+    return generateStepValue({
+      baseRaw: cell.value,
+      mode: cell.sequencer.mode,
+      stepIdx,
+      steps: Math.max(1, Math.min(16, cell.sequencer.steps)),
+      amount: cell.sequencer.genAmount,
+      seed: cell.sequencer.seed,
+      ringALength: cell.sequencer.ringALength,
+      ringBLength: cell.sequencer.ringBLength,
+      cellRow: ts.seqCellRow,
+      bounceDecay: cell.sequencer.bounceDecay,
+      subIdx,
+      subdiv,
+      scaleToUnit: cell.scaleToUnit
+    })
+  }
+  // Classic (non-generative) mode. For most modes we read directly
+  // from the user-edited stepValues grid. Density mode is special —
+  // every step fires (no gating in classic) with a per-step
+  // multiplier of (density/100) × stepHash(i, seed). So slider +
+  // hash combine to produce the per-step density value visible in
+  // the preview, multiplied into the step's value.
+  const baseRaw = cell.sequencer.stepValues[stepIdx] ?? cell.value
+  if (cell.sequencer.mode === 'density') {
+    const sliderFrac = Math.max(0, Math.min(100, cell.sequencer.density)) / 100
+    const mult = sliderFrac * stepHash(stepIdx, cell.sequencer.seed)
+    const tokens = parseValueTokens(baseRaw)
+    return tokens
+      .map((tok) => {
+        const num = parseFloat(tok)
+        if (!Number.isFinite(num)) return tok
+        const v = num * mult
+        return Number.isInteger(num) && Math.abs(v - Math.round(v)) < 0.0001
+          ? String(Math.round(v))
+          : Number(v.toFixed(4)).toString()
+      })
+      .join(' ')
+  }
+  // Ratchet classic mode — apply per-mode sub-pulse shaping so the
+  // burst is actually audible on numeric receivers, not just a held
+  // value re-fired identically subdiv times. The shape applies to
+  // EVERY sub-pulse of the burst (including sub 0) so the entire
+  // step is replaced with the ratchet-mode value sequence.
+  if (cell.sequencer.mode === 'ratchet' && subdiv > 1) {
+    const tokens = parseValueTokens(baseRaw)
+    return tokens
+      .map((tok) => {
+        const num = parseFloat(tok)
+        if (!Number.isFinite(num)) return tok
+        const v = applyRatchetMode(num, subIdx, subdiv, cell.sequencer)
+        return Number.isInteger(num) && Math.abs(v - Math.round(v)) < 0.0001
+          ? String(Math.round(v))
+          : Number(v.toFixed(4)).toString()
+      })
+      .join(' ')
+  }
+  return baseRaw
+}
+
+/** Generate a fresh per-step curve for Draw + Generative mode.
+ *  Each generated value is the user's drawn value PLUS a hash-driven
+ *  jitter scaled by genAmount. So the new curve has the same shape
+ *  as the user's drawing but wobbles around it; genAmount controls
+ *  how far the wobble can travel. cycle index is folded into the
+ *  hash so each cycle produces a different curve. Clamped to [0, 1]
+ *  so the canvas representation stays valid. */
+function generateDrawCurve(cell: Cell, cycle: number): number[] {
+  return generateDrawCurveFromValues(
+    cell.sequencer.drawValues,
+    effectiveSteps(cell),
+    cell.sequencer.seed,
+    cell.sequencer.genAmount,
+    cycle
+  )
+}
+
+/** Predict the [min, max] range of a modulator's output given the
+ *  current center value. Used by scaleToUnit auto-range when a
+ *  modulator is active — instead of blunt clamp01 (which collapses
+ *  anything > 1 to 1), we remap the modulator's expected output
+ *  range into [0, 1]. Different modulator types have different
+ *  natural ranges:
+ *   - LFO/RandomGen/S&H/Slew/Chaos: bipolar = center ± magnitude,
+ *     unipolar = center..center+magnitude
+ *   - Envelope/Ramp: multiplicative — range = [center×(1-depth), center]
+ *   - Arpeggiator: bracketed by the ladder min/max scaled by depth
+ *  Returns a degenerate {min:center, max:center} when no modulator
+ *  is active (caller falls back to plain clamp01).
+ */
+function predictModRange(m: Modulation, center: number): { min: number; max: number } {
+  if (!m.enabled) return { min: center, max: center }
+  const depth01 = Math.max(0, Math.min(1, m.depthPct / 100))
+  const magnitude = Math.max(Math.abs(center), 1) * depth01
+  switch (m.type) {
+    case 'lfo':
+    case 'random':
+    case 'sh':
+    case 'slew':
+    case 'chaos': {
+      // The chaos / random / S&H modulators produce values in
+      // roughly [-1, 1] post-conversion; the additive magnitude
+      // around center applies either symmetrically (bipolar) or
+      // only upward (unipolar).
+      return m.mode === 'unipolar'
+        ? { min: center, max: center + magnitude }
+        : { min: center - magnitude, max: center + magnitude }
+    }
+    case 'envelope':
+    case 'ramp': {
+      // Multiplicative — gain ∈ [1-depth, 1]. Min is center×(1-depth),
+      // max is center. Handle negative centers gracefully.
+      const a = center * (1 - depth01)
+      const b = center
+      return { min: Math.min(a, b), max: Math.max(a, b) }
+    }
+    case 'arpeggiator': {
+      // Arp ladder spans roughly [center/N, center×N] for mult mode,
+      // [center×(1-depth), center×(1+depth)] in the limit. Use the
+      // same magnitude formula as LFO to keep things predictable.
+      return { min: center - magnitude, max: center + magnitude }
+    }
+    default:
+      return { min: center, max: center }
+  }
+}
+
+/** Effective cellular seed at the current moment — base cellSeed
+ *  plus an LFO modulation when depth > 0. Used at trigger AND at
+ *  each cycle wrap so the cellular pattern slowly drifts across
+ *  adjacent seed values over time. */
+function modulatedCellSeed(seq: SequencerParams, tMs: number): number {
+  const d = Math.max(0, Math.min(100, seq.cellularSeedLfoDepth)) / 100
+  if (d <= 0) return seq.cellSeed
+  const rate = Math.max(0.01, Math.min(10, seq.cellularSeedLfoRate))
+  // tMs is high-resolution but rate is in Hz — convert.
+  const phase = (tMs / 1000) * rate * Math.PI * 2
+  const offset = Math.round(Math.sin(phase) * d * 32767) // half of 65535
+  return Math.max(0, Math.min(65535, seq.cellSeed + offset))
+}
+
+/** Per-step Ratchet probability + subdivision count, accounting for
+ *  the Variation knob. Variation 0 returns the global values; 100 lets
+ *  each step's hash drive its own randomised values. Deterministic
+ *  per (step, seed). */
+function ratchetStepParams(
+  seq: SequencerParams,
+  step: number
+): { prob: number; maxDiv: number } {
+  const variation = Math.max(0, Math.min(100, seq.ratchetVariation)) / 100
+  // Always integer subdivs in [2, 16]. Variation blends the global
+  // and per-step hashed values, then we round to keep timing clean.
+  if (variation <= 0) {
+    return {
+      prob: Math.max(0, Math.min(100, seq.ratchetProb)),
+      maxDiv: Math.max(2, Math.min(16, Math.round(seq.ratchetMaxDiv)))
+    }
+  }
+  const probHash = stepHash(step, seq.seed) // 0..1
+  const divHash = stepHash(step + 1000, seq.seed * 7 + 13) // independent
+  const prob = (1 - variation) * seq.ratchetProb + variation * probHash * 100
+  // Per-step maxDiv blends global with a fresh roll in [2, 16]; round
+  // at the end so the engine always uses whole-number subdivisions.
+  const maxDivRaw =
+    (1 - variation) * seq.ratchetMaxDiv + variation * (2 + divHash * 14)
+  return {
+    prob: Math.max(0, Math.min(100, prob)),
+    maxDiv: Math.max(2, Math.min(16, Math.round(maxDivRaw)))
+  }
+}
+
+/** Sub-pulse value shaping for Ratchet bursts. The mode dropdown
+ *  picks which formula:
+ *   - 'octaves': all sub-pulses emit value / subdiv (so subdivisions
+ *     of the tempo emit proportionally-scaled values — a 4-burst at
+ *     value 100 emits 25 four times)
+ *   - 'ramp': sub i emits value × (i+1)/subdiv (linear rise from
+ *     value/subdiv to value, like a snare roll building up)
+ *   - 'random': hash-driven scatter (different per (step, sub) pair)
+ *  Applied to BOTH classic and generative Ratchet so the dropdown
+ *  governs sub-pulse shape regardless of generative mode. */
+function applyRatchetMode(
+  base: number,
+  subIdx: number,
+  subdiv: number,
+  seq: SequencerParams
+): number {
+  // Outside a burst → emit the raw step value.
+  if (subdiv <= 1) return base
+  const mode = seq.ratchetMode ?? 'octaves'
+  // Sub-pulse fraction in [0, 1] across the burst.
+  const t = subIdx / Math.max(1, subdiv - 1)
+  switch (mode) {
+    case 'octaves':
+      // Every sub-pulse emits stepValue / subdiv — uniformly scaled.
+      return base / subdiv
+    case 'ramp':
+      // Linear rise from base/subdiv (sub 0) to base (sub subdiv-1).
+      return base * ((subIdx + 1) / subdiv)
+    case 'inverse':
+      // Mirror of Ramp: starts at base, falls linearly to base/subdiv.
+      return base * ((subdiv - subIdx) / subdiv)
+    case 'pingpong': {
+      // Triangle window — rise from base/subdiv to base at the midpoint,
+      // then fall back. Smooth "swell-and-recede" ornament.
+      const tri = 1 - Math.abs(t - 0.5) * 2
+      const min = 1 / subdiv
+      return base * (min + tri * (1 - min))
+    }
+    case 'echo': {
+      // Exponential decay (palm-mute echo / bouncing-ball feel). Each
+      // sub-pulse keeps ~70% of the previous amplitude.
+      const k = Math.pow(0.7, subIdx)
+      return base * k
+    }
+    case 'trill':
+      // Alternating ornament — even sub-pulses fire at base, odd ones
+      // at base × 0.5. Reads as a fast two-note flicker.
+      return subIdx % 2 === 0 ? base : base * 0.5
+    case 'random':
+    default: {
+      const h = stepHash(subIdx * 31 + 7, seq.seed)
+      return base * (0.25 + 0.75 * h)
+    }
+  }
+}
+
+/** Compute per-token {min, max} across one full cycle's worth of
+ *  generated step values. Used by the scaleToUnit auto-range path
+ *  so output covers the full [0, 1] range based on the actual values
+ *  the cycle will produce — instead of blindly clamping anything > 1
+ *  down to 1 (which left the user staring at a row of "1.000").
+ *
+ *  Called at trigger AND at every cycle wrap. For Ratchet, we sample
+ *  the full sub-pulse space too so the scatter's wider variation is
+ *  captured. For Cellular, the current `ts.seqCellRow` is used (each
+ *  cycle's range reflects that cycle's row, not the initial one). */
+function computeCycleRanges(
+  cell: Cell,
+  ts: TrackState
+): Array<{ min: number; max: number }> {
+  const tokenCount = parseValueTokens(cell.value).length
+  if (tokenCount === 0) return []
+  const ranges = Array.from({ length: tokenCount }, () => ({
+    min: Infinity,
+    max: -Infinity
+  }))
+  const stepCount = effectiveSteps(cell)
+  // For Ratchet, sample (step × subIdx ∈ [0, maxDiv)) so the scatter's
+  // sub-pulse range counts toward the cycle min/max. Other modes
+  // collapse subIdx=0, subdiv=1. Cap matches the runtime cap in
+  // `ratchetStepParams` (16) — earlier this was 8 and Ratchet bursts
+  // with maxDiv ∈ (8, 16] were under-sampled, causing scaleToUnit
+  // auto-range to clip the loudest sub-pulses.
+  const maxDiv =
+    cell.sequencer.mode === 'ratchet'
+      ? Math.max(2, Math.min(16, Math.floor(cell.sequencer.ratchetMaxDiv)))
+      : 1
+  for (let i = 0; i < stepCount; i++) {
+    for (let sub = 0; sub < maxDiv; sub++) {
+      const raw = resolveStepBaseRaw(cell, ts, i, sub, maxDiv)
+      const toks = parseValueTokens(raw)
+      toks.forEach((tok, idx) => {
+        if (idx >= ranges.length) return
+        const n = parseFloat(tok)
+        if (!Number.isFinite(n)) return
+        if (n < ranges[idx].min) ranges[idx].min = n
+        if (n > ranges[idx].max) ranges[idx].max = n
+      })
+    }
+  }
+  // Replace Infinity with sentinel zeros when no numeric token at
+  // that position (the caller's normalize path checks span >0 and
+  // falls through, so this just keeps the array shape clean).
+  return ranges.map((r) =>
+    Number.isFinite(r.min) && Number.isFinite(r.max) ? r : { min: 0, max: 0 }
+  )
 }
 
 function lfo(shape: LfoShape, phase: number, state: TrackState, tickIdx: number): number {
@@ -212,6 +614,18 @@ export class SceneEngine {
     })
     this.tracks.clear()
     this.clearSceneAdvance()
+    // Reset every ephemeral tick-state field so a subsequent start()
+    // doesn't compute dt against a stale lastTickAt or carry stale
+    // live-value rows / active-scene bookkeeping into the new run.
+    this.liveValues = {}
+    this.lastTickAt = 0
+    this.lastValueEmitAt = 0
+    this.tickIdx = 0
+    this.activeSceneId = null
+    this.activeSceneStartedAt = null
+    this.activeSequenceSlotIdx = null
+    this.activeSceneRepeatCount = 0
+    this.pauseStartedAt = null
   }
 
   setOnStateChange(cb: (s: EngineState) => void): void {
@@ -368,10 +782,57 @@ export class SceneEngine {
 
     const start = (): void => {
       const curOut = this.computeCurrentOutputs(trackId)
-      // Target centers: sequencer step 0 if sequencer enabled, else cell.value.
-      const baseRaw = cell.sequencer.enabled
-        ? cell.sequencer.stepValues[0] ?? cell.value
-        : cell.value
+      // Reset sequencer to step 0 + per-mode state on trigger. Done
+      // BEFORE the baseRaw lookup below so generative mode's seeded
+      // cellRow / PRNG are already populated when we ask for the
+      // first step's value.
+      ts.seqStepIdx = 0
+      ts.seqStepStart = now()
+      ts.seqLastStepIdx = -1
+      // Cellular: seed the row from cellSeed (0 = single center cell).
+      // When the Seed LFO is active, the effective seed is modulated
+      // around cellSeed by a slow sine — different cycles get
+      // different starting patterns.
+      ts.seqCellRow = cellularInitialRow(
+        modulatedCellSeed(cell.sequencer, now()),
+        cell.sequencer.steps
+      )
+      // Drift: start at step 0 (matches the visual playhead for the
+      // first emitted value).
+      ts.seqDriftPos = 0
+      // Per-track sequencer PRNG. Seeded from cell.value + seed so a
+      // given clip+seed combination is reproducible across triggers.
+      ts.seqRng = mulberry32(
+        hashSeedString(`${cell.value}|${cell.sequencer.seed}`)
+      )
+      // Ratchet: not bursting at the start of a clip.
+      ts.seqRatchetSubdiv = 1
+      ts.seqRatchetSubIdx = 0
+      ts.seqRatchetSubStart = now()
+      // Reset Hold-mode dedup flag so the first emit after a fresh
+      // trigger always sends, regardless of whether the value happens
+      // to match a stale lastSentNumeric from a previous play.
+      ts.hasEmittedNumeric = false
+      // Fresh ramp lifecycle — clear the previous-mode tracker so
+      // the first tick after trigger uses the cell's CURRENT mode
+      // without thinking it just changed.
+      ts.prevRampMode = null
+      // Draw + Generative — produce the first variation curve from
+      // the user's drawing. Each subsequent cycle wrap re-generates
+      // (see per-tick loop). With Generative off, the user's
+      // drawValues are used directly and these stay empty.
+      ts.drawGenCycle = 0
+      if (cell.sequencer.mode === 'draw' && cell.sequencer.generative) {
+        ts.drawGeneratedValues = generateDrawCurve(cell, 0)
+      } else {
+        ts.drawGeneratedValues = []
+      }
+      // Pre-compute the cycle's per-token value range. Feeds the
+      // scaleToUnit auto-range path so output covers [0, 1] based on
+      // actual generated values, not blunt clipping.
+      ts.seqGenRanges = computeCycleRanges(cell, ts)
+      // Target centres at step 0 — same path the per-tick loop uses.
+      const baseRaw = resolveStepBaseRaw(cell, ts, 0, 0, 1)
       const rawTargets = numericBasesFromRaw(baseRaw)
       const targets = cell.scaleToUnit ? rawTargets.map((v) => clamp01(v)) : rawTargets
       // Pad from/to to the same length so element-wise interpolation is clean.
@@ -390,14 +851,17 @@ export class SceneEngine {
       // restart cleanly from their t=0 value.
       ts.phase = 0
       ts.triggerTime = now()
-      // Reset stepped-random state so a fresh random value fires at trigger.
+      // Reset stepped-random state so a fresh random value fires at
+      // trigger. Use the per-track seqRng (deterministic from the
+      // cell's value seed) instead of Math.random() so two triggers
+      // of the same cell with the same seed produce identical
+      // modulator trajectories — the rest of the modulator state
+      // tries to be reproducible and Math.random() defeated that.
+      const seedRng = ts.seqRng ?? Math.random
       ts.rndStepLastTick = -1
-      ts.rndStepValue = Math.random() * 2 - 1
+      ts.rndStepValue = seedRng() * 2 - 1
       ts.rndSmoothPrev = 0
-      ts.rndSmoothNext = Math.random() * 2 - 1
-      // Reset sequencer to step 0 on trigger.
-      ts.seqStepIdx = 0
-      ts.seqStepStart = now()
+      ts.rndSmoothNext = seedRng() * 2 - 1
       // Reset arp: start index depends on mode (Down starts at the top, etc.).
       ts.arpPatternIdx = 0
       ts.arpStepIdx = arpStartStep(cell.modulation.arpeggiator)
@@ -413,19 +877,21 @@ export class SceneEngine {
       }
       // Fresh S&H sample at trigger so the first tick has a real value
       // rather than zero (avoids a dead-air slot on the downbeat).
-      ts.shHeld = Math.random() * 2 - 1
+      // seqRng (cell-seed-driven) keeps these reproducible across
+      // re-triggers — same as rndStep/rndSmooth above.
+      ts.shHeld = seedRng() * 2 - 1
       ts.shPrev = 0
       ts.shLastAdvanceAt = now()
       // Slew: start at current center target to avoid a pop, pick a new
       // random target immediately so motion is audible.
       ts.slewValue = 0
-      ts.slewTarget = Math.random() * 2 - 1
+      ts.slewTarget = seedRng() * 2 - 1
       ts.slewLastAdvanceAt = now()
       // Chaos: seed close to 0.5 with a small per-trigger jitter so two
       // adjacent cells running the same settings produce different
       // trajectories. Values exactly at 0 or 1 are fixed points; keep
       // clear of both.
-      ts.chaosX = 0.1 + Math.random() * 0.8
+      ts.chaosX = 0.1 + seedRng() * 0.8
       ts.chaosLastAdvanceAt = now()
       ts.lastSentString = null
       ts.lastStringAtSceneId = null
@@ -889,10 +1355,20 @@ export class SceneEngine {
         const effHz = effectiveLfoHz(cell.modulation, this.session.globalBpm)
         const prevPhase = ts.phase
         ts.phase += effHz * dt
-        if (Math.floor(ts.phase) !== Math.floor(prevPhase)) {
-          ts.rndSmoothPrev = ts.rndSmoothNext
-          ts.rndSmoothNext = Math.random() * 2 - 1
-          ts.rndStepValue = Math.random() * 2 - 1
+        // Resample stepped / smooth noise on every full-cycle wrap.
+        // Multiple wraps in a single tick (effHz × dt > 1.0, possible
+        // after a sync-mode toggle that jumps effHz way up) iterate
+        // the resampler `wraps` times so we don't silently miss
+        // intermediate samples — visible as a frozen "stuck" value
+        // at high rates otherwise.
+        const wraps = Math.floor(ts.phase) - Math.floor(prevPhase)
+        if (wraps > 0) {
+          const rng = ts.seqRng ?? Math.random
+          for (let w = 0; w < wraps; w++) {
+            ts.rndSmoothPrev = ts.rndSmoothNext
+            ts.rndSmoothNext = rng() * 2 - 1
+            ts.rndStepValue = rng() * 2 - 1
+          }
           ts.rndStepLastTick = this.tickIdx
         }
       }
@@ -904,12 +1380,13 @@ export class SceneEngine {
       if (cell.modulation.enabled && cell.modulation.type === 'sh' && !ts.stopping) {
         const effHz = effectiveLfoHz(cell.modulation, this.session.globalBpm)
         if (effHz > 0) {
+          const rng = ts.seqRng ?? Math.random
           const period = 1000 / effHz
           while (t - ts.shLastAdvanceAt >= period) {
             ts.shLastAdvanceAt += period
-            if (Math.random() < Math.max(0, Math.min(1, cell.modulation.sh.probability))) {
+            if (rng() < Math.max(0, Math.min(1, cell.modulation.sh.probability))) {
               ts.shPrev = ts.shHeld
-              ts.shHeld = Math.random() * 2 - 1
+              ts.shHeld = rng() * 2 - 1
             }
             // If the die rolls against us, no change — held + prev stay put.
           }
@@ -921,11 +1398,12 @@ export class SceneEngine {
       if (cell.modulation.enabled && cell.modulation.type === 'slew' && !ts.stopping) {
         const effHz = effectiveLfoHz(cell.modulation, this.session.globalBpm)
         if (effHz > 0) {
+          const rng = ts.seqRng ?? Math.random
           const period = 1000 / effHz
           while (t - ts.slewLastAdvanceAt >= period) {
             ts.slewLastAdvanceAt += period
             if (cell.modulation.slew.randomTarget) {
-              ts.slewTarget = Math.random() * 2 - 1
+              ts.slewTarget = rng() * 2 - 1
             } else {
               // Bipolar square: flip the existing target's sign each clock.
               // A previous version used a tick-local counter that reset
@@ -952,13 +1430,16 @@ export class SceneEngine {
         if (effHz > 0) {
           const period = 1000 / effHz
           const r = Math.max(3.4, Math.min(4.0, cell.modulation.chaos.r))
+          const rng = ts.seqRng ?? Math.random
           while (t - ts.chaosLastAdvanceAt >= period) {
             ts.chaosLastAdvanceAt += period
             let x = ts.chaosX
             x = r * x * (1 - x)
-            // Clamp away from fixed points so the trajectory never stalls
-            // on a degenerate input.
-            if (!Number.isFinite(x) || x <= 0 || x >= 1) x = 0.1 + Math.random() * 0.8
+            // Clamp away from fixed points so the trajectory never
+            // stalls on a degenerate input. Reseed via the per-track
+            // PRNG (not Math.random) so the recovery is reproducible
+            // across re-triggers of the same cell.
+            if (!Number.isFinite(x) || x <= 0 || x >= 1) x = 0.1 + rng() * 0.8
             ts.chaosX = x
           }
         }
@@ -992,20 +1473,41 @@ export class SceneEngine {
           }
           if (advanced) {
             const rnd = cell.modulation.random
+            // Pre-compute the configured output span so scaleToUnit
+            // can NORMALISE int / colour samples (which live in
+            // [rnd.min, rnd.max] — typically 0..255 for colour, 0..127
+            // for MIDI, etc.) into [0, 1] rather than blunt-clamping
+            // every byte > 1 down to 1. Float values already live in
+            // [rnd.min, rnd.max] so the same normalisation works.
+            const rndLo = Math.min(rnd.min, rnd.max)
+            const rndHi = Math.max(rnd.min, rnd.max)
+            const rndSpan = rndHi - rndLo
+            const normalise = (v: number): number => {
+              if (rndSpan <= 1e-9) return 0
+              return Math.max(0, Math.min(1, (v - rndLo) / rndSpan))
+            }
             const args: Array<{
               type: 'i' | 'f' | 's' | 'T' | 'F'
               value: number | string | boolean
             }> = ts.randCurrent.map((v) => {
               if (rnd.valueType === 'float') {
+                if (cell.scaleToUnit) {
+                  return { type: 'f' as const, value: normalise(v) }
+                }
                 // Quantize to 1e-11 for stable output.
                 const q = Math.round(v * 1e11) / 1e11
-                const final = cell.scaleToUnit ? clamp01(q) : q
-                return { type: 'f' as const, value: final }
+                return { type: 'f' as const, value: q }
               }
-              // int or colour — integer output
+              // int or colour — integer output in [rndLo, rndHi].
+              // Under scaleToUnit we emit a FLOAT in [0, 1] (matching
+              // the rest of the engine's scaleToUnit convention) so
+              // the receiver sees actual proportions instead of a
+              // collapsed 0/1.
               const n = Math.round(v)
-              const final = cell.scaleToUnit ? clamp01(n) : n
-              return { type: 'i' as const, value: final }
+              if (cell.scaleToUnit) {
+                return { type: 'f' as const, value: normalise(n) }
+              }
+              return { type: 'i' as const, value: n }
             })
             this.sender.sendMany(cell.destIp, cell.destPort, cell.oscAddress, args)
             this.recordLiveValue(
@@ -1043,7 +1545,12 @@ export class SceneEngine {
         }
       }
 
-      // Advance sequencer step
+      // Advance sequencer step. The advance logic is mode-aware: most
+      // modes just count seqStepIdx upward (mod steps) like classic
+      // step / euclidean; Drift replaces the counter with a Brownian
+      // playhead; Cellular mutates the row at every cycle wrap; Ratchet
+      // re-rolls its subdivision count at every step.
+      let ratchetForceRetrigger = false
       if (cell.sequencer.enabled && !ts.stopping) {
         // Resolve the step duration based on the sequencer's Sync mode.
         //   'bpm'   — lock to the session's global BPM
@@ -1056,27 +1563,165 @@ export class SceneEngine {
             : syncMode === 'tempo'
               ? 60000 / Math.max(1, cell.sequencer.bpm)
               : Math.max(1, cell.sequencer.stepMs)
+        // Effective step count — Draw mode uses drawSteps (up to 64);
+        // other modes use steps (up to 16). Drives the wrap modulus
+        // and the cycle-range precompute.
+        const steps = effectiveSteps(cell)
         let stepChanged = false
-        while (t - ts.seqStepStart >= stepDurMs) {
-          ts.seqStepStart += stepDurMs
-          const steps = Math.max(1, Math.min(16, cell.sequencer.steps))
-          ts.seqStepIdx = (ts.seqStepIdx + 1) % steps
+        // Per-iteration step duration. Most modes use a uniform
+        // stepDurMs; Bounce substitutes a geometrically-shrinking
+        // duration tied to the current step index, producing the
+        // accelerating "ball settling on the floor" cadence.
+        const currentStepDur = (idx: number): number =>
+          cell.sequencer.mode === 'bounce'
+            ? bounceStepDuration(
+                stepDurMs,
+                Math.max(1, Math.min(16, cell.sequencer.steps)),
+                cell.sequencer.bounceDecay,
+                idx
+              )
+            : stepDurMs
+        while (t - ts.seqStepStart >= currentStepDur(ts.seqStepIdx)) {
+          ts.seqStepStart += currentStepDur(ts.seqStepIdx)
+          ts.seqLastStepIdx = ts.seqStepIdx
+          if (cell.sequencer.mode === 'drift') {
+            // Brownian playhead — the visible "current step" is the
+            // walker's position, not a fixed counter. Reuse seqStepIdx
+            // for emitState so the inspector preview can highlight it.
+            const rng = ts.seqRng ?? Math.random
+            ts.seqDriftPos = advanceDrift(
+              ts.seqDriftPos,
+              steps,
+              cell.sequencer.bias,
+              cell.sequencer.edge,
+              rng
+            )
+            ts.seqStepIdx = ts.seqDriftPos
+          } else {
+            ts.seqStepIdx = (ts.seqStepIdx + 1) % steps
+            // Cellular: at the wrap point, evolve the row through one
+            // Wolfram iteration. Done at wrap (not every step) so the
+            // row stays stable through one full cycle of values, then
+            // mutates audibly at the cycle boundary.
+            // Draw + Generative — regenerate the variation curve at
+            // each cycle wrap so the user hears a new pattern based
+            // on their drawing, not the same loop repeating.
+            if (
+              cell.sequencer.mode === 'draw' &&
+              cell.sequencer.generative &&
+              ts.seqStepIdx === 0 &&
+              ts.seqLastStepIdx >= 0
+            ) {
+              ts.drawGenCycle++
+              ts.drawGeneratedValues = generateDrawCurve(cell, ts.drawGenCycle)
+              if (cell.scaleToUnit) ts.seqGenRanges = computeCycleRanges(cell, ts)
+            }
+            if (
+              cell.sequencer.mode === 'cellular' &&
+              ts.seqStepIdx === 0 &&
+              ts.seqLastStepIdx >= 0
+            ) {
+              // If the Seed LFO is on, re-seed the row from the
+              // modulated seed instead of evolving — this is what
+              // produces the "slowly wandering pattern" feel. With
+              // the LFO off, evolve via the Wolfram rule as before.
+              if (cell.sequencer.cellularSeedLfoDepth > 0) {
+                ts.seqCellRow = cellularInitialRow(
+                  modulatedCellSeed(cell.sequencer, t),
+                  Math.max(1, Math.min(16, cell.sequencer.steps))
+                )
+              } else {
+                ts.seqCellRow = evolveCellular(
+                  ts.seqCellRow,
+                  cell.sequencer.rule,
+                  Math.max(1, Math.min(16, cell.sequencer.steps))
+                )
+              }
+              // Cycle wrap → recompute the cycle's value range so
+              // scaleToUnit auto-range tracks the evolving pattern.
+              if (cell.scaleToUnit) ts.seqGenRanges = computeCycleRanges(cell, ts)
+            }
+          }
+          // Ratchet — roll a fresh subdivision count for this new step.
+          // Per-step probability + maxDiv blend the global values with
+          // per-step hashes, shaped by the Variation knob (0 = uniform,
+          // 100 = fully random per step). The PRNG roll still decides
+          // whether to actually fire a burst.
+          if (cell.sequencer.mode === 'ratchet') {
+            const rng = ts.seqRng ?? Math.random
+            const stepParams = ratchetStepParams(cell.sequencer, ts.seqStepIdx)
+            const prob = stepParams.prob / 100
+            const maxDiv = stepParams.maxDiv
+            if (prob > 0 && rng() < prob) {
+              ts.seqRatchetSubdiv = 2 + Math.floor(rng() * (maxDiv - 1))
+            } else {
+              ts.seqRatchetSubdiv = 1
+            }
+            ts.seqRatchetSubIdx = 0
+            ts.seqRatchetSubStart = ts.seqStepStart
+          }
           stepChanged = true
+        }
+        // Ratchet sub-pulse loop — within a step that's currently
+        // bursting, fire a "force retrigger" pulse at every subdivision
+        // boundary. The send paths below honour ratchetForceRetrigger
+        // by bypassing string-dedupe (so a held string value re-fires)
+        // and re-emitting numerics even when value math says no change.
+        if (
+          cell.sequencer.mode === 'ratchet' &&
+          ts.seqRatchetSubdiv > 1 &&
+          !ts.stopping
+        ) {
+          // Use the CURRENT step's actual duration — Bounce mode
+          // shrinks step duration geometrically as the ball
+          // "settles", so a sub-pulse divided against the constant
+          // `stepDurMs` would overshoot the real step boundary on
+          // bouncier steps. Asking `currentStepDur(ts.seqStepIdx)`
+          // returns either stepDurMs (most modes) or the
+          // bounce-shaped duration (bounce mode), so this works
+          // uniformly across modes.
+          const subDur = currentStepDur(ts.seqStepIdx) / ts.seqRatchetSubdiv
+          while (
+            ts.seqRatchetSubIdx < ts.seqRatchetSubdiv - 1 &&
+            t - ts.seqRatchetSubStart >= subDur
+          ) {
+            ts.seqRatchetSubStart += subDur
+            ts.seqRatchetSubIdx++
+            ratchetForceRetrigger = true
+          }
         }
         if (stepChanged) this.emitState()
       }
 
-      // Euclidean gate — when the sequencer is in 'euclidean' mode, the
-      // current step is either a HIT (emit normally) or a MISS (suppress
-      // OSC send so the receiver's current value is held).
+      // Per-mode gate evaluation. Some modes (steps, drift, ratchet)
+      // never mute on their own; others (euclidean, polyrhythm, density,
+      // cellular) gate based on the current step.
       const seqMuted =
         cell.sequencer.enabled &&
-        cell.sequencer.mode === 'euclidean' &&
         (() => {
           const steps = Math.max(1, Math.min(16, cell.sequencer.steps))
-          const pulses = Math.max(0, Math.min(steps, cell.sequencer.pulses))
-          const pat = euclidean(pulses, steps, cell.sequencer.rotation)
-          return !pat[ts.seqStepIdx % steps]
+          const idx = ts.seqStepIdx % steps
+          switch (cell.sequencer.mode) {
+            case 'euclidean': {
+              const pulses = Math.max(0, Math.min(steps, cell.sequencer.pulses))
+              const pat = euclidean(pulses, steps, cell.sequencer.rotation)
+              return !pat[idx]
+            }
+            case 'polyrhythm':
+              return !polyrhythmGate(
+                idx,
+                cell.sequencer.ringALength,
+                cell.sequencer.ringBLength,
+                cell.sequencer.combine
+              )
+            case 'density':
+              return !densityGate(idx, cell.sequencer.seed, cell.sequencer.density)
+            case 'cellular':
+              return ((ts.seqCellRow >>> idx) & 1) === 0
+            // steps / drift / ratchet always emit (subject to value parsing).
+            default:
+              return false
+          }
         })()
       if (seqMuted) {
         // No OSC output this tick. Advance stopping-morph so Stop still
@@ -1088,10 +1733,17 @@ export class SceneEngine {
         continue
       }
 
-      // Resolve the base value string: sequencer step value if enabled, else cell.value.
-      const baseRaw = cell.sequencer.enabled
-        ? cell.sequencer.stepValues[ts.seqStepIdx] ?? cell.value
-        : cell.value
+      // Resolve the base value string. Four branches handled in the
+      // shared helper: sequencer off → cell.value; Draw mode →
+      // drawValues[i] × token; generative → per-mode live rule;
+      // classic → stepValues[i] lookup.
+      const baseRaw = resolveStepBaseRaw(
+        cell,
+        ts,
+        ts.seqStepIdx,
+        ts.seqRatchetSubIdx,
+        ts.seqRatchetSubdiv
+      )
 
       // Morph progress (transition only applies on scene change, not step changes).
       const morphP = ts.morphMs > 0 ? clamp((t - ts.morphStart) / ts.morphMs, 0, 1) : 1
@@ -1103,7 +1755,82 @@ export class SceneEngine {
         if (ts.stopping && morphP >= 1) this.disarm(ts)
         continue
       }
-      const perToken = tokens.map((t) => autoDetectOscArg(t))
+      const perTokenSeq = tokens.map((t) => autoDetectOscArg(t))
+
+      // ── Multi-arg + sequencer + pin merge ──────────────────────────
+      // When a Track snapshots an argSpec with N slots (e.g. OCTOCOSME
+      // "Voice Pots" with four pots per voice), the cell normally
+      // emits N OSC args. But the sequencer's per-step value is a
+      // single string — typically with FEWER tokens than the slot
+      // count (the user types "0.5" not "0.5 0.5 0.5 0.5"). Left
+      // alone, the engine would only emit one arg per step and the
+      // multi-arg cell's pinned slots would never be re-asserted.
+      //
+      // Fix: pad `perToken` up to argSpec.length when the cell is
+      // multi-arg AND a sequencer is active. For each slot:
+      //   - pinned slot          → token sourced from
+      //                            track.persistentValues[i] so the
+      //                            pin survives the sequencer entirely
+      //   - present in seq value → use the sequenced token at that
+      //                            slot (per-slot variation when the
+      //                            user types a multi-token step)
+      //   - single seq token     → broadcast to every unpinned slot
+      //                            (the common case — one step value
+      //                             drives all unpinned pots together)
+      //   - otherwise            → fall back to the cell's original
+      //                            multi-arg value at that slot
+      //
+      // The per-arg pin override at l.~1920 still runs and re-asserts
+      // the pinned value AFTER modulation, so even if a modulator
+      // wobbles the padded token mid-tick the emitted value stays
+      // frozen. The padding here only guarantees that ALL slots get
+      // iterated in the emit loop below.
+      const slotCount = track?.argSpec?.length ?? 0
+      const persistArrPad = track?.persistentSlots
+      const persistValsPad = track?.persistentValues
+      let perToken = perTokenSeq
+      if (
+        cell.sequencer.enabled &&
+        slotCount > perTokenSeq.length &&
+        slotCount > 0
+      ) {
+        const originalTokens = parseValueTokens(cell.value)
+        const padded: typeof perTokenSeq = new Array(slotCount)
+        for (let i = 0; i < slotCount; i++) {
+          const pinned =
+            persistArrPad?.[i] === true &&
+            persistValsPad?.[i] !== undefined
+          if (pinned) {
+            // Slot is pinned — seed perToken from the pinned token so
+            // the slot is present in the emit loop. The pin override
+            // at l.~1920 will re-clamp `out` back to this value after
+            // modulation runs.
+            padded[i] = autoDetectOscArg(persistValsPad![i])
+          } else if (i < perTokenSeq.length) {
+            // Sequencer produced a per-slot token — use it.
+            padded[i] = perTokenSeq[i]
+          } else if (perTokenSeq.length === 1) {
+            // Single sequenced value: broadcast it to every unpinned
+            // slot. This is the common case ("sequence all pots
+            // together") and matches what the inspector preview shows
+            // when the step value is a single number.
+            padded[i] = perTokenSeq[0]
+          } else if (i < originalTokens.length) {
+            // Fewer sequencer tokens than slots, but more than one —
+            // fall back to the cell's original multi-arg value for
+            // the trailing slots so the OSC bundle keeps its full
+            // arg count.
+            padded[i] = autoDetectOscArg(originalTokens[i])
+          } else {
+            // No source for this slot — emit a neutral 0 float rather
+            // than a malformed short bundle. argSpec entries with a
+            // fixed value would have been baked into cell.value at
+            // instantiation, so this branch is defensive only.
+            padded[i] = { type: 'f', value: 0 }
+          }
+        }
+        perToken = padded
+      }
       const hasNumeric = perToken.some((a) => a.type === 'i' || a.type === 'f')
 
       // Pure string/bool path — send on change, no morph math.
@@ -1113,7 +1840,9 @@ export class SceneEngine {
           ts.lastSentString !== baseRaw ||
           ts.lastStringAtSceneId !== ts.activeSceneId ||
           ts.lastStringAtStep !== stepKey
-        if (morphP >= 1 && changed) {
+        // Ratchet sub-pulses retrigger the same step value: bypass dedupe
+        // so the string/bool re-fires within the step.
+        if (morphP >= 1 && (changed || ratchetForceRetrigger)) {
           this.sender.sendMany(
             cell.destIp,
             cell.destPort,
@@ -1145,12 +1874,30 @@ export class SceneEngine {
             this.currentSceneDurationSec(ts.activeSceneId)
           )
         } else if (cell.modulation.type === 'ramp') {
+          // Mode change while playing → reset triggerTime so the new
+          // mode's curve fires from t=0 immediately. Without this,
+          // toggling Normal → Inverted on a clip that's already past
+          // its rampMs would settle at the new mode's END value and
+          // never visibly transition — looks like "Inverted does
+          // nothing" to the user.
+          const currentMode = cell.modulation.ramp.mode ?? 'normal'
+          if (
+            ts.prevRampMode !== null &&
+            ts.prevRampMode !== currentMode
+          ) {
+            ts.triggerTime = t
+          }
+          ts.prevRampMode = currentMode
           rampGain = computeRampGain(
             cell.modulation.ramp,
             (t - ts.triggerTime) / 1000,
             this.currentSceneDurationSec(ts.activeSceneId)
           )
         } else {
+          // Modulator isn't Ramp — clear the tracker so a future
+          // re-enable of Ramp triggers a fresh ramp regardless of
+          // history.
+          ts.prevRampMode = null
           modNorm = computeModNorm(
             cell.modulation,
             ts,
@@ -1163,16 +1910,29 @@ export class SceneEngine {
       }
 
       // Per-token targets (numeric) — baseline for center computation.
+      // When scaleToUnit is on AND a sequencer is active, DON'T pre-
+      // clamp here — the auto-range path below will normalise the
+      // value into [0, 1] using the cycle's actual min/max. Pre-
+      // clamping would zero out anything > 1 before auto-range ever
+      // saw it, defeating the whole "scale 0..2 to 0..1" intent.
       const stepTargetsRaw = perToken.map((a) =>
         a.type === 'i' || a.type === 'f' ? (a.value as number) : null
       )
-      const stepTargets = cell.scaleToUnit
-        ? stepTargetsRaw.map((v) => (v === null ? null : clamp01(v)))
-        : stepTargetsRaw
+      const stepTargets =
+        cell.scaleToUnit && !cell.sequencer.enabled
+          ? stepTargetsRaw.map((v) => (v === null ? null : clamp01(v)))
+          : stepTargetsRaw
 
       const outs: Array<{ type: 'i' | 'f' | 's' | 'T' | 'F'; value: unknown }> = []
       const liveParts: string[] = []
 
+      // Track whether ANY token's emitted value differs from the
+      // last sent. Drives the Hold rest-behaviour gate below — when
+      // restBehaviour='hold' AND nothing changed, skip the OSC send
+      // so the receiver naturally holds its previous value (no
+      // redundant traffic, no re-triggering).
+      const sentValuesBefore = ts.lastSentNumeric.slice()
+      const newFinalVals: number[] = []
       for (let idx = 0; idx < perToken.length; idx++) {
         const a = perToken[idx]
         if (a.type === 's' || a.type === 'T' || a.type === 'F') {
@@ -1192,6 +1952,34 @@ export class SceneEngine {
           const from = ts.fromCenter[idx] ?? 0
           const to = ts.toCenter[idx] ?? target
           center = from + (to - from) * morphP
+        }
+
+        // scaleToUnit auto-range — instead of blunt clamp([0, 1]),
+        // remap the cycle's value range to [0, 1] so the user sees
+        // full-range output even when the seed produces values >1
+        // (or <0). Range is precomputed at trigger + at every cycle
+        // wrap, so cellular's evolving pattern stays in scope.
+        // Only applies when sequencer is enabled — non-sequencer
+        // cells use the classic clamp01 path below.
+        if (
+          cell.scaleToUnit &&
+          cell.sequencer.enabled &&
+          ts.seqGenRanges[idx]
+        ) {
+          const r = ts.seqGenRanges[idx]
+          const span = r.max - r.min
+          if (span > 1e-9) {
+            center = (center - r.min) / span
+          } else {
+            // Degenerate (all step values identical, OR a single
+            // repeated step). Previously we forced 0.5 so SOMETHING
+            // showed up — but that was misleading when the user
+            // intended e.g. a constant 0 or 1. Instead, clamp the
+            // user's actual value into [0, 1] and emit that, so a
+            // sequencer with one repeated "1" stays at 1, a repeated
+            // "0" stays at 0, and a repeated "0.42" stays at 0.42.
+            center = center < 0 ? 0 : center > 1 ? 1 : center
+          }
         }
 
         let out = center
@@ -1239,7 +2027,28 @@ export class SceneEngine {
             out = center + modNorm * magnitude
           }
         }
-        if (cell.scaleToUnit) out = clamp01(out)
+        // Smart scaleToUnit auto-range.
+        // - Sequencer + scaleToUnit: normalise `out` to the cycle's
+        //   actual value range (already handled — center was
+        //   normalised above before modulation; final clamp01 keeps
+        //   modulator wobble inside [0, 1]).
+        // - Modulator + scaleToUnit (no sequencer): predict the
+        //   modulator's output range and normalise `out` into [0, 1]
+        //   using THAT range. Means a Chaos modulator on a base of
+        //   100 spans the full [0, 1] visually rather than clipping.
+        // - Plain scaleToUnit (no mod, no seq): classic clamp01.
+        if (cell.scaleToUnit) {
+          const seqAutoRanged =
+            cell.sequencer.enabled && ts.seqGenRanges[idx]
+          if (!seqAutoRanged && cell.modulation.enabled && !ts.stopping) {
+            const r = predictModRange(cell.modulation, center)
+            const span = r.max - r.min
+            if (span > 1e-9) {
+              out = (out - r.min) / span
+            }
+          }
+          out = clamp01(out)
+        }
 
         // Per-arg-position persistence — if this slot is pinned on
         // the track, override the computed value with the user-
@@ -1265,11 +2074,46 @@ export class SceneEngine {
         // track's stored persistentValues, not from this cache, so
         // we don't need to keep the cache in sync for them.)
         if (!persistThis) ts.lastSentNumeric[idx] = finalVal
+        newFinalVals.push(finalVal)
         outs.push({ type: sendType, value: finalVal })
         liveParts.push(sendType === 'i' ? String(finalVal) : finalVal.toFixed(3))
       }
 
-      this.sender.sendMany(cell.destIp, cell.destPort, cell.oscAddress, outs as OscArg[])
+      // Hold rest-behaviour gate: when restBehaviour='hold', skip
+      // the OSC send if every numeric token matches what we sent
+      // last tick — receivers naturally hold their previous value,
+      // so re-sending the same payload is just redundant traffic.
+      // Always send the FIRST emit after a trigger (regardless of
+      // dedup), so receivers get an initial value to hold.
+      const hold = cell.sequencer.restBehaviour === 'hold'
+      let valuesChanged = false
+      if (newFinalVals.length === 0) {
+        valuesChanged = true // pure string/bool — fall through to send
+      } else {
+        for (let i = 0; i < newFinalVals.length; i++) {
+          if (sentValuesBefore[i] !== newFinalVals[i]) {
+            valuesChanged = true
+            break
+          }
+        }
+      }
+      const shouldSend =
+        !hold ||
+        valuesChanged ||
+        ratchetForceRetrigger ||
+        !ts.hasEmittedNumeric
+      if (shouldSend) {
+        this.sender.sendMany(
+          cell.destIp,
+          cell.destPort,
+          cell.oscAddress,
+          outs as OscArg[]
+        )
+        ts.hasEmittedNumeric = true
+      }
+      // Always record liveValue for the UI — even if we suppressed
+      // the OSC send for Hold, the cell tile + step previews should
+      // still reflect the current generated state.
       this.recordLiveValue(ts.activeSceneId ?? '', trackId, liveParts.join(' '))
 
       if (ts.stopping && morphP >= 1) this.disarm(ts)
@@ -1361,9 +2205,13 @@ export class SceneEngine {
       })
     }
 
-    const baseRaw = cell.sequencer.enabled
-      ? cell.sequencer.stepValues[ts.seqStepIdx] ?? cell.value
-      : cell.value
+    const baseRaw = resolveStepBaseRaw(
+      cell,
+      ts,
+      ts.seqStepIdx,
+      ts.seqRatchetSubIdx,
+      ts.seqRatchetSubdiv
+    )
     const targetsRaw = numericBasesFromRaw(baseRaw)
     const targets = cell.scaleToUnit ? targetsRaw.map(clamp01) : targetsRaw
 
@@ -1654,7 +2502,13 @@ function computeEnvelopeGain(
 //  negative curvePct = ease-in (slow start, fast finish)
 // The caller multiplies the result by the cell's depth % (see main tick).
 function computeRampGain(
-  ramp: { rampMs: number; curvePct: number; sync: 'synced' | 'free' | 'freeSync'; totalMs: number },
+  ramp: {
+    rampMs: number
+    curvePct: number
+    sync: 'synced' | 'free' | 'freeSync'
+    totalMs: number
+    mode?: 'normal' | 'inverted' | 'loop'
+  },
   elapsedSec: number,
   sceneDurSec: number
 ): number {
@@ -1666,17 +2520,27 @@ function computeRampGain(
   } else {
     lenSec = Math.max(0.0001, (ramp.rampMs ?? 0) / 1000)
   }
-  if (elapsedSec <= 0) return 0
-  if (elapsedSec >= lenSec) return 1
-  const lin = elapsedSec / lenSec
+  const mode = ramp.mode ?? 'normal'
+  // Loop mode: take elapsed time modulo the ramp period so the curve
+  // retriggers every period instead of holding at 1 after completing.
+  // Normal/Inverted: clamp at edges (0 before, 1/0 after).
+  let lin: number
+  if (mode === 'loop') {
+    if (elapsedSec <= 0) lin = 0
+    else lin = (elapsedSec % lenSec) / lenSec
+  } else {
+    if (elapsedSec <= 0) return mode === 'inverted' ? 1 : 0
+    if (elapsedSec >= lenSec) return mode === 'inverted' ? 0 : 1
+    lin = elapsedSec / lenSec
+  }
   const curve = ramp.curvePct ?? 0
-  if (curve === 0) return lin
-  // Classic power-curve pair — rotationally symmetric around (0.5, 0.5):
-  //   curve > 0 → ease-out  y = 1 - (1-t)^k   (fast start, slow tail)
-  //   curve < 0 → ease-in   y = t^k           (slow start, fast finish)
-  // Both grow the exponent the same way (k = 1..5) so ±curve magnitudes
-  // produce mirror-image shapes, not mathematical inverses (which looked
-  // lopsided when rendered next to each other in the visualizer).
-  const k = 1 + (Math.abs(curve) / 100) * 4
-  return curve > 0 ? 1 - Math.pow(1 - lin, k) : Math.pow(lin, k)
+  const shaped =
+    curve === 0
+      ? lin
+      : curve > 0
+        ? 1 - Math.pow(1 - lin, 1 + (Math.abs(curve) / 100) * 4)
+        : Math.pow(lin, 1 + (Math.abs(curve) / 100) * 4)
+  // Inverted mode flips the ramp vertically so it falls 1 → 0 instead
+  // of rising 0 → 1 (curve shape preserved, just mirrored).
+  return mode === 'inverted' ? 1 - shaped : shaped
 }

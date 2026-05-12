@@ -147,6 +147,11 @@ export interface RampParams {
   curvePct: number    // -100..100, linear at 0
   sync: EnvSync       // reuses envelope sync modes: synced / free / freeSync
   totalMs: number     // length (ms) used when sync='freeSync'. Same range as rampMs.
+  // Mode: how the ramp behaves over time.
+  //   'normal'   — one-shot 0 → 1 ramp, holds at 1 after completing (default)
+  //   'inverted' — one-shot 1 → 0 ramp (mirror of normal), holds at 0
+  //   'loop'     — repeats the 0 → 1 ramp forever, retriggering at every period
+  mode: 'normal' | 'inverted' | 'loop'
 }
 
 export interface Modulation {
@@ -183,26 +188,184 @@ export interface Modulation {
 export type SeqSyncMode = 'bpm' | 'tempo' | 'free'
 
 // Sequencer drive mode:
-//   'steps'     — classic 1..16 step cycle, each step plays stepValues[i].
-//   'euclidean' — Bjorklund pattern: `pulses` active hits distributed as
-//                 evenly as possible over `steps` total, rotated by
-//                 `rotation`. Active step i still emits stepValues[i];
-//                 inactive steps are silent (no OSC sent, cell output
-//                 stays at its last sent value).
-export type SeqMode = 'steps' | 'euclidean'
+//   'steps'      — classic 1..16 step cycle, each step plays stepValues[i].
+//   'euclidean'  — Bjorklund pattern: `pulses` active hits distributed as
+//                  evenly as possible over `steps` total, rotated by
+//                  `rotation`. Active step i still emits stepValues[i];
+//                  inactive steps are silent.
+//   'polyrhythm' — Two independent ring clocks of length `ringALength` and
+//                  `ringBLength`; each "fires" at multiples of its length
+//                  inside the master cycle. Combined via `combine` (OR /
+//                  XOR / AND) into a gate. Tiny inputs → long emergent
+//                  patterns (3-against-7, etc.).
+//   'density'    — Each step has an internal probability derived from
+//                  hash(step, seed); fires when that probability falls
+//                  under `density / 100`. Same seed = same personality;
+//                  density is a master "how busy" knob.
+//   'cellular'   — 1D Wolfram cellular automaton. Each cycle the row
+//                  evolves: every step's next state is f(left, self,
+//                  right) per the chosen `rule` (0..255). Rule 30 ≈
+//                  quasi-random, Rule 90 ≈ Sierpinski symmetry, Rule 110
+//                  ≈ gliders.
+//   'drift'      — Brownian playhead. Step row is fixed; the head walks
+//                  +1 / 0 / -1 each clock based on `bias` (-100..+100%).
+//                  `edge` controls boundary behaviour (wrap or reflect).
+//   'ratchet'    — Each step has a chance (`ratchetProb` %) of
+//                  subdividing into a quick burst of 2..`ratchetMaxDiv`
+//                  re-triggers within the step duration. Most audible on
+//                  string / bool / int OSC targets that interpret each
+//                  send as a fresh trigger.
+//   'bounce'     — Real ball-bounce physics. Each cycle is one "drop":
+//                  step 0 is the loud first impact, subsequent steps
+//                  bounce at GEOMETRICALLY SHRINKING intervals with
+//                  EXPONENTIALLY DECAYING amplitude. A single
+//                  `bounceDecay` knob controls "bounciness" — both the
+//                  time-acceleration and the value-decay come from the
+//                  same coefficient so the gesture is unified.
+//   'draw'       — Freely-drawn automation curve. The user sketches
+//                  a curve on a rectangular canvas with the mouse;
+//                  each x-position is a step, each y-position is the
+//                  emitted value (normalised to [0, 1]). Step count
+//                  caps higher than other modes (up to 64) so the
+//                  curve has enough resolution to feel like a real
+//                  DAW automation lane. Generative + Variation knobs
+//                  don't apply — the curve IS the user's intention.
+export type SeqMode =
+  | 'steps'
+  | 'euclidean'
+  | 'polyrhythm'
+  | 'density'
+  | 'cellular'
+  | 'drift'
+  | 'ratchet'
+  | 'bounce'
+  | 'draw'
+
+export type SeqCombine = 'or' | 'xor' | 'and'
+export type SeqDriftEdge = 'wrap' | 'reflect'
 
 export interface SequencerParams {
   enabled: boolean
-  steps: number // 1..16, active count (also euclidean total steps)
+  steps: number // 1..16, active count / master cycle length
   syncMode: SeqSyncMode
-  bpm: number // 10..500 — used when syncMode='sync' (1 step per beat)
+  bpm: number // 10..500 — used when syncMode='bpm' (1 step per beat)
   stepMs: number // used when syncMode='free'
   stepValues: string[] // fixed length 16; only first `steps` fire at runtime
-  // Euclidean fields — only meaningful when mode === 'euclidean'.
+  // Pattern dispatch.
   mode: SeqMode
-  pulses: number   // 1..steps
+
+  // Euclidean fields — only meaningful when mode === 'euclidean'.
+  pulses: number   // 0..steps
   rotation: number // 0..steps-1
+
+  // Polyrhythm fields — only meaningful when mode === 'polyrhythm'.
+  ringALength: number // 1..16
+  ringBLength: number // 1..16
+  combine: SeqCombine
+
+  // Density fields — only meaningful when mode === 'density'.
+  density: number // 0..100, master probability scaler
+  seed: number    // 0..255, picks the "personality" of which steps fire
+
+  // Cellular fields — only meaningful when mode === 'cellular'.
+  rule: number     // 0..255, Wolfram rule number
+  cellSeed: number // 0..65535 bitmask of initial row; 0 = single center cell
+  // Seed LFO — when depth > 0, the engine re-seeds the cellular
+  // automaton on each cycle wrap with a value modulated around
+  // cellSeed by a slow LFO. Lets the pattern slowly drift through
+  // adjacent seed values over time, producing a generative
+  // "wandering pattern" feel without manually changing seed.
+  cellularSeedLfoDepth: number // 0..100 (% of full 0..65535 range)
+  cellularSeedLfoRate: number  // 0.01..10 Hz
+
+  // Drift fields — only meaningful when mode === 'drift'.
+  bias: number       // -100..+100 (% forward bias; 0 = pure random walk)
+  edge: SeqDriftEdge
+
+  // Ratchet fields — only meaningful when mode === 'ratchet'.
+  ratchetProb: number   // 0..100, per-step probability of subdividing
+  ratchetMaxDiv: number // 2..16, max subdivision count (always integer)
+  // Variation: 0 = every step uses the global Probability + MaxDiv
+  // verbatim. 100 = each step's prob & maxDiv are hash-randomised
+  // off the global value so bursts feel less uniform across the
+  // cycle. Deterministic per (step, seed) so the same seed always
+  // produces the same per-step variation.
+  ratchetVariation: number // 0..100
+  // Mode: shape of the sub-pulse values within each burst.
+  //   'octaves'  — every sub-pulse emits stepValue / subdiv (proportional
+  //                scaling, like dividing the tempo)
+  //   'ramp'     — sub i emits stepValue × (i+1)/subdiv (snare-roll rise)
+  //   'inverse'  — mirror of Ramp: stepValue × (subdiv-i)/subdiv (fall)
+  //   'pingpong' — rises then falls within the burst (triangle window)
+  //   'echo'     — exponential decay (each sub ≈ base × 0.7^i, like a
+  //                ball-bounce or guitar palm-mute echo)
+  //   'trill'    — alternates base / base*0.5 across sub-pulses (an
+  //                ornamental two-note flicker)
+  //   'random'   — hash-driven scatter (each sub-pulse different)
+  ratchetMode:
+    | 'octaves'
+    | 'ramp'
+    | 'inverse'
+    | 'pingpong'
+    | 'echo'
+    | 'trill'
+    | 'random'
+
+  // Bounce fields — only meaningful when mode === 'bounce'.
+  // Maps 0..100 → physical coefficient e ∈ [0.40, 0.95]:
+  //   0   → "dead bounce" (e=0.40): quick collapse, last bounces nearly
+  //         back-to-back, then the cycle resets.
+  //   100 → "super bouncy" (e=0.95): bounces barely decay, intervals
+  //         stay almost uniform, sustained train of pulses.
+  // Drives BOTH the per-step duration (geometric shrink) and, in
+  // generative mode, the per-step value decay — so what you see and
+  // what you hear are tied to the same physical knob.
+  bounceDecay: number   // 0..100
+
+  // Generative mode — when true, per-step values are no longer read
+  // from `stepValues[]`. Instead the cell's `value` becomes the seed
+  // / base intention, and each step's emitted value is computed live
+  // from a per-mode organic rule (Tide / Accent / Voicing / Wave /
+  // Crowd / Terrain / Scatter — see factory.ts). `genAmount` is one
+  // shared "Variation" knob that every mode reinterprets:
+  //   Steps      — tide swell depth
+  //   Euclidean  — accent strength on downbeat hits
+  //   Polyrhythm — spread between Ring A / Ring B / coincidence
+  //   Density    — sine-wave amplitude sampled by the gate
+  //   Cellular   — excitement range from neighbour count
+  //   Drift      — height of the terrain hills the walker samples
+  //   Ratchet    — scatter width across a burst's sub-pulses
+  // 0 = flat (every step at base); 100 = full swing (±1 around base
+  // for Scale-0..1 cells, ±the base value otherwise).
+  generative: boolean
+  genAmount: number // 0..100
+
+  // Rest behaviour — what the engine emits between sequencer step
+  // boundaries (ticks where the value hasn't changed).
+  //   'last' — re-send the same value every tick (default; useful
+  //            for receivers that need a continuous stream).
+  //   'hold' — send nothing until the value actually changes;
+  //            receivers naturally hold their previous value. Cuts
+  //            redundant OSC and lets receivers own the sample-and-
+  //            hold semantics.
+  restBehaviour: SeqRestBehaviour
+
+  // Draw fields — only meaningful when mode === 'draw'. The user
+  // sketches a curve directly with the mouse; each x-position is a
+  // step, y-position is a normalised [0, 1] value. The canvas Y
+  // axis is labelled with `drawValueMin` / `drawValueMax` so the
+  // drawn 0..1 curve maps to whatever output range the user wants
+  // (e.g. -1..1 bipolar, 0..127 MIDI, 0..100 percent). Cap is high
+  // (up to 1024) so curves can be near-continuous for DAW-like
+  // automation lanes.
+  drawValues: number[] // length up to 1024, values in [0, 1]
+  drawSteps: number    // 4..1024
+  drawValueMin: number // value at curve y=0 (canvas floor)
+  drawValueMax: number // value at curve y=1 (canvas ceiling)
 }
+
+// Sequencer rest-behaviour alias.
+export type SeqRestBehaviour = 'last' | 'hold'
 
 export interface Cell {
   // Destination. If `destLinkedToDefault` is true, destIp/destPort track the session default.
@@ -637,6 +800,63 @@ export interface OscErrorEvent {
   message: string
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Network discovery — passive OSC listener.
+//
+// The Pool drawer's Network tab surfaces every OSC sender on the local
+// network that has hit our listening port. Each unique (ip, port)
+// becomes a `DiscoveredOscDevice`; every distinct OSC address path that
+// device has emitted becomes a `DiscoveredOscAddress`. The user can then
+// drag a device onto the Edit sidebar to materialise it as an
+// Instrument with one Parameter per observed address.
+// ─────────────────────────────────────────────────────────────────────
+
+// One OSC address path observed from a particular sender, with a tiny
+// fingerprint of the latest arg shape so the UI can infer paramType.
+export interface DiscoveredOscAddress {
+  path: string
+  lastSeen: number
+  count: number
+  // OSC type tags of the most recent message at this path. Drives
+  // paramType inference when materialising as an Instrument
+  // (e.g. one 'f' → float, three 'f' → v3, four 'f' → colour, etc.).
+  argTypes: string[]
+  // Truncated string-rendered preview of the latest args, for display.
+  argsPreview: string
+}
+
+// One sender on the local network — keyed by `${ip}:${port}` so a
+// single device that uses two source ports shows up as two rows
+// (rare, but unambiguous and easy to reason about).
+export interface DiscoveredOscDevice {
+  id: string // `${ip}:${port}`
+  ip: string
+  port: number
+  // When we first / most recently saw a packet from this sender.
+  firstSeen: number
+  lastSeen: number
+  packetCount: number
+  // Optional friendly name — for now the UI just shows the ip:port,
+  // but reserving the field keeps mDNS / OSCQuery integration easy
+  // later (a service announcement can fill this in).
+  name?: string
+  // Set of OSC paths this device has emitted. Capped at 256 to keep
+  // pathological floods (e.g. a streaming bundle per pixel) bounded.
+  addresses: DiscoveredOscAddress[]
+}
+
+// Status snapshot pushed to the renderer alongside the device list —
+// tells the Network tab whether the listener is bound, what port it
+// chose, and what local IPv4 addresses the user should point their
+// sender at to be picked up.
+export interface NetworkListenerStatus {
+  enabled: boolean
+  port: number
+  localAddresses: string[]
+  // Most recent bind error message ('' if none).
+  lastError: string
+}
+
 // Window.api signature — consumed by renderer.
 // MIDI is handled via Web MIDI in the renderer (not through IPC).
 export interface ExposedApi {
@@ -682,4 +902,32 @@ export interface ExposedApi {
   // Batched OSC send errors. Rendered as the health dot next to each
   // destination + as [ERR] rows in the OSC monitor drawer.
   onOscErrors: (cb: (batch: OscErrorEvent[]) => void) => () => void
+
+  // ── Network discovery ────────────────────────────────────────────
+  // Enable / disable the passive UDP OSC listener. Optional `port`
+  // re-binds on a different inbox (default 9000). Resolves with the
+  // post-action status snapshot. Bind failures surface in `lastError`
+  // and `enabled` stays false.
+  networkSetEnabled: (
+    enabled: boolean,
+    port?: number
+  ) => Promise<NetworkListenerStatus>
+  // Snapshot fetch — initial list + current status. Called once on
+  // mount; subsequent updates arrive via `onNetworkDevices`.
+  networkList: () => Promise<{
+    status: NetworkListenerStatus
+    devices: DiscoveredOscDevice[]
+  }>
+  // Wipe the device cache — useful when the user wants to re-scan
+  // without restarting the app.
+  networkClear: () => Promise<void>
+  // Push channel — fired on a 250ms timer whenever the device map has
+  // changed (new sender, new address, or fresh packet count). Status
+  // is bundled in so port-rebinds and bind errors round-trip too.
+  onNetworkDevices: (
+    cb: (payload: {
+      status: NetworkListenerStatus
+      devices: DiscoveredOscDevice[]
+    }) => void
+  ) => () => void
 }

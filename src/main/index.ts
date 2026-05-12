@@ -7,9 +7,14 @@ import type { EngineState, OscErrorEvent, OscEvent, Session } from '@shared/type
 import { SceneEngine } from './engine'
 import * as sessionIO from './session'
 import * as autosave from './autosave'
+import { OscNetworkListener } from './oscNetwork'
 
 let mainWindow: BrowserWindow | null = null
 const engine = new SceneEngine()
+// Passive OSC discovery listener. Bound lazily — stays closed until
+// the renderer's Pool drawer Network tab flips it on, so we don't fight
+// other apps for port 9000 unless the user actually asked for it.
+const networkListener = new OscNetworkListener()
 // Hoisted here (rather than inside whenReady()) so the module-level
 // before-quit / window-all-closed handlers can clear it alongside the
 // rest of the shutdown work. Previously there were TWO before-quit
@@ -37,6 +42,12 @@ function shutdown(): void {
     clearInterval(oscFlushTimer)
     oscFlushTimer = null
   }
+  // Tear down the discovery listener so its UDP socket is released
+  // before the process exits. Fire-and-forget — setEnabled(false)
+  // returns a Promise but app shutdown can't wait on it.
+  networkListener.setEnabled(false).catch(() => {
+    /* ignore — already torn down */
+  })
   engine.stop()
   autosave.stopAutosave()
 }
@@ -119,51 +130,99 @@ app.whenReady().then(async () => {
       oscErrBuffer = []
       mainWindow?.webContents.send('engine:oscErrors', errBatch)
     }
+    // Piggy-back the discovery flush on the same timer so the Network
+    // tab gets fresh device updates at ~20Hz without a second loop.
+    // `flush()` is a no-op when nothing changed since the last call.
+    networkListener.flush()
   }, 50)
 
+  // Push channel — the listener calls this whenever the device map
+  // changes. flush() routes through here on its 50ms cadence.
+  networkListener.setOnUpdate((payload) => {
+    mainWindow?.webContents.send('network:devices', payload)
+  })
+
+  // Wrapper that catches thrown errors inside an IPC handler, logs
+  // them with the channel name, and returns undefined to the renderer
+  // instead of propagating a generic IPC failure. Without this, a
+  // malformed session payload or an engine bug could leave engine
+  // state half-mutated AND surface as an unhelpful "An object could
+  // not be cloned" error on the renderer side.
+  function safeHandle(
+    channel: string,
+    handler: (...args: unknown[]) => unknown
+  ): void {
+    ipcMain.handle(channel, async (event, ...args) => {
+      try {
+        return await handler(event, ...args)
+      } catch (e) {
+        console.error(`[ipc] ${channel} threw:`, (e as Error).message)
+        return undefined
+      }
+    })
+  }
+
   // ---------- IPC: Engine ----------
-  ipcMain.handle('engine:triggerCell', (_e, sceneId: string, trackId: string) => {
-    engine.triggerCell(sceneId, trackId)
-  })
-  ipcMain.handle('engine:stopCell', (_e, sceneId: string, trackId: string) => {
-    engine.stopCell(sceneId, trackId)
-  })
-  ipcMain.handle(
-    'engine:triggerScene',
-    (_e, sceneId: string, opts?: { morphMs?: number; sourceSlotIdx?: number | null }) => {
-      engine.triggerScene(sceneId, opts)
-    }
+  safeHandle('engine:triggerCell', (_e, sceneId, trackId) =>
+    engine.triggerCell(sceneId as string, trackId as string)
   )
-  ipcMain.handle('engine:stopScene', (_e, sceneId: string) => {
-    engine.stopScene(sceneId)
+  safeHandle('engine:stopCell', (_e, sceneId, trackId) =>
+    engine.stopCell(sceneId as string, trackId as string)
+  )
+  safeHandle('engine:triggerScene', (_e, sceneId, opts) =>
+    engine.triggerScene(
+      sceneId as string,
+      opts as { morphMs?: number; sourceSlotIdx?: number | null } | undefined
+    )
+  )
+  safeHandle('engine:stopScene', (_e, sceneId) => engine.stopScene(sceneId as string))
+  safeHandle('engine:stopAll', () => engine.stopAll())
+  safeHandle('engine:panic', () => engine.panic())
+  safeHandle('engine:pauseSequence', () => engine.pauseSequence())
+  safeHandle('engine:resumeSequence', () => engine.resumeSequence())
+  safeHandle('engine:setTickRate', (_e, hz) => engine.setTickRate(hz as number))
+  safeHandle('engine:updateSession', (_e, s) => {
+    // Snapshot to autosave FIRST so even if the engine bails partway
+    // through propagating defaults, the next 60s tick captures the
+    // renderer's intent. Engine call comes second.
+    autosave.setCurrentSession(s as Session)
+    engine.updateSession(s as Session)
   })
-  ipcMain.handle('engine:stopAll', () => engine.stopAll())
-  ipcMain.handle('engine:panic', () => engine.panic())
-  ipcMain.handle('engine:pauseSequence', () => engine.pauseSequence())
-  ipcMain.handle('engine:resumeSequence', () => engine.resumeSequence())
-  ipcMain.handle('engine:setTickRate', (_e, hz: number) => engine.setTickRate(hz))
-  ipcMain.handle('engine:updateSession', (_e, s: Session) => {
-    engine.updateSession(s)
-    // Mirror to autosave so the 60s timer always has the freshest session.
-    autosave.setCurrentSession(s)
-  })
-  ipcMain.handle('engine:sendMetaValue', (_e, knobIdx: number, v: number) =>
-    engine.sendMetaValue(knobIdx, v)
+  safeHandle('engine:sendMetaValue', (_e, knobIdx, v) =>
+    engine.sendMetaValue(knobIdx as number, v as number)
   )
 
   // ---------- IPC: Session I/O ----------
+  // Save/open paths DO want to propagate errors back to the renderer
+  // so the user sees "could not save" instead of a silent no-op. We
+  // still wrap with safeHandle but rethrow inside — Electron's handle
+  // promise rejection mechanism still forwards the error message.
   ipcMain.handle('session:saveAs', (_e, s: Session) => sessionIO.saveAs(mainWindow, s))
   ipcMain.handle('session:saveTo', (_e, s: Session, path: string) => sessionIO.saveTo(path, s))
   ipcMain.handle('session:open', () => sessionIO.open(mainWindow))
 
+  // ---------- IPC: Network discovery ----------
+  // Pool drawer's Network tab uses these to bind/unbind the passive
+  // listener, fetch the initial device snapshot, and clear the cache.
+  safeHandle('network:setEnabled', (_e, enabled, port) =>
+    networkListener.setEnabled(enabled as boolean, port as number | undefined)
+  )
+  safeHandle('network:list', () => ({
+    status: networkListener.getStatus(),
+    devices: networkListener.list()
+  }))
+  safeHandle('network:clear', () => networkListener.clear())
+
   // ---------- IPC: Autosave / crash recovery ----------
   // `crashCheck` — renderer calls this on mount to decide whether to show
   // the restore prompt. Returns the flag + the latest autosave entries.
-  ipcMain.handle('autosave:crashCheck', async () => {
+  safeHandle('autosave:crashCheck', async () => {
     const entries = await autosave.listAutosaves()
     return { crashed: prevRunCrashed, entries }
   })
-  ipcMain.handle('autosave:list', () => autosave.listAutosaves())
+  safeHandle('autosave:list', () => autosave.listAutosaves())
+  // Load DOES want to propagate failures (so the user sees the parse
+  // error in the integrity dialog). Leave it on the raw ipcMain.handle.
   ipcMain.handle('autosave:load', (_e, path: string) => autosave.loadAutosave(path))
 
   createWindow()

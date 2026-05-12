@@ -17,6 +17,9 @@ import type {
   Pool,
   RampParams,
   Scene,
+  SeqMode,
+  SeqSyncMode,
+  SequencerParams,
   Session,
   Track,
   TrackKind
@@ -42,6 +45,7 @@ import {
   makeFunctionSpec,
   makeFunctionTrack,
   buildInitialValueFromArgSpec,
+  inferParamTypeFromArgTypes,
   makeMetaController,
   makeMetaKnob,
   makeParameterSpec,
@@ -259,6 +263,15 @@ interface UiState {
   // null and elapsed is just accumulatedMs (or 0 after Stop).
   transportStartedAt: number | null
   transportAccumulatedMs: number
+  // ── Network discovery (Pool drawer's Network tab) ─────────────────
+  // Devices observed by the main-process passive UDP OSC listener.
+  // Empty until the user enables the listener; updated on push from
+  // the engine on a ~50ms cadence whenever the map changes. NOT
+  // persisted in the session — discovery state is per-run.
+  networkDevices: import('@shared/types').DiscoveredOscDevice[]
+  // Listener bind status (enabled / port / lastError / local IPv4s).
+  // Pulled on Network-tab mount + refreshed on every push update.
+  networkStatus: import('@shared/types').NetworkListenerStatus
 }
 
 // Height (px) assigned to the scene-notes textarea when the Notes toggle
@@ -268,11 +281,15 @@ interface UiState {
 export const NOTES_ONE_LINE_HEIGHT = 26
 
 export type ThemeName =
+  // Rainbow-Circuit-flavoured themes — these opt into rich UI controls
+  // (bespoke arc sliders, icon-row mode pickers, card-wrap sections,
+  // console-readout numerics) via `RICH_THEMES` below.
+  | 'nature'   // Hopscotch palette — dark warm grey + olive→teal + orange
   // New themes (listed first in the picker).
   | 'studio-dark'
   | 'warm-charcoal'
   | 'graphite'
-  | 'cream'
+  | 'cream'    // repainted to match Peaks — cream paper + mustard ochre
   | 'paper-light'
   // Original themes.
   | 'dark'
@@ -285,6 +302,21 @@ export type ThemeName =
   | 'solaris'
   | 'flame'
   | 'analog'
+
+// Themes that opt into the bespoke "rich" UI surface — custom arc
+// sliders for Rate / Variation, mini-pictogram icon row in place of
+// the Pattern dropdown, soft cards around inspector sections, and
+// console-style numerical readouts. Other themes render the classic
+// HTML form controls. Nature + Cream both use this surface (Cream's
+// repainted Peaks look + Nature's Hopscotch palette).
+export const RICH_THEMES: ReadonlySet<ThemeName> = new Set<ThemeName>([
+  'nature',
+  'cream'
+])
+
+export function isRichTheme(t: ThemeName): boolean {
+  return RICH_THEMES.has(t)
+}
 
 interface Actions {
   // Session-level
@@ -549,7 +581,12 @@ interface Actions {
   setMetaControllerHeight: (h: number) => void
   setMetaSelectedKnob: (idx: number) => void
   updateMetaKnob: (idx: number, patch: Partial<MetaKnob>) => void
-  addMetaDestination: (knobIdx: number) => void
+  // Optional `prefill` lets the Destination-header picker hand over a
+  // resolved {destIp, destPort, oscAddress} for an active Instrument's
+  // Parameter (and optionally a specific arg-slot). When omitted, the
+  // destination is seeded from session defaults — same as the old
+  // "+ Destination" button did.
+  addMetaDestination: (knobIdx: number, prefill?: Partial<MetaDest>) => void
   removeMetaDestination: (knobIdx: number, destIdx: number) => void
   updateMetaDestination: (knobIdx: number, destIdx: number, patch: Partial<MetaDest>) => void
   // MIDI-learn bind / clear for a knob. Binding is always a CC in practice
@@ -564,6 +601,21 @@ interface Actions {
   // by metaSmooth.ts on every tween frame.
   setMetaKnobDisplayValues: (values: number[]) => void
   setUiScale: (s: number) => void
+
+  // ── Network discovery ───────────────────────────────────────────
+  // Replace the device list + status snapshot from a main-process
+  // push or initial fetch. The Pool's Network tab calls
+  // `networkRefresh()` on mount; subsequent updates come through
+  // window.api.onNetworkDevices().
+  setNetworkSnapshot: (
+    devices: import('@shared/types').DiscoveredOscDevice[],
+    status: import('@shared/types').NetworkListenerStatus
+  ) => void
+  // Materialise a discovered device into a user InstrumentTemplate
+  // with one Parameter per observed OSC address. Returns the new
+  // template's id so the caller (drag-start handler in PoolPane) can
+  // embed it in the existing POOL_TEMPLATE_DRAG_MIME payload.
+  materialiseNetworkDevice: (deviceId: string) => string | null
 
   // Engine state mirror
   setEngineState: (s: EngineState) => void
@@ -637,6 +689,17 @@ export const useStore = create<State>((set, get) => ({
   morphMs: 2000,
   transportStartedAt: null,
   transportAccumulatedMs: 0,
+  // Network discovery state — empty until the user enables the
+  // listener from the Pool drawer's Network tab. Status defaults to
+  // disabled on port 9000; the renderer fetches the real snapshot on
+  // mount via window.api.networkList().
+  networkDevices: [],
+  networkStatus: {
+    enabled: false,
+    port: 9000,
+    localAddresses: [],
+    lastError: ''
+  },
   // Ephemeral per-knob display values, interpolated by metaSmooth.ts. Not
   // persisted — on session load we reset these to each knob's `value`
   // (see setSession below).
@@ -1814,7 +1877,12 @@ export const useStore = create<State>((set, get) => ({
   setInspectorWidth: (w) => set({ inspectorWidth: clampInt(w, 320, 640) }),
   setSequencePaused: (paused) => set({ sequencePaused: paused }),
   setMidiLearnMode: (on) =>
-    set({ midiLearnMode: on, midiLearnTarget: on ? null : null }),
+    // Always clear midiLearnTarget when the mode flips — whether
+    // turning on (entering learn mode without a specific target
+    // pre-selected) or off (cancelling). The previous `on ? null : null`
+    // ternary was a half-finished conditional; collapsed to a single
+    // null for clarity.
+    set({ midiLearnMode: on, midiLearnTarget: null }),
   setMidiLearnTarget: (t) => set({ midiLearnTarget: t }),
   setTheme: (t) => set({ theme: t }),
   // By default each toggle is independent (scenes only OR messages only).
@@ -2097,17 +2165,22 @@ export const useStore = create<State>((set, get) => ({
         session: { ...st.session, metaController: { ...st.session.metaController, knobs } }
       }
     }),
-  addMetaDestination: (knobIdx) =>
+  addMetaDestination: (knobIdx, prefill) =>
     set((st) => {
       if (knobIdx < 0 || knobIdx >= META_KNOB_COUNT) return st
       const knobs = st.session.metaController.knobs.map((k, i) => {
         if (i !== knobIdx) return k
         if (k.destinations.length >= META_MAX_DESTS) return k
+        // Prefill from the Destination-header picker (resolved
+        // Instrument → Parameter → optional Value), falling back to
+        // session defaults + a /meta/N stub address otherwise. Each
+        // field is overridable independently so a caller can pass
+        // only an OSC address and inherit the IP/port defaults.
         const newDest: MetaDest = {
-          destIp: st.session.defaultDestIp,
-          destPort: st.session.defaultDestPort,
-          oscAddress: `/meta/${knobIdx + 1}`,
-          enabled: true
+          destIp: prefill?.destIp ?? st.session.defaultDestIp,
+          destPort: prefill?.destPort ?? st.session.defaultDestPort,
+          oscAddress: prefill?.oscAddress ?? `/meta/${knobIdx + 1}`,
+          enabled: prefill?.enabled ?? true
         }
         return { ...k, destinations: [...k.destinations, newDest] }
       })
@@ -2172,8 +2245,211 @@ export const useStore = create<State>((set, get) => ({
   setUiScale: (s) =>
     set({ uiScale: Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, s)) }),
 
+  setNetworkSnapshot: (devices, status) =>
+    set({ networkDevices: devices, networkStatus: status }),
+
+  materialiseNetworkDevice: (deviceId) => {
+    // Find the discovered device by id. Defensive about stale ids —
+    // the user could keep a drag-start event mid-flight while the
+    // device's TTL expires and it falls off the list.
+    const dev = get().networkDevices.find((d) => d.id === deviceId)
+    if (!dev) return null
+    // Derive a short instrument name from the most common OSC root
+    // (the first path component). e.g. "/octocosme/vol /octocosme/tilt"
+    // → "octocosme". Falls back to the ip if there's no common prefix.
+    const rootCounts = new Map<string, number>()
+    for (const a of dev.addresses) {
+      const m = /^\/?([^/]+)/.exec(a.path)
+      if (m) rootCounts.set(m[1], (rootCounts.get(m[1]) ?? 0) + 1)
+    }
+    let bestRoot = ''
+    let bestN = 0
+    rootCounts.forEach((n, root) => {
+      if (n > bestN) {
+        bestN = n
+        bestRoot = root
+      }
+    })
+    // If half or more of the addresses share a root, use it as the
+    // template's OSC base + display name. Otherwise leave the base
+    // empty (each function's path stays absolute) and name by IP.
+    const useRoot = bestN > 0 && bestN >= Math.ceil(dev.addresses.length / 2)
+    const tplName = useRoot ? bestRoot : `OSC ${dev.ip}`
+    const oscBase = useRoot ? `/${bestRoot}` : ''
+    // Escape regex metacharacters in the discovered root before
+    // injecting into RegExp — OSC addresses can legitimately contain
+    // dots, parens, plus, etc., and an unescaped `/foo.bar/baz`
+    // would otherwise match `/fooXbar/baz`.
+    const escapedBest = bestRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    // Build one InstrumentFunction per observed address. Strip the
+    // shared root from each path when we adopt it as the base, so
+    // /octocosme/vol becomes function path "vol" under base "/octocosme".
+    const functions: InstrumentFunction[] = dev.addresses.map((addr, i) => {
+      const paramType = inferParamTypeFromArgTypes(addr.argTypes)
+      let oscPath = addr.path
+      if (useRoot) {
+        const stripped = oscPath.replace(new RegExp(`^/?${escapedBest}/?`), '')
+        // If stripping leaves nothing (root address itself), keep the
+        // last segment as the param name; otherwise use the stripped
+        // remainder.
+        oscPath = stripped || bestRoot
+      } else if (oscPath.startsWith('/')) {
+        oscPath = oscPath.slice(1)
+      }
+      // Friendly name = last path segment, title-cased.
+      const last = oscPath.split('/').filter(Boolean).pop() ?? `param${i + 1}`
+      const name = last
+        .replace(/[-_]+/g, ' ')
+        .replace(/\b\w/g, (c) => c.toUpperCase())
+      // Multi-arg paramTypes (v2/v3/v4/colour) need an argSpec so the
+      // cell editor's split-input strip can render one input per slot.
+      // Without this, a v3 RGB clip would show only a single combined
+      // input and the user couldn't edit individual channels. We
+      // derive slot names from canonical conventions (x/y for v2,
+      // x/y/z for v3, x/y/z/w for v4, r/g/b/a for colour) and pick a
+      // sensible default min/max range.
+      const argSpec = buildArgSpecForParamType(paramType, addr.argTypes)
+      const isBool = paramType === 'bool'
+      const fn: InstrumentFunction = {
+        id: `fn_net_${Math.random().toString(36).slice(2, 9)}`,
+        name,
+        oscPath,
+        paramType,
+        nature: 'lin',
+        streamMode: 'streaming',
+        min: isBool ? 0 : 0,
+        max: isBool ? 1 : 1,
+        init: 0
+      }
+      if (argSpec) fn.argSpec = argSpec
+      return fn
+    })
+    // Ensure at least one function — if the device emitted bundles only
+    // (no top-level messages) we'd have an empty list. Fall back to a
+    // single placeholder param the user can rename.
+    if (functions.length === 0) {
+      functions.push({
+        id: `fn_net_${Math.random().toString(36).slice(2, 9)}`,
+        name: 'Parameter 1',
+        oscPath: 'param1',
+        paramType: 'float',
+        nature: 'lin',
+        streamMode: 'streaming',
+        min: 0,
+        max: 1,
+        init: 0
+      })
+    }
+    const newId = `tpl_user_${Math.random().toString(36).slice(2, 9)}`
+    const tpl: InstrumentTemplate = {
+      id: newId,
+      name: tplName,
+      description: `Auto-discovered ${dev.ip}:${dev.port} — ${dev.addresses.length} address${
+        dev.addresses.length === 1 ? '' : 'es'
+      } observed.`,
+      // Match the device's actual sender as the destination IP. The
+      // sender's source port is rarely also its inbox, so default the
+      // destination port to 9000 (common OSC inbox) — the user can
+      // override on the template if their device listens elsewhere.
+      color: pickAutoColor(newId),
+      destIp: dev.ip,
+      destPort: 9000,
+      oscAddressBase: oscBase,
+      voices: 1,
+      builtin: false,
+      functions
+    }
+    set((st) => ({
+      session: {
+        ...st.session,
+        pool: { ...st.session.pool, templates: [...st.session.pool.templates, tpl] }
+      },
+      poolSelection: { kind: 'template', templateId: newId }
+    }))
+    return newId
+  },
+
   setEngineState: (s) => set({ engine: s })
 }))
+
+// Build an `argSpec` array for a multi-arg paramType derived from a
+// Network-discovered device. Single-arg types (bool/int/float/string)
+// don't need an argSpec — the cell editor renders a single input from
+// the function's top-level min/max/init. Multi-arg types do: each
+// slot becomes one labelled input in the cell editor's split strip.
+function buildArgSpecForParamType(
+  paramType: import('@shared/types').FunctionParamType,
+  argTypes: string[]
+): import('@shared/types').ParamArgSpec[] | null {
+  // Map a discovered OSC type tag to the argSpec's `type` enum.
+  // Anything we can't classify falls to 'float' — matches the
+  // paramType inference helper's convention.
+  function tag2type(t: string): 'float' | 'int' | 'bool' | 'string' {
+    if (t === 'T' || t === 'F') return 'bool'
+    if (t === 'i') return 'int'
+    if (t === 's') return 'string'
+    return 'float'
+  }
+  // Canonical slot names per vector kind. 'v2' → x/y, 'v3' → x/y/z,
+  // 'v4' → x/y/z/w, 'colour' → r/g/b/a (or r/g/b for 3-arg colour,
+  // though the paramType union doesn't distinguish).
+  let names: string[] | null = null
+  let defaultMax = 1
+  switch (paramType) {
+    case 'v2':
+      names = ['x', 'y']
+      break
+    case 'v3':
+      names = ['x', 'y', 'z']
+      break
+    case 'v4':
+      names = ['x', 'y', 'z', 'w']
+      break
+    case 'colour':
+      // Most OSC colour senders emit 4 bytes (RGBA) in 0..255. We
+      // default max=255; the user can clamp later from the inspector.
+      names = ['r', 'g', 'b', 'a']
+      defaultMax = 255
+      break
+    default:
+      return null
+  }
+  return names.map((name, i) => ({
+    name,
+    type: tag2type(argTypes[i] ?? 'f'),
+    min: 0,
+    max: defaultMax,
+    init: 0
+  }))
+}
+
+// Deterministic colour per template id — keeps the sidebar tint stable
+// across drag-from-network actions instead of strobing on every re-add.
+function pickAutoColor(seed: string): string {
+  // Tiny hash → hue. Saturation + lightness fixed for a coherent
+  // palette; matches the vibe of randomSceneColor() without pulling
+  // it in (and without the side-effect of randomness in tests).
+  let h = 0
+  for (let i = 0; i < seed.length; i++) {
+    h = (h * 31 + seed.charCodeAt(i)) >>> 0
+  }
+  const hue = h % 360
+  return hslToHex(hue, 62, 56)
+}
+
+function hslToHex(h: number, s: number, l: number): string {
+  s /= 100
+  l /= 100
+  const k = (n: number): number => (n + h / 30) % 12
+  const a = s * Math.min(l, 1 - l)
+  const f = (n: number): number =>
+    l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)))
+  const r = Math.round(f(0) * 255)
+  const g = Math.round(f(8) * 255)
+  const b = Math.round(f(4) * 255)
+  const hex = (v: number): string => v.toString(16).padStart(2, '0')
+  return `#${hex(r)}${hex(g)}${hex(b)}`
+}
 
 // Persist clipTemplates whenever they change. Referential check skips writes
 // from unrelated state updates (engine ticks etc) — the templates array is
@@ -2374,52 +2650,10 @@ function propagateDefaults(s: Session): Session {
             // through, but if the saved file has a malformed binding it'd
             // crash midi.ts. Normalizing here is cheap and safe.
             midiTrigger: sanitizeMidiBinding(c.midiTrigger),
-            // Soft-migrate sequencer for sessions saved before this feature existed.
-            sequencer: c.sequencer
-              ? {
-                  ...c.sequencer,
-                  // Legacy 'sync' value used the per-clip bpm slider — that's
-                  // now 'tempo'. Preserve old behavior for existing sessions.
-                  syncMode:
-                    (c.sequencer.syncMode as string) === 'sync'
-                      ? 'tempo'
-                      : c.sequencer.syncMode,
-                  stepValues: [...c.sequencer.stepValues],
-                  // Euclidean fields — new in this build. Older sessions
-                  // default to classic 'steps' mode with sensible pulses /
-                  // rotation (factory default tresillo 3-over-8).
-                  mode:
-                    (c.sequencer as Partial<typeof DEFAULT_SEQUENCER>).mode === 'euclidean'
-                      ? 'euclidean'
-                      : 'steps',
-                  pulses:
-                    typeof (c.sequencer as Partial<typeof DEFAULT_SEQUENCER>).pulses === 'number'
-                      ? Math.max(
-                          0,
-                          Math.min(
-                            16,
-                            Math.floor(
-                              (c.sequencer as Partial<typeof DEFAULT_SEQUENCER>).pulses as number
-                            )
-                          )
-                        )
-                      : DEFAULT_SEQUENCER.pulses,
-                  rotation:
-                    typeof (c.sequencer as Partial<typeof DEFAULT_SEQUENCER>).rotation ===
-                    'number'
-                      ? Math.max(
-                          0,
-                          Math.min(
-                            15,
-                            Math.floor(
-                              (c.sequencer as Partial<typeof DEFAULT_SEQUENCER>)
-                                .rotation as number
-                            )
-                          )
-                        )
-                      : DEFAULT_SEQUENCER.rotation
-                }
-              : { ...DEFAULT_SEQUENCER, stepValues: [...DEFAULT_SEQUENCER.stepValues] },
+            // Soft-migrate sequencer for sessions saved before any of the
+            // per-mode fields existed. Centralised in a helper to keep
+            // adding new modes from blowing up this block.
+            sequencer: migrateSequencer(c.sequencer),
             scaleToUnit: typeof c.scaleToUnit === 'boolean' ? c.scaleToUnit : false,
             // Migrate modulation fields — older sessions lack type/mode/sync/etc.
             modulation: {
@@ -2466,7 +2700,12 @@ function propagateDefaults(s: Session): Session {
                 totalMs:
                   typeof (m?.ramp as Partial<typeof DEFAULT_RAMP> | undefined)?.totalMs === 'number'
                     ? (m!.ramp as RampParams).totalMs
-                    : DEFAULT_RAMP.totalMs
+                    : DEFAULT_RAMP.totalMs,
+                mode: (() => {
+                  const raw = (m?.ramp as Partial<typeof DEFAULT_RAMP> | undefined)
+                    ?.mode
+                  return raw === 'inverted' || raw === 'loop' ? raw : 'normal'
+                })()
               },
               arpeggiator: {
                 steps: (m?.arpeggiator as Partial<typeof DEFAULT_ARPEGGIATOR> | undefined)?.steps ?? DEFAULT_ARPEGGIATOR.steps,
@@ -2562,6 +2801,134 @@ function backfillTrackArgSpecsFromPool(s: Session): Session {
     return { ...t, argSpec: fn.argSpec.map((a) => ({ ...a })) }
   })
   return { ...s, tracks: tracksUpdated }
+}
+
+// Soft-migrate a saved sequencer block. Old sessions only carried steps
+// + euclidean fields; this builds the full DEFAULT_SEQUENCER shape with
+// each persisted field overlaid, clamped, and validated. Centralising
+// keeps propagateDefaults from ballooning every time a new mode lands.
+function migrateSequencer(raw: unknown): SequencerParams {
+  const base: SequencerParams = {
+    ...DEFAULT_SEQUENCER,
+    stepValues: [...DEFAULT_SEQUENCER.stepValues]
+  }
+  if (!raw || typeof raw !== 'object') return base
+  const r = raw as Partial<SequencerParams> & Record<string, unknown>
+
+  const num = (v: unknown, def: number, lo: number, hi: number, integer = false): number => {
+    if (typeof v !== 'number' || !Number.isFinite(v)) return def
+    const x = integer ? Math.floor(v) : v
+    return Math.max(lo, Math.min(hi, x))
+  }
+
+  // Legacy 'sync' value used the per-clip bpm slider — now 'tempo'.
+  const syncMode: SeqSyncMode =
+    (r.syncMode as string) === 'sync'
+      ? 'tempo'
+      : r.syncMode === 'free' || r.syncMode === 'tempo' || r.syncMode === 'bpm'
+        ? r.syncMode
+        : base.syncMode
+
+  // Mode dispatch — be permissive on input but always emit a valid value.
+  const VALID_MODES: SeqMode[] = [
+    'steps',
+    'euclidean',
+    'polyrhythm',
+    'density',
+    'cellular',
+    'drift',
+    'ratchet',
+    'bounce',
+    'draw'
+  ]
+  const mode: SeqMode =
+    typeof r.mode === 'string' && (VALID_MODES as string[]).includes(r.mode)
+      ? (r.mode as SeqMode)
+      : base.mode
+
+  const combine: 'or' | 'xor' | 'and' =
+    r.combine === 'xor' || r.combine === 'and' ? r.combine : 'or'
+  const edge: 'wrap' | 'reflect' = r.edge === 'reflect' ? 'reflect' : 'wrap'
+
+  const stepValues = Array.isArray(r.stepValues)
+    ? r.stepValues.slice(0, 16).map((v) => (typeof v === 'string' ? v : String(v ?? '')))
+    : [...base.stepValues]
+  // Pad to 16 so engine indexing never goes off the end.
+  while (stepValues.length < 16) stepValues.push('')
+
+  return {
+    enabled: !!r.enabled,
+    steps: num(r.steps, base.steps, 1, 16, true),
+    syncMode,
+    // Allow up to 1024 in storage — Draw mode caps higher than other
+    // sequencer modes. The UI clamps per-mode.
+    bpm: num(r.bpm, base.bpm, 10, 1024, true),
+    stepMs: num(r.stepMs, base.stepMs, 1, 60000, true),
+    stepValues,
+    mode,
+    pulses: num(r.pulses, base.pulses, 0, 16, true),
+    rotation: num(r.rotation, base.rotation, 0, 15, true),
+    ringALength: num(r.ringALength, base.ringALength, 1, 16, true),
+    ringBLength: num(r.ringBLength, base.ringBLength, 1, 16, true),
+    combine,
+    density: num(r.density, base.density, 0, 100),
+    seed: num(r.seed, base.seed, 0, 255, true),
+    rule: num(r.rule, base.rule, 0, 255, true),
+    cellSeed: num(r.cellSeed, base.cellSeed, 0, 65535, true),
+    bias: num(r.bias, base.bias, -100, 100),
+    edge,
+    ratchetProb: num(r.ratchetProb, base.ratchetProb, 0, 100),
+    ratchetMaxDiv: num(r.ratchetMaxDiv, base.ratchetMaxDiv, 2, 16, true),
+    ratchetVariation: num(r.ratchetVariation, base.ratchetVariation, 0, 100),
+    ratchetMode:
+      r.ratchetMode === 'ramp' ||
+      r.ratchetMode === 'random' ||
+      r.ratchetMode === 'inverse' ||
+      r.ratchetMode === 'pingpong' ||
+      r.ratchetMode === 'echo' ||
+      r.ratchetMode === 'trill'
+        ? r.ratchetMode
+        : 'octaves',
+    cellularSeedLfoDepth: num(
+      r.cellularSeedLfoDepth,
+      base.cellularSeedLfoDepth,
+      0,
+      100
+    ),
+    cellularSeedLfoRate: num(
+      r.cellularSeedLfoRate,
+      base.cellularSeedLfoRate,
+      0.01,
+      10
+    ),
+    bounceDecay: num(r.bounceDecay, base.bounceDecay, 0, 100),
+    generative: !!r.generative,
+    genAmount: num(r.genAmount, base.genAmount, 0, 100),
+    restBehaviour: r.restBehaviour === 'hold' ? 'hold' : 'last',
+    drawSteps: num(r.drawSteps, base.drawSteps, 4, 1024, true),
+    drawValues: (() => {
+      if (Array.isArray(r.drawValues)) {
+        const vs = r.drawValues
+          .slice(0, 1024)
+          .map((v) =>
+            typeof v === 'number' && Number.isFinite(v)
+              ? Math.max(0, Math.min(1, v))
+              : 0
+          )
+        while (vs.length < 1024) vs.push(0)
+        return vs
+      }
+      return [...base.drawValues]
+    })(),
+    drawValueMin:
+      typeof r.drawValueMin === 'number' && Number.isFinite(r.drawValueMin)
+        ? r.drawValueMin
+        : base.drawValueMin,
+    drawValueMax:
+      typeof r.drawValueMax === 'number' && Number.isFinite(r.drawValueMax)
+        ? r.drawValueMax
+        : base.drawValueMax
+  }
 }
 
 // Shared defensive cleanup for MIDI bindings on Tracks, Scenes, and Cells.

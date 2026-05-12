@@ -12,9 +12,10 @@
 // drawer can provide). Drafts (auto-created backing Templates behind
 // "Add Instrument" sidebar rows) are hidden until "Save as Template".
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
 import type {
+  DiscoveredOscDevice,
   InstrumentFunction,
   InstrumentTemplate,
   ParameterTemplate
@@ -42,19 +43,45 @@ export interface PoolParameterDragPayload {
 // Persisted Pool tab + pop-out flag are local UI — they don't belong in
 // the session file. localStorage is enough.
 //
-// Two tabs after the simplification: Built-in (everything shipped) and
-// User (everything authored — Instruments AND Parameter blueprints
-// rendered as two labelled sections in the same scrollable list).
-const POOL_TAB_KEY = 'dataflou:poolTab:v2'
-type PoolTab = 'builtin' | 'user'
+// Three tabs: Built-in (everything shipped), User (everything authored —
+// Instruments AND Parameter blueprints rendered as two labelled
+// sections), and Network (auto-discovered OSC senders on the local
+// network — drag onto the sidebar to materialise as a Pool template).
+//
+// Bumped the storage key (poolTab:v3) when adding "network" so a stale
+// localStorage value can't poison the union. Old keys parse to 'user'.
+const POOL_TAB_KEY = 'dataflou:poolTab:v3'
+type PoolTab = 'builtin' | 'user' | 'network'
 function loadPoolTab(): PoolTab {
   try {
     const v = typeof localStorage !== 'undefined' ? localStorage.getItem(POOL_TAB_KEY) : null
-    if (v === 'builtin' || v === 'user') return v
+    if (v === 'builtin' || v === 'user' || v === 'network') return v
   } catch {
     /* ignore */
   }
   return 'user'
+}
+
+// Listening-port for the network discovery UDP socket. Persisted so the
+// user's choice (e.g. 8000 if 9000 conflicts) survives app restarts.
+const NETWORK_PORT_KEY = 'dataflou:networkPort:v1'
+function loadNetworkPort(): number {
+  try {
+    const raw =
+      typeof localStorage !== 'undefined' ? localStorage.getItem(NETWORK_PORT_KEY) : null
+    const n = raw == null ? NaN : parseInt(raw, 10)
+    if (Number.isFinite(n) && n >= 1 && n <= 65535) return n
+  } catch {
+    /* ignore */
+  }
+  return 9000
+}
+function saveNetworkPort(p: number): void {
+  try {
+    localStorage.setItem(NETWORK_PORT_KEY, String(p))
+  } catch {
+    /* ignore */
+  }
 }
 
 export default function PoolPane({
@@ -91,9 +118,13 @@ export default function PoolPane({
   const addParameter = useStore((s) => s.addParameter)
   const duplicateParameter = useStore((s) => s.duplicateParameter)
   const removeParameter = useStore((s) => s.removeParameter)
+  // Network discovery state — devices + listener status pushed from main.
+  const networkDevices = useStore((s) => s.networkDevices)
+  const networkStatus = useStore((s) => s.networkStatus)
+  const setNetworkSnapshot = useStore((s) => s.setNetworkSnapshot)
 
-  // Which view: built-in / user templates / parameters. Persisted so
-  // the user's filter choice carries across drawer toggles.
+  // Which view: built-in / user / network. Persisted so the user's
+  // filter choice carries across drawer toggles.
   const [tab, setTabState] = useState<PoolTab>(loadPoolTab)
   function setTab(t: PoolTab): void {
     setTabState(t)
@@ -104,20 +135,35 @@ export default function PoolPane({
     }
   }
 
+  // Subscribe to main-process network device pushes whenever the
+  // Pool pane is mounted. Cheap (~250ms cadence, only when devices
+  // change), and unsubscribes cleanly on unmount so re-mounting the
+  // Pool drawer doesn't double-bind handlers.
+  // Network listener subscription lives in App.tsx now — keeping it
+  // at app-level means the title-bar status dot can reflect live bind
+  // errors even when the Pool drawer is collapsed. This component
+  // just reads the resulting Zustand state.
+  // (The previous subscription in this effect leaked tear-down on
+  // every PoolPane mount/unmount and stopped updating the dot when
+  // the user hid the drawer.)
+
   // Drafts back the live "Add Instrument" sidebar rows; keep them out
   // of the Pool browser until the user explicitly Saves-as-Template.
-  // Filter the currently visible items based on the tab.
+  // Filter the currently visible items based on the tab. Network tab
+  // doesn't show templates/parameters — it renders its own list below.
   let visibleTemplates: InstrumentTemplate[] = []
   let visibleParameters: ParameterTemplate[] = []
   if (tab === 'builtin') {
     visibleTemplates = allTemplates.filter((t) => !t.draft && t.builtin)
     visibleParameters = allParameters.filter((p) => p.builtin)
-  } else {
+  } else if (tab === 'user') {
     // User tab — both user Instruments and user Parameter blueprints
     // share the same scrollable list, separated by section headers.
     visibleTemplates = allTemplates.filter((t) => !t.draft && !t.builtin)
     visibleParameters = allParameters.filter((p) => !p.builtin)
   }
+  // tab === 'network' → templates/parameters stay empty; NetworkTab
+  // handles the rendering itself.
 
   // Per-template expand/collapse — local UI state, not persisted. By
   // default everything is COLLAPSED; you click the chevron to peek
@@ -143,41 +189,64 @@ export default function PoolPane({
           modal that's easier to scan when the library grows. */}
       <div
         {...titleBarHandlers}
-        className="flex items-center gap-2 px-2 py-1 border-b border-border shrink-0 cursor-default select-none"
+        // `flex-nowrap` + `whitespace-nowrap` on every child guarantees
+        // the title bar stays single-line at the User tab's wider
+        // trailing cluster (+ Instrument / + Parameter / ⤢ / Hide) —
+        // without it "Built-in" wrapped onto two rows. Right-side
+        // buttons use the compact `text-[9px]` + `px-1` sizing so all
+        // four can sit next to the tabs even at narrow drawer widths.
+        className="flex items-center gap-1.5 px-2 py-1 border-b border-border shrink-0 cursor-default select-none flex-nowrap"
         onDoubleClick={() => onTogglePopOut?.()}
         title={poppedOut ? 'Drag to move · Double-click to dock' : 'Double-click to pop out'}
         style={{ touchAction: titleBarHandlers ? 'none' : undefined, ...titleBarHandlers?.style }}
       >
-        <span className="label">Pool</span>
-        <div className="flex items-center gap-0.5">
+        <span className="label shrink-0">Pool</span>
+        <div className="flex items-center gap-0.5 shrink-0">
           <FilterTab label="Built-in" active={tab === 'builtin'} onClick={() => setTab('builtin')} />
           <FilterTab label="User" active={tab === 'user'} onClick={() => setTab('user')} />
+          <FilterTab
+            label="Network"
+            active={tab === 'network'}
+            onClick={() => setTab('network')}
+            // Tiny green dot when the passive listener is bound — same
+            // visual language as the OSC monitor's "wire alive" cue.
+            dot={networkStatus.enabled ? 'on' : networkStatus.lastError ? 'err' : 'off'}
+          />
         </div>
-        <span className="text-muted text-[10px]">
-          {visibleTemplates.length}I · {visibleParameters.length}P
-        </span>
-        <div className="flex-1" />
+        {tab === 'network' ? (
+          <span
+            className="text-muted text-[10px] shrink-0 whitespace-nowrap"
+            title="Discovered OSC senders"
+          >
+            {networkDevices.length}D
+          </span>
+        ) : (
+          <span className="text-muted text-[10px] shrink-0 whitespace-nowrap">
+            {visibleTemplates.length}I · {visibleParameters.length}P
+          </span>
+        )}
+        <div className="flex-1 min-w-0" />
         {tab === 'user' && (
           <>
             <button
-              className="btn text-[10px] py-0 px-1.5 leading-tight"
+              className="btn text-[9px] py-0 px-1 leading-tight shrink-0 whitespace-nowrap"
               onClick={() => addTemplate()}
               title="Create a new empty Instrument"
             >
-              + Instrument
+              + Instr
             </button>
             <button
-              className="btn text-[10px] py-0 px-1.5 leading-tight"
+              className="btn text-[9px] py-0 px-1 leading-tight shrink-0 whitespace-nowrap"
               onClick={() => addParameter()}
               title="Create a new Parameter blueprint"
             >
-              + Parameter
+              + Param
             </button>
           </>
         )}
         {onTogglePopOut && (
           <button
-            className="btn text-[10px] py-0 px-1.5 leading-tight shrink-0"
+            className="btn text-[9px] py-0 px-1 leading-tight shrink-0"
             onClick={onTogglePopOut}
             title={poppedOut ? 'Dock back into the drawer' : 'Pop out to a centered window'}
           >
@@ -186,7 +255,7 @@ export default function PoolPane({
         )}
         {onHide && (
           <button
-            className="btn text-[10px] py-0 px-1.5 leading-tight shrink-0"
+            className="btn text-[9px] py-0 px-1 leading-tight shrink-0"
             onClick={onHide}
             title="Hide the Pool (P to toggle)"
           >
@@ -195,31 +264,35 @@ export default function PoolPane({
         )}
       </div>
 
-      {/* Body — scrollable list. Both tabs render the same two-section
-          structure: an Instruments section (Templates) on top, then a
-          Parameters section. Empty sections render nothing. */}
+      {/* Body — scrollable list. Built-in / User tabs render the
+          two-section structure (Instruments + Parameters). Network tab
+          renders its own status header + device list. */}
       <div className="flex-1 min-h-0 overflow-y-auto py-1">
-        <SectionedList
-          mode={tab}
-          templates={visibleTemplates}
-          params={visibleParameters}
-          expanded={expanded}
-          onToggleExpand={toggleExpand}
-          selection={selection}
-          onSelect={(sel) => setSelection(sel)}
-          onAddFunction={(tplId) => addFunction(tplId)}
-          onRemoveTemplate={(tplId, name) => {
-            if (confirm(`Delete instrument "${name}"?`)) removeTemplate(tplId)
-          }}
-          onRemoveFunction={(tplId, fnId, fnName) => {
-            if (confirm(`Delete parameter "${fnName}"?`)) removeFunction(tplId, fnId)
-          }}
-          onDuplicateTemplate={(id) => duplicateTemplate(id)}
-          onDuplicateParam={(id) => duplicateParameter(id)}
-          onRemoveParam={(id, name) => {
-            if (confirm(`Delete parameter "${name}"?`)) removeParameter(id)
-          }}
-        />
+        {tab === 'network' ? (
+          <NetworkTab devices={networkDevices} />
+        ) : (
+          <SectionedList
+            mode={tab}
+            templates={visibleTemplates}
+            params={visibleParameters}
+            expanded={expanded}
+            onToggleExpand={toggleExpand}
+            selection={selection}
+            onSelect={(sel) => setSelection(sel)}
+            onAddFunction={(tplId) => addFunction(tplId)}
+            onRemoveTemplate={(tplId, name) => {
+              if (confirm(`Delete instrument "${name}"?`)) removeTemplate(tplId)
+            }}
+            onRemoveFunction={(tplId, fnId, fnName) => {
+              if (confirm(`Delete parameter "${fnName}"?`)) removeFunction(tplId, fnId)
+            }}
+            onDuplicateTemplate={(id) => duplicateTemplate(id)}
+            onDuplicateParam={(id) => duplicateParameter(id)}
+            onRemoveParam={(id, name) => {
+              if (confirm(`Delete parameter "${name}"?`)) removeParameter(id)
+            }}
+          />
+        )}
       </div>
     </div>
   )
@@ -228,15 +301,24 @@ export default function PoolPane({
 function FilterTab({
   label,
   active,
-  onClick
+  onClick,
+  dot
 }: {
   label: string
   active: boolean
   onClick: () => void
+  // Optional status dot — used by the Network tab to indicate whether
+  // the passive UDP listener is bound. 'on' = green, 'err' = red,
+  // 'off' = no dot.
+  dot?: 'on' | 'off' | 'err'
 }): JSX.Element {
   return (
     <button
-      className={`text-[10px] px-1.5 py-0 leading-tight rounded border ${
+      // `whitespace-nowrap` is the critical bit — without it the
+      // "Built-in" label wraps onto two rows once the User-tab's
+      // trailing cluster (+ Instr / + Param / ⤢ / Hide) takes its
+      // share of the title-bar width.
+      className={`text-[10px] px-1.5 py-0 leading-tight rounded border inline-flex items-center gap-1 whitespace-nowrap shrink-0 ${
         active
           ? 'bg-accent text-black border-accent'
           : 'border-border text-muted hover:text-text'
@@ -244,6 +326,18 @@ function FilterTab({
       onClick={onClick}
     >
       {label}
+      {dot === 'on' && (
+        <span
+          className="inline-block w-1.5 h-1.5 rounded-full"
+          style={{ background: 'rgb(var(--c-success))' }}
+        />
+      )}
+      {dot === 'err' && (
+        <span
+          className="inline-block w-1.5 h-1.5 rounded-full"
+          style={{ background: 'rgb(var(--c-danger))' }}
+        />
+      )}
     </button>
   )
 }
@@ -617,4 +711,370 @@ function ParameterRow({
       )}
     </div>
   )
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Network tab — passive OSC discovery. Shows the listener status +
+// every (ip:port) we've ever seen a packet from since enabling.
+// Drag a device onto the Edit sidebar → materialised as a user
+// Instrument with one Parameter per observed OSC address.
+// ─────────────────────────────────────────────────────────────────────
+
+function NetworkTab({ devices }: { devices: DiscoveredOscDevice[] }): JSX.Element {
+  const status = useStore((s) => s.networkStatus)
+  const setNetworkSnapshot = useStore((s) => s.setNetworkSnapshot)
+  const materialise = useStore((s) => s.materialiseNetworkDevice)
+  // Port input is local (mirrored from localStorage on mount and from
+  // the listener's actual port via status pushes). We don't bind it
+  // directly to status.port because the user edits it free-form before
+  // hitting "Apply".
+  const [portInput, setPortInput] = useState<number>(() =>
+    status.port || loadNetworkPort()
+  )
+  // Track whether the port input is currently focused so external
+  // status pushes don't overwrite the user's in-progress typing. The
+  // ref is updated synchronously by the input's focus / blur handlers.
+  const portInputFocused = useRef(false)
+  // Pending-rebind spinner — set true between dispatch and the next
+  // status update so the user can tell the listener is restarting.
+  const [busy, setBusy] = useState(false)
+  // Track which devices are expanded (show address list). Default
+  // collapsed so the list stays scannable; one click expands.
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
+  function toggleExpand(id: string): void {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+  // Tick at 1Hz so the "last seen" age labels refresh between
+  // network pushes. Without this the row would read "5s" frozen
+  // until the next device-map change forces a re-render.
+  const [, ageTick] = useState(0)
+  useEffect(() => {
+    const id = setInterval(() => ageTick((n) => n + 1), 1000)
+    return () => clearInterval(id)
+  }, [])
+
+  // Keep the port input synced when status pushes change the bound
+  // port (e.g. another tab applied a different port, or the user re-
+  // enabled the listener and we picked up the persisted port from
+  // main). Skip the sync while the user is actively focused on the
+  // input — otherwise typing "9001" right when a status push arrives
+  // for the same port snaps the field mid-edit.
+  useEffect(() => {
+    if (portInputFocused.current) return
+    if (status.port && status.port !== portInput) setPortInput(status.port)
+    // We don't include portInput in the deps — we only want to react
+    // to external port changes, not to the user's own typing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status.port])
+
+  async function applyToggle(): Promise<void> {
+    setBusy(true)
+    try {
+      const next = await window.api?.networkSetEnabled?.(
+        !status.enabled,
+        portInput
+      )
+      if (next) {
+        // Push the post-action status into the store so the dot + port
+        // display stay in sync without waiting for the next periodic
+        // push (which won't fire if no devices changed).
+        setNetworkSnapshot(devices, next)
+        if (next.port !== portInput) setPortInput(next.port)
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+  async function applyPort(): Promise<void> {
+    if (!Number.isFinite(portInput) || portInput < 1 || portInput > 65535) return
+    saveNetworkPort(portInput)
+    setBusy(true)
+    try {
+      // Re-bind on the new port. Pass current enabled state so we
+      // stay on if already listening, or stay off if we weren't.
+      const next = await window.api?.networkSetEnabled?.(
+        status.enabled,
+        portInput
+      )
+      if (next) setNetworkSnapshot(devices, next)
+    } finally {
+      setBusy(false)
+    }
+  }
+  async function clearAll(): Promise<void> {
+    await window.api?.networkClear?.()
+    // The clear handler pushes an empty snapshot immediately, so no
+    // local state mutation needed — the store update will re-render us.
+  }
+
+  return (
+    <div className="flex flex-col">
+      {/* Status header — toggle, port input, "send to" hint. */}
+      <div className="px-2 pt-1 pb-2 border-b border-border/60 flex flex-col gap-1">
+        <div className="flex items-center gap-1">
+          <button
+            className={`text-[10px] px-2 py-0 leading-tight rounded border ${
+              status.enabled
+                ? 'bg-accent text-black border-accent'
+                : 'border-border text-muted hover:text-text'
+            }`}
+            disabled={busy}
+            onClick={applyToggle}
+            title={
+              status.enabled
+                ? 'Stop listening for OSC packets'
+                : 'Bind a UDP port and watch for incoming OSC senders'
+            }
+          >
+            {status.enabled ? 'Listening' : 'Listen'}
+          </button>
+          <span className="text-[10px] text-muted">on port</span>
+          <input
+            type="number"
+            min={1}
+            max={65535}
+            className="bg-panel2 border border-border rounded text-[10px] px-1 py-0 w-[58px] leading-tight"
+            // Render empty when the cleared field would otherwise show
+            // "0". The actual numeric port stays at the last valid
+            // value in state so `applyPort` doesn't try to bind on 0.
+            value={portInput > 0 ? portInput : ''}
+            onChange={(e) => {
+              // Keep portInput at the last valid value if the user
+              // clears the field — display goes empty but the bind
+              // target doesn't flip to 0. Re-parse on every keystroke.
+              const parsed = parseInt(e.target.value, 10)
+              if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 65535) {
+                setPortInput(parsed)
+              } else if (e.target.value === '') {
+                // Sentinel value 0 → renders as empty (above) but
+                // applyPort() rejects (below).
+                setPortInput(0)
+              }
+            }}
+            onFocus={() => {
+              portInputFocused.current = true
+            }}
+            onBlur={() => {
+              portInputFocused.current = false
+              if (portInput >= 1 && portInput !== status.port) applyPort()
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur()
+            }}
+          />
+          <div className="flex-1" />
+          <button
+            className="btn text-[10px] py-0 px-1.5 leading-tight"
+            onClick={clearAll}
+            disabled={devices.length === 0}
+            title="Forget every discovered device — useful after moving networks"
+          >
+            Clear
+          </button>
+        </div>
+        {/* Local-IP hint — tells the user where to point their device. */}
+        {status.enabled && status.localAddresses.length > 0 && (
+          <div className="text-[9px] text-muted leading-snug">
+            Tell your OSC sender to target{' '}
+            <span className="font-mono text-text">
+              {status.localAddresses.join(' or ')}
+              {':'}
+              {status.port}
+            </span>
+          </div>
+        )}
+        {!!status.lastError && (
+          <div
+            className="text-[9px] leading-snug"
+            style={{ color: 'rgb(var(--c-danger))' }}
+            title={status.lastError}
+          >
+            Bind error: {status.lastError}
+          </div>
+        )}
+        {!status.enabled && !status.lastError && (
+          <div className="text-[9px] text-muted leading-snug">
+            Passive discovery — click Listen to start watching for OSC
+            senders on this machine&apos;s LAN.
+          </div>
+        )}
+      </div>
+
+      {/* Device list — one row per (ip:port), expandable to show
+          observed addresses. Drag onto the Edit sidebar to materialise
+          as a user Instrument Template. */}
+      {devices.length === 0 ? (
+        <div className="p-3 text-muted text-[11px]">
+          {status.enabled
+            ? 'Waiting for OSC packets…'
+            : 'Enable Listen to start discovering senders.'}
+        </div>
+      ) : (
+        <>
+          <div className="px-2 pt-2 pb-0.5 text-[9px] uppercase tracking-wide text-muted">
+            Discovered
+          </div>
+          {devices.map((d) => (
+            <NetworkDeviceRow
+              key={d.id}
+              device={d}
+              expanded={expanded.has(d.id)}
+              onToggleExpand={() => toggleExpand(d.id)}
+              onMaterialiseForDrag={() => materialise(d.id)}
+              // Drag-cancel cleanup — used by the row's onDragEnd
+              // handler to remove the just-materialised template when
+              // the drop didn't land on a valid target.
+              onCancelMaterialise={(tplId) => useStore.getState().removeTemplate(tplId)}
+            />
+          ))}
+        </>
+      )}
+    </div>
+  )
+}
+
+function NetworkDeviceRow({
+  device,
+  expanded,
+  onToggleExpand,
+  onMaterialiseForDrag,
+  onCancelMaterialise
+}: {
+  device: DiscoveredOscDevice
+  expanded: boolean
+  onToggleExpand: () => void
+  // Synchronously creates an InstrumentTemplate in the Pool from this
+  // device and returns the new template id, ready to embed in the
+  // existing POOL_TEMPLATE_DRAG_MIME drag payload. Drag-start calls
+  // this so the drop target (Edit sidebar) sees a real template id.
+  onMaterialiseForDrag: () => string | null
+  // Drag-cancel cleanup. Without this, every aborted drag (Esc, drop
+  // outside any handler, dropped onto a non-accepting zone) would
+  // leave the just-materialised template stranded in the Pool. We
+  // call this on dragend when dataTransfer.dropEffect === 'none'.
+  onCancelMaterialise: (tplId: string) => void
+}): JSX.Element {
+  // Track the id committed at drag-start so onDragEnd can roll back
+  // if the drop didn't take. Using a ref instead of state keeps the
+  // value stable across React renders that happen between dragstart
+  // and dragend.
+  const materialisedIdRef = useRef<string | null>(null)
+  function onDragStart(e: React.DragEvent): void {
+    // Materialise into the Pool right now so the drop target can
+    // treat us as a normal POOL_TEMPLATE_DRAG_MIME source. Zustand's
+    // set() is synchronous so the new template is visible immediately.
+    const newId = onMaterialiseForDrag()
+    if (!newId) {
+      e.preventDefault()
+      return
+    }
+    materialisedIdRef.current = newId
+    const payload: PoolTemplateDragPayload = { templateId: newId }
+    e.dataTransfer.setData(POOL_TEMPLATE_DRAG_MIME, JSON.stringify(payload))
+    e.dataTransfer.effectAllowed = 'copy'
+  }
+  function onDragEnd(e: React.DragEvent): void {
+    // `dropEffect` is 'none' when the user pressed Esc, dropped over
+    // a non-accepting target, or released outside the window. In any
+    // of those cases the template is orphaned in the Pool — remove
+    // it so the user doesn't accumulate junk Instruments across
+    // aborted drags. A successful drop leaves dropEffect = 'copy'.
+    const tplId = materialisedIdRef.current
+    materialisedIdRef.current = null
+    if (!tplId) return
+    if (e.dataTransfer.dropEffect === 'none') {
+      onCancelMaterialise(tplId)
+    }
+  }
+
+  // Time since last packet — rough freshness indicator. We render
+  // text rather than relying on a live ticker so the row doesn't
+  // re-paint on every status push when nothing else changed.
+  const ageMs = Date.now() - device.lastSeen
+  const ageLabel = formatAge(ageMs)
+  const isFresh = ageMs < 2000
+
+  return (
+    <div className="flex flex-col">
+      <div
+        draggable
+        onDragStart={onDragStart}
+        onDragEnd={onDragEnd}
+        onClick={onToggleExpand}
+        className="relative flex items-center gap-1 px-1 py-[1px] cursor-grab text-[12px] leading-tight hover:bg-panel2/60"
+        style={{ borderLeft: `3px solid rgb(var(--c-accent))` }}
+        title="Drag onto the Edit sidebar to add as an Instrument (one Parameter per address)."
+      >
+        <button
+          className="text-muted hover:text-text text-[15px] font-bold leading-none w-5 shrink-0"
+          onClick={(e) => {
+            e.stopPropagation()
+            onToggleExpand()
+          }}
+          title={expanded ? 'Collapse' : `Expand (${device.addresses.length} addresses)`}
+        >
+          {expanded ? '▾' : '▸'}
+        </button>
+        <span className="font-mono text-[11px] truncate">{device.id}</span>
+        {/* Activity dot — green when we just heard from the device,
+            grey once it's been quiet for >2s. */}
+        <span
+          className="inline-block w-1.5 h-1.5 rounded-full shrink-0"
+          style={{
+            background: isFresh
+              ? 'rgb(var(--c-success))'
+              : 'rgb(var(--c-muted) / 0.5)'
+          }}
+          title={`Last packet ${ageLabel} ago`}
+        />
+        <span className="text-muted text-[10px] shrink-0">
+          {device.addresses.length} addr · {device.packetCount} pkt
+        </span>
+        <div className="flex-1" />
+        <span className="text-muted text-[9px] shrink-0">{ageLabel}</span>
+      </div>
+      {expanded && device.addresses.length > 0 && (
+        <div className="flex flex-col">
+          {device.addresses
+            // Stable ordering by path for readability — without this
+            // the list reshuffles every push as `count` ticks up.
+            .slice()
+            .sort((a, b) => a.path.localeCompare(b.path))
+            .map((a) => (
+              <div
+                key={a.path}
+                className="flex items-center gap-2 pl-7 pr-1 py-0 leading-tight text-[11px] hover:bg-panel2/40"
+                title={`Type tags: ${a.argTypes.join('') || '∅'}  ·  ${a.count} packets`}
+              >
+                <span className="font-mono truncate">{a.path}</span>
+                <span
+                  className="text-[9px] text-muted shrink-0 px-1 rounded-sm border border-border font-mono"
+                  title="OSC type tags"
+                >
+                  {a.argTypes.join('') || '∅'}
+                </span>
+                <div className="flex-1" />
+                <span className="text-muted text-[10px] font-mono truncate max-w-[120px]">
+                  {a.argsPreview}
+                </span>
+              </div>
+            ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Compact "5s", "12m", "2h" formatting for the last-seen column. Tight
+// so the device row stays single-line at narrow drawer widths.
+function formatAge(ms: number): string {
+  if (ms < 1000) return 'now'
+  if (ms < 60_000) return `${Math.floor(ms / 1000)}s`
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m`
+  return `${Math.floor(ms / 3_600_000)}h`
 }

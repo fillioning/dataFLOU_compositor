@@ -1,5 +1,7 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
-import { useStore } from '../store'
+import { useStore, isRichTheme } from '../store'
+import { RcArcSlider, RcFlatBar } from './RcArcSlider'
+import { RcModeIcons } from './RcModeIcons'
 import type {
   ArpMode,
   Cell,
@@ -11,11 +13,229 @@ import type {
   MultMode,
   ParamArgSpec,
   RandomValueType,
+  SeqCombine,
+  SeqDriftEdge,
+  SeqMode,
   SeqSyncMode
 } from '@shared/types'
-import { DIVISIONS, euclidean, rateHzToSlider, sliderToRateHz } from '@shared/factory'
+import {
+  DIVISIONS,
+  cellularInitialRow,
+  euclidean,
+  evolveCellular,
+  generateStepValue,
+  polyrhythmGate,
+  rateHzToSlider,
+  sliderToRateHz,
+  stepHash
+} from '@shared/factory'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { UncontrolledTextInput } from './UncontrolledInput'
+import { DrawCanvas } from './DrawCanvas'
+import {
+  ArpVisual,
+  ChaosVisual,
+  EnvelopeVisual,
+  LfoVisual,
+  RampVisual,
+  RandomVisual,
+  SampleHoldVisual,
+  SlewVisual
+} from './ModulatorVisuals'
+
+// Two-segment piecewise-linear mapping for the sequencer's Free (ms)
+// step-duration slider. A pure-linear slider over [10, 60000] ms gave
+// the useful sub-second range (10–1000 ms) only ~1.5% of the slider's
+// travel, which made it almost impossible to dial in musical step
+// times. This mapping gives 10–1000 ms the LEFT HALF of the slider
+// and 1000–60000 ms the RIGHT HALF — so subtle changes near the
+// downbeat are easy, and very slow steps stay reachable.
+//
+// Position space: integer 0..1000 (what the <input type="range"> sees).
+// Value space: integer 10..60000 ms (what the engine stores).
+function sliderToStepMs(pos: number): number {
+  const p = Math.max(0, Math.min(1000, pos))
+  if (p <= 500) return Math.round(10 + (p / 500) * (1000 - 10))
+  return Math.round(1000 + ((p - 500) / 500) * (60000 - 1000))
+}
+function stepMsToSlider(ms: number): number {
+  const m = Math.max(10, Math.min(60000, ms))
+  if (m <= 1000) return Math.round(((m - 10) / (1000 - 10)) * 500)
+  return Math.round(500 + ((m - 1000) / (60000 - 1000)) * 500)
+}
+
+// Same trick for the Ramp's "Ramp time" slider: position 0..1000
+// maps to 0..30000 ms with the fast band (0..5000 ms) taking the
+// left half of the slider. Right half is 5000..30000 ms.
+function sliderToRampMs(pos: number): number {
+  const p = Math.max(0, Math.min(1000, pos))
+  if (p <= 500) return Math.round((p / 500) * 5000 * 10) / 10
+  return Math.round(5000 + ((p - 500) / 500) * (30000 - 5000))
+}
+function rampMsToSlider(ms: number): number {
+  const m = Math.max(0, Math.min(30000, ms))
+  if (m <= 5000) return Math.round((m / 5000) * 500)
+  return Math.round(500 + ((m - 5000) / (30000 - 5000)) * 500)
+}
+
+// Returns true when step `i` is gated OFF in the current cycle for
+// the given sequencer mode + params. Used by the step-values grid
+// to grey-glow muted steps (instead of orange) when the playhead
+// lands on them, so the user can see which steps would actually
+// fire vs which the receiver will hold past.
+function isStepGateMuted(
+  seq: import('@shared/types').SequencerParams,
+  i: number
+): boolean {
+  const s = Math.max(1, Math.min(16, Math.floor(seq.steps)))
+  const idx = ((i % s) + s) % s
+  switch (seq.mode) {
+    case 'euclidean': {
+      const p = Math.max(0, Math.min(s, seq.pulses))
+      const pat = euclidean(p, s, seq.rotation)
+      return !pat[idx]
+    }
+    case 'polyrhythm':
+      return !polyrhythmGate(idx, seq.ringALength, seq.ringBLength, seq.combine)
+    case 'density':
+      // Density classic mode no longer gates (every step fires with
+      // a per-step multiplier); only generative Density gates.
+      if (!seq.generative) return false
+      return stepHash(idx, seq.seed) >= seq.density / 100
+    case 'cellular': {
+      const row = cellularInitialRow(seq.cellSeed, s)
+      return ((row >>> idx) & 1) === 0
+    }
+    default:
+      return false
+  }
+}
+
+// Cellular Seed slider that, when its LFO is active, auto-animates
+// its displayed position by computing the same modulated seed value
+// the engine uses. Drag → user takes over; release → LFO resumes.
+function CellularSeedSlider({
+  seed,
+  lfoDepth,
+  lfoRate,
+  onChange
+}: {
+  seed: number
+  lfoDepth: number
+  lfoRate: number
+  onChange: (v: number) => void
+}): JSX.Element {
+  // Re-render at ~30 Hz while LFO is active so the slider visibly
+  // moves. requestAnimationFrame would be ~60 Hz which is wasteful
+  // for this — setInterval(33ms) is plenty smooth visually.
+  const [, tick] = useState(0)
+  const dragging = useRef(false)
+  // Mirror lfoDepth into a ref so the setInterval body always reads
+  // the latest value, not the closure-captured one. Without this,
+  // toggling depth to 0 from a parent re-render while an interval
+  // tick is in flight could fire one extra tick that recomputes
+  // `modulated` from a stale > 0 depth — visible as a one-frame
+  // "snap" of the slider after the user releases.
+  const lfoDepthRef = useRef(lfoDepth)
+  lfoDepthRef.current = lfoDepth
+  useEffect(() => {
+    if (lfoDepth <= 0) return
+    const id = setInterval(() => {
+      // Re-check depth inside the tick body — the dep-array cleanup
+      // covers the steady-state case, this covers the transient
+      // race when the React commit hasn't yet torn the interval down.
+      if (lfoDepthRef.current <= 0) return
+      if (!dragging.current) tick((n) => n + 1)
+    }, 33)
+    return () => clearInterval(id)
+  }, [lfoDepth])
+  // Modulated seed value at "now" — matches the engine's formula in
+  // modulatedCellSeed (factory-side, see engine.ts).
+  const modulated = (() => {
+    if (lfoDepth <= 0 || dragging.current) return seed
+    const phase = (Date.now() / 1000) * Math.max(0.01, lfoRate) * Math.PI * 2
+    const offset = Math.round(Math.sin(phase) * (lfoDepth / 100) * 32767)
+    return Math.max(0, Math.min(65535, seed + offset))
+  })()
+  return (
+    <>
+      <input
+        type="range"
+        min={0}
+        max={65535}
+        step={1}
+        value={modulated}
+        onChange={(e) =>
+          onChange(clamp(Math.round(Number(e.target.value)), 0, 65535))
+        }
+        onPointerDown={() => (dragging.current = true)}
+        onPointerUp={() => (dragging.current = false)}
+        title="Initial bit pattern of the row. 0 = single center cell on; nonzero = each bit i seeds step i. Auto-animates when Seed LFO Depth > 0."
+      />
+      <BoundedNumberInput
+        className="input w-14 text-right"
+        value={modulated}
+        onChange={(v) => onChange(v)}
+        min={0}
+        max={65535}
+        integer
+      />
+    </>
+  )
+}
+
+// Per-mode tooltip for the Generative-mode Variation slider. Each
+// sequencer mode reinterprets the same 0..100% knob as its own
+// natural metaphor, so the title attribute names the metaphor
+// concretely rather than just saying "Variation".
+function genVariationTitle(mode: SeqMode): string {
+  switch (mode) {
+    case 'steps':
+      return 'Tide depth — how high the swell rises and how low it falls across one cycle.'
+    case 'euclidean':
+      return 'Accent strength — how much harder the downbeat hits land vs the off-beats.'
+    case 'polyrhythm':
+      return 'Voicing spread — distance between Ring A (low), Ring B (high), and the coincidence resonance.'
+    case 'density':
+      return 'Wave amplitude — how tall the sine the gate samples through.'
+    case 'cellular':
+      return 'Excitement range — how loud crowded cells get vs lonely ones.'
+    case 'drift':
+      return 'Hill height — how tall the terrain the walker samples.'
+    case 'ratchet':
+      return 'Scatter width — how widely each sub-pulse in a burst lands from the base.'
+    case 'bounce':
+      return 'Decay strength — how much the seed amplitude drops with each bounce. Combines with the Decay knob (timing) to shape the gesture.'
+    default:
+      return 'Variation amount.'
+  }
+}
+
+// Short single-word label for the rich-theme arc slider — appears
+// below the arc, complementing the % readout in the centre. Mirrors
+// `genVariationTitle` but tighter so the label fits the arc footprint.
+function genVariationLabel(mode: SeqMode): string {
+  switch (mode) {
+    case 'steps':
+      return 'Tide'
+    case 'euclidean':
+      return 'Accent'
+    case 'polyrhythm':
+      return 'Voicing'
+    case 'density':
+      return 'Wave'
+    case 'cellular':
+      return 'Crowd'
+    case 'drift':
+      return 'Terrain'
+    case 'ratchet':
+      return 'Scatter'
+    case 'bounce':
+      return 'Bounce'
+    default:
+      return 'Variation'
+  }
+}
 
 export default function Inspector({ mode }: { mode: 'cell' | 'track' }): JSX.Element {
   if (mode === 'track') return <TrackInspector />
@@ -299,6 +519,11 @@ function CellInspector(): JSX.Element {
   const currentStep = useStore(
     (s) => s.engine.seqStepBySceneAndTrack[sel.sceneId]?.[sel.trackId]
   )
+  // Rich theme flag — drives whether bespoke arc sliders, mode-icon
+  // rows, card-wrap sections, and console-readout numbers render in
+  // place of the classic HTML controls. Reactive: switching theme
+  // flips the entire inspector instantly.
+  const rich = useStore((s) => isRichTheme(s.theme))
 
   if (!scene || !track || !cell) {
     return <div className="p-4 text-muted text-[12px]">Cell removed.</div>
@@ -405,7 +630,7 @@ function CellInspector(): JSX.Element {
           <MultiArgValueEditor
             cell={c}
             argSpec={track.argSpec}
-            disabled={cell.sequencer.enabled}
+            disabled={cell.sequencer.enabled && !cell.sequencer.generative}
             onChange={(v) => u({ value: v })}
             onCommitTrigger={() => {
               const { sceneId, trackId } = sel
@@ -426,11 +651,15 @@ function CellInspector(): JSX.Element {
               />
               <span>Scale 0.0–1.0</span>
             </label>
-            {cell.sequencer.enabled && (
+            {cell.sequencer.enabled && cell.sequencer.generative ? (
+              <span className="text-success text-[10px]">
+                (seed — generative mode on)
+              </span>
+            ) : cell.sequencer.enabled ? (
               <span className="text-accent text-[10px]">
                 (ignored — sequencer on)
               </span>
-            )}
+            ) : null}
           </div>
         </Section>
       ) : (
@@ -464,7 +693,7 @@ function CellInspector(): JSX.Element {
                 }
               }}
               placeholder="0"
-              disabled={cell.sequencer.enabled}
+              disabled={cell.sequencer.enabled && !cell.sequencer.generative}
             />
             <label className="flex items-center gap-1 text-[11px] shrink-0" title="Clamp every output to [0.0, 1.0]">
               <input
@@ -486,9 +715,13 @@ function CellInspector(): JSX.Element {
                     ? `auto-detected: ${types[0] || 'string (empty)'}`
                     : `${tokenCount} values: ${types.join(', ')}`}
                   {tokenCount >= 16 && <span className="text-danger ml-2">(max 16)</span>}
-                  {cell.sequencer.enabled && (
+                  {cell.sequencer.enabled && cell.sequencer.generative ? (
+                    <span className="text-success ml-2">
+                      (seed — generative mode on)
+                    </span>
+                  ) : cell.sequencer.enabled ? (
                     <span className="text-accent ml-2">(ignored — sequencer on)</span>
-                  )}
+                  ) : null}
                 </>
               )
             })()}
@@ -587,38 +820,149 @@ function CellInspector(): JSX.Element {
         title="Sequencer"
         enabled={cell.sequencer.enabled}
         onToggle={(v) => uSeq({ enabled: v })}
+        headerRight={
+          cell.sequencer.enabled ? (
+            <label
+              className="flex items-center gap-1 text-[11px] cursor-pointer select-none"
+              title={
+                'Generative: ignore the Step Values grid and live-generate per-step values from the cell\'s Value field as a seed.\n' +
+                'Each mode reinterprets the seed organically:\n' +
+                '  Steps      → Tide (sine swell)\n' +
+                '  Euclidean  → Accent (downbeat hits land harder)\n' +
+                '  Polyrhythm → Voicing (Ring A low / Ring B high / coincidence resonates)\n' +
+                '  Density    → Wave (continuous sine, gate samples)\n' +
+                '  Cellular   → Crowd (cells with more on-neighbours excite)\n' +
+                '  Drift      → Terrain (1D landscape the walker samples)\n' +
+                '  Ratchet    → Scatter (each sub-pulse a startled bird)'
+              }
+            >
+              <input
+                type="checkbox"
+                checked={cell.sequencer.generative}
+                onChange={(e) => uSeq({ generative: e.target.checked })}
+              />
+              <span
+                className={
+                  cell.sequencer.generative ? 'text-success' : 'text-muted'
+                }
+              >
+                Generative
+              </span>
+            </label>
+          ) : undefined
+        }
       >
         <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center">
-          <span className="label">Pattern</span>
-          <select
-            className="input col-span-2"
-            value={cell.sequencer.mode}
-            onChange={(e) =>
-              uSeq({ mode: e.target.value as import('@shared/types').SeqMode })
-            }
-            title="Steps = cycle through step values in order. Euclidean = distribute `Pulses` hits evenly across `Steps` total slots; misses emit no OSC."
-          >
-            <option value="steps">Steps (cycle)</option>
-            <option value="euclidean">Euclidean</option>
-          </select>
+          {cell.sequencer.generative &&
+            (rich ? (
+              <>
+                <span className="label">Variation</span>
+                {/* Rich theme uses a flat tonal-gradient bar instead
+                    of the half-arc — same Rainbow-Circuit DNA, no
+                    pump/scale animation, fits inline with the rest
+                    of the controls without a big footprint. */}
+                <div className="col-span-2">
+                  <RcFlatBar
+                    value={cell.sequencer.genAmount}
+                    onChange={(v) => uSeq({ genAmount: v })}
+                    min={0}
+                    max={100}
+                    step={1}
+                    label={genVariationLabel(cell.sequencer.mode)}
+                    format={(v) => `${Math.round(v)}%`}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <span className="label">Variation</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={cell.sequencer.genAmount}
+                  onChange={(e) =>
+                    uSeq({ genAmount: clamp(Number(e.target.value), 0, 100) })
+                  }
+                  title={genVariationTitle(cell.sequencer.mode)}
+                />
+                <BoundedNumberInput
+                  className="input w-14 text-right"
+                  value={cell.sequencer.genAmount}
+                  onChange={(v) => uSeq({ genAmount: v })}
+                  min={0}
+                  max={100}
+                />
+              </>
+            ))}
+          <span className="label">Sequencer</span>
+          {rich ? (
+            <div className="col-span-2">
+              {/* Single right-justified row of 9 pictograms. Locks
+                  the row to one line regardless of which mode is
+                  selected so the layout stays stable. The cells
+                  hug the right edge so the "Sequencer" label hangs
+                  off the left and the icons cluster nicely. */}
+              <RcModeIcons
+                value={cell.sequencer.mode}
+                onChange={(m) => uSeq({ mode: m })}
+              />
+            </div>
+          ) : (
+            <select
+              className="input col-span-2"
+              value={cell.sequencer.mode}
+              onChange={(e) => uSeq({ mode: e.target.value as SeqMode })}
+              title={
+                'Steps: classic cycle.\n' +
+                'Euclidean: N pulses spread evenly across Steps.\n' +
+                'Polyrhythm: two ring clocks combined (3 vs 8, etc.).\n' +
+                'Density: per-step probability driven by a Seed.\n' +
+                'Cellular: 1D Wolfram automaton evolves the row each cycle.\n' +
+                'Drift: Brownian playhead wanders the step row.\n' +
+                'Ratchet: each step may burst into 2..N retriggers.\n' +
+                'Bounce: real ball-bounce physics — accelerating intervals + decaying amplitude.\n' +
+                'Draw: sketch an automation curve directly with the mouse.'
+              }
+            >
+              <option value="steps">Steps (cycle)</option>
+              <option value="euclidean">Euclidean</option>
+              <option value="polyrhythm">Polyrhythm</option>
+              <option value="density">Density</option>
+              <option value="cellular">Cellular</option>
+              <option value="drift">Drift</option>
+              <option value="ratchet">Ratchet</option>
+              <option value="bounce">Bounce (physics)</option>
+              <option value="draw">Draw (curve)</option>
+            </select>
+          )}
 
-          <span className="label">Steps</span>
-          <input
-            type="range"
-            min={1}
-            max={16}
-            step={1}
-            value={cell.sequencer.steps}
-            onChange={(e) => uSeq({ steps: clamp(Math.round(Number(e.target.value)), 1, 16) })}
-          />
-          <BoundedNumberInput
-            className="input w-14 text-right"
-            value={cell.sequencer.steps}
-            onChange={(v) => uSeq({ steps: v })}
-            min={1}
-            max={16}
-            integer
-          />
+          {/* Steps slider — hidden in Draw mode (Resolution IS the
+              step count there; having both was confusing). */}
+          {cell.sequencer.mode !== 'draw' && (
+            <>
+              <span className="label">Steps</span>
+              <input
+                type="range"
+                min={1}
+                max={16}
+                step={1}
+                value={cell.sequencer.steps}
+                onChange={(e) =>
+                  uSeq({ steps: clamp(Math.round(Number(e.target.value)), 1, 16) })
+                }
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.steps}
+                onChange={(v) => uSeq({ steps: v })}
+                min={1}
+                max={16}
+                integer
+              />
+            </>
+          )}
 
           {cell.sequencer.mode === 'euclidean' && (
             <>
@@ -667,6 +1011,399 @@ function CellInspector(): JSX.Element {
             </>
           )}
 
+          {cell.sequencer.mode === 'polyrhythm' && (
+            <>
+              <span className="label">Ring A</span>
+              <input
+                type="range"
+                min={1}
+                max={16}
+                step={1}
+                value={cell.sequencer.ringALength}
+                onChange={(e) =>
+                  uSeq({ ringALength: clamp(Math.round(Number(e.target.value)), 1, 16) })
+                }
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.ringALength}
+                onChange={(v) => uSeq({ ringALength: v })}
+                min={1}
+                max={16}
+                integer
+              />
+
+              <span className="label">Ring B</span>
+              <input
+                type="range"
+                min={1}
+                max={16}
+                step={1}
+                value={cell.sequencer.ringBLength}
+                onChange={(e) =>
+                  uSeq({ ringBLength: clamp(Math.round(Number(e.target.value)), 1, 16) })
+                }
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.ringBLength}
+                onChange={(v) => uSeq({ ringBLength: v })}
+                min={1}
+                max={16}
+                integer
+              />
+
+              <span className="label">Combine</span>
+              <select
+                className="input col-span-2"
+                value={cell.sequencer.combine}
+                onChange={(e) => uSeq({ combine: e.target.value as SeqCombine })}
+                title="OR fires when either ring hits. XOR fires when exactly one hits (phasing feel). AND fires only at coincidence (sparse highlights)."
+              >
+                <option value="or">OR (either ring)</option>
+                <option value="xor">XOR (one but not both)</option>
+                <option value="and">AND (coincidence only)</option>
+              </select>
+            </>
+          )}
+
+          {cell.sequencer.mode === 'density' && (
+            <>
+              <span className="label">Density</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={cell.sequencer.density}
+                onChange={(e) =>
+                  uSeq({ density: clamp(Number(e.target.value), 0, 100) })
+                }
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.density}
+                onChange={(v) => uSeq({ density: v })}
+                min={0}
+                max={100}
+              />
+
+              <span className="label">Seed</span>
+              <input
+                type="range"
+                min={0}
+                max={255}
+                step={1}
+                value={cell.sequencer.seed}
+                onChange={(e) =>
+                  uSeq({ seed: clamp(Math.round(Number(e.target.value)), 0, 255) })
+                }
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.seed}
+                onChange={(v) => uSeq({ seed: v })}
+                min={0}
+                max={255}
+                integer
+              />
+            </>
+          )}
+
+          {cell.sequencer.mode === 'cellular' && (
+            <>
+              <span className="label">Rule</span>
+              <input
+                type="range"
+                min={0}
+                max={255}
+                step={1}
+                value={cell.sequencer.rule}
+                onChange={(e) =>
+                  uSeq({ rule: clamp(Math.round(Number(e.target.value)), 0, 255) })
+                }
+                title="Wolfram rule (0-255). Try 30 (chaos), 90 (Sierpinski), 110 (gliders), 184 (traffic)."
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.rule}
+                onChange={(v) => uSeq({ rule: v })}
+                min={0}
+                max={255}
+                integer
+              />
+
+              <span className="label">Seed</span>
+              <CellularSeedSlider
+                seed={cell.sequencer.cellSeed}
+                lfoDepth={cell.sequencer.cellularSeedLfoDepth}
+                lfoRate={cell.sequencer.cellularSeedLfoRate}
+                onChange={(v) => uSeq({ cellSeed: v })}
+              />
+
+              <span className="label">Seed LFO</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={cell.sequencer.cellularSeedLfoDepth}
+                onChange={(e) =>
+                  uSeq({
+                    cellularSeedLfoDepth: clamp(Number(e.target.value), 0, 100)
+                  })
+                }
+                title="Depth of the Seed LFO (0 = off). When >0, the cellular row is re-seeded each cycle around the base Seed value, drifting the pattern over time."
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.cellularSeedLfoDepth}
+                onChange={(v) => uSeq({ cellularSeedLfoDepth: v })}
+                min={0}
+                max={100}
+              />
+
+              <span className="label">LFO Rate</span>
+              <input
+                type="range"
+                min={0.01}
+                max={10}
+                step={0.01}
+                value={cell.sequencer.cellularSeedLfoRate}
+                onChange={(e) =>
+                  uSeq({
+                    cellularSeedLfoRate: clamp(Number(e.target.value), 0.01, 10)
+                  })
+                }
+                title="LFO speed in Hz (0.01–10). 0.5 ≈ 2-second cycle, 2 ≈ 500-ms cycle."
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.cellularSeedLfoRate}
+                onChange={(v) => uSeq({ cellularSeedLfoRate: v })}
+                min={0.01}
+                max={10}
+              />
+            </>
+          )}
+
+          {cell.sequencer.mode === 'drift' && (
+            <>
+              <span className="label">Bias</span>
+              <input
+                type="range"
+                min={-100}
+                max={100}
+                step={1}
+                value={cell.sequencer.bias}
+                onChange={(e) =>
+                  uSeq({ bias: clamp(Number(e.target.value), -100, 100) })
+                }
+                title="-100% always backward, 0 pure random walk, +100% always forward."
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.bias}
+                onChange={(v) => uSeq({ bias: v })}
+                min={-100}
+                max={100}
+              />
+
+              <span className="label">Edge</span>
+              <select
+                className="input col-span-2"
+                value={cell.sequencer.edge}
+                onChange={(e) => uSeq({ edge: e.target.value as SeqDriftEdge })}
+                title="Wrap loops the playhead around the row. Reflect bounces off the boundaries."
+              >
+                <option value="wrap">Wrap</option>
+                <option value="reflect">Reflect</option>
+              </select>
+            </>
+          )}
+
+          {cell.sequencer.mode === 'ratchet' && (
+            <>
+              <span className="label">Probability</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={cell.sequencer.ratchetProb}
+                onChange={(e) =>
+                  uSeq({ ratchetProb: clamp(Number(e.target.value), 0, 100) })
+                }
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.ratchetProb}
+                onChange={(v) => uSeq({ ratchetProb: v })}
+                min={0}
+                max={100}
+              />
+
+              <span className="label">Max Div.</span>
+              <input
+                type="range"
+                min={2}
+                max={16}
+                step={1}
+                value={cell.sequencer.ratchetMaxDiv}
+                onChange={(e) =>
+                  uSeq({
+                    ratchetMaxDiv: clamp(
+                      Math.round(Number(e.target.value)),
+                      2,
+                      16
+                    )
+                  })
+                }
+                title="Maximum subdivisions per ratchet hit (2–16). Always whole-number divisions — each burst fires 2..N evenly-spaced re-triggers within the step."
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.ratchetMaxDiv}
+                onChange={(v) => uSeq({ ratchetMaxDiv: Math.round(v) })}
+                min={2}
+                max={16}
+                integer
+              />
+
+              <span className="label">Variation</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={cell.sequencer.ratchetVariation}
+                onChange={(e) =>
+                  uSeq({
+                    ratchetVariation: clamp(Number(e.target.value), 0, 100)
+                  })
+                }
+                title="0% = every step uses the same Probability + Max Div. 100% = each step's probability AND subdivision count are randomised (deterministic per seed) so the burst pattern varies across the cycle."
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.ratchetVariation}
+                onChange={(v) => uSeq({ ratchetVariation: v })}
+                min={0}
+                max={100}
+              />
+
+              <span className="label">Mode</span>
+              <select
+                className="input col-span-2"
+                value={cell.sequencer.ratchetMode}
+                onChange={(e) =>
+                  uSeq({
+                    ratchetMode: e.target.value as
+                      | 'octaves'
+                      | 'ramp'
+                      | 'inverse'
+                      | 'pingpong'
+                      | 'echo'
+                      | 'trill'
+                      | 'random'
+                  })
+                }
+                title={
+                  'Octaves: every sub-pulse emits stepValue / subdiv (proportional scaling).\n' +
+                  'Ramp: linear rise stepValue/subdiv → stepValue (snare-roll build).\n' +
+                  'Inverse: mirror of Ramp — falls from stepValue to stepValue/subdiv.\n' +
+                  'Pingpong: rises then falls inside the burst (triangle window).\n' +
+                  'Echo: exponential decay ~0.7^i (palm-mute / ball-bounce).\n' +
+                  'Trill: alternates stepValue / stepValue×0.5 (two-note ornament).\n' +
+                  'Random: hash-driven scatter.'
+                }
+              >
+                <option value="octaves">Octaves — value / subdiv</option>
+                <option value="ramp">Ramp — rising values</option>
+                <option value="inverse">Inverse — falling values</option>
+                <option value="pingpong">Pingpong — rise + fall</option>
+                <option value="echo">Echo — exp decay</option>
+                <option value="trill">Trill — two-note flicker</option>
+                <option value="random">Random — scattered</option>
+              </select>
+            </>
+          )}
+
+          {cell.sequencer.mode === 'bounce' && (
+            <>
+              <span className="label">Decay</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={cell.sequencer.bounceDecay}
+                onChange={(e) =>
+                  uSeq({ bounceDecay: clamp(Number(e.target.value), 0, 100) })
+                }
+                title="Bounciness — 0% = dead bounce (quick collapse, last bounces nearly back-to-back); 100% = super bouncy (intervals barely decay, sustained pulse train). Drives both timing and (in generative mode) value decay."
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.bounceDecay}
+                onChange={(v) => uSeq({ bounceDecay: v })}
+                min={0}
+                max={100}
+              />
+            </>
+          )}
+
+          {cell.sequencer.mode === 'draw' && (
+            <>
+              <span className="label">Resolution</span>
+              <input
+                type="range"
+                min={4}
+                max={1024}
+                step={1}
+                value={cell.sequencer.drawSteps}
+                onChange={(e) =>
+                  uSeq({
+                    drawSteps: clamp(
+                      Math.round(Number(e.target.value)),
+                      4,
+                      1024
+                    )
+                  })
+                }
+                title="Cells across the drawing canvas (4–1024). Higher = finer automation; past ~128 the curve reads as a continuous line."
+              />
+              <BoundedNumberInput
+                className="input w-14 text-right"
+                value={cell.sequencer.drawSteps}
+                onChange={(v) => uSeq({ drawSteps: v })}
+                min={4}
+                max={1024}
+                integer
+              />
+
+              {/* X Value (bottom of canvas) + Y Value (top of canvas)
+                  — the output range the drawn 0..1 curve maps onto.
+                  Default [0, 1] preserves classic behaviour; set to
+                  [-1, 1] for bipolar, [0, 127] for MIDI, etc. */}
+              <span className="label">X Value</span>
+              <BoundedNumberInput
+                className="input col-span-2 w-full text-right"
+                value={cell.sequencer.drawValueMin}
+                onChange={(v) => uSeq({ drawValueMin: v })}
+                title="Output value at the bottom of the canvas (curve y=0). Default 0."
+              />
+
+              <span className="label">Y Value</span>
+              <BoundedNumberInput
+                className="input col-span-2 w-full text-right"
+                value={cell.sequencer.drawValueMax}
+                onChange={(v) => uSeq({ drawValueMax: v })}
+                title="Output value at the top of the canvas (curve y=1). Default 1."
+              />
+            </>
+          )}
+
           <span className="label">Mode</span>
           <select
             className="input col-span-2"
@@ -701,33 +1438,51 @@ function CellInspector(): JSX.Element {
           ) : cell.sequencer.syncMode === 'tempo' ? (
             <>
               <span className="label">Tempo</span>
-              <input
-                type="range"
-                min={10}
-                max={500}
-                step={1}
-                value={cell.sequencer.bpm}
-                onChange={(e) => uSeq({ bpm: clamp(Number(e.target.value), 10, 500) })}
-              />
-              <BoundedNumberInput
-                className="input w-14 text-right"
-                value={cell.sequencer.bpm}
-                onChange={(v) => uSeq({ bpm: v })}
-                min={10}
-                max={500}
-                integer
-              />
+              {(() => {
+                // Draw mode unlocks a higher tempo cap (1024 BPM) so
+                // drawn-curve automation can run at very fast clock
+                // rates. Other modes stay at the musical 500 cap.
+                const bpmMax = cell.sequencer.mode === 'draw' ? 1024 : 500
+                return (
+                  <>
+                    <input
+                      type="range"
+                      min={10}
+                      max={bpmMax}
+                      step={1}
+                      value={Math.min(bpmMax, cell.sequencer.bpm)}
+                      onChange={(e) =>
+                        uSeq({ bpm: clamp(Number(e.target.value), 10, bpmMax) })
+                      }
+                    />
+                    <BoundedNumberInput
+                      className="input w-14 text-right"
+                      value={cell.sequencer.bpm}
+                      onChange={(v) => uSeq({ bpm: v })}
+                      min={10}
+                      max={bpmMax}
+                      integer
+                    />
+                  </>
+                )
+              })()}
             </>
           ) : (
             <>
-              <span className="label">Step</span>
+              <span className="label">MS</span>
+              {/* Piecewise-linear mapping: left half = 10–1000 ms
+                  (the musically useful range), right half = 1000–
+                  60000 ms. Slider position 0..1000 → ms 10..60000. */}
               <input
                 type="range"
-                min={10}
-                max={5000}
-                step={10}
-                value={Math.min(5000, cell.sequencer.stepMs)}
-                onChange={(e) => uSeq({ stepMs: clamp(Number(e.target.value), 1, 60000) })}
+                min={0}
+                max={1000}
+                step={1}
+                value={stepMsToSlider(cell.sequencer.stepMs)}
+                onChange={(e) =>
+                  uSeq({ stepMs: sliderToStepMs(Number(e.target.value)) })
+                }
+                title={`${cell.sequencer.stepMs} ms — slider midpoint = 1000 ms`}
               />
               <BoundedNumberInput
                 className="input w-16 text-right"
@@ -751,33 +1506,180 @@ function CellInspector(): JSX.Element {
             }
           />
         )}
+        {cell.sequencer.mode === 'polyrhythm' && (
+          <PolyrhythmPreview
+            steps={cell.sequencer.steps}
+            ringALength={cell.sequencer.ringALength}
+            ringBLength={cell.sequencer.ringBLength}
+            combine={cell.sequencer.combine}
+            currentStep={
+              cell.sequencer.enabled && currentStep !== undefined ? currentStep : -1
+            }
+          />
+        )}
+        {cell.sequencer.mode === 'density' && (
+          <DensityPreview
+            steps={cell.sequencer.steps}
+            seed={cell.sequencer.seed}
+            density={cell.sequencer.density}
+            currentStep={
+              cell.sequencer.enabled && currentStep !== undefined ? currentStep : -1
+            }
+          />
+        )}
+        {cell.sequencer.mode === 'cellular' && (
+          <CellularPreview
+            steps={cell.sequencer.steps}
+            rule={cell.sequencer.rule}
+            cellSeed={cell.sequencer.cellSeed}
+            seedLfoDepth={cell.sequencer.cellularSeedLfoDepth}
+            seedLfoRate={cell.sequencer.cellularSeedLfoRate}
+            currentStep={
+              cell.sequencer.enabled && currentStep !== undefined ? currentStep : -1
+            }
+          />
+        )}
+        {cell.sequencer.mode === 'drift' && (
+          <DriftPreview
+            steps={cell.sequencer.steps}
+            currentStep={
+              cell.sequencer.enabled && currentStep !== undefined ? currentStep : -1
+            }
+          />
+        )}
+        {cell.sequencer.mode === 'ratchet' && (
+          <RatchetPreview
+            steps={cell.sequencer.steps}
+            ratchetProb={cell.sequencer.ratchetProb}
+            ratchetMaxDiv={cell.sequencer.ratchetMaxDiv}
+            ratchetVariation={cell.sequencer.ratchetVariation}
+            seed={cell.sequencer.seed}
+            currentStep={
+              cell.sequencer.enabled && currentStep !== undefined ? currentStep : -1
+            }
+          />
+        )}
+        {cell.sequencer.mode === 'bounce' && (
+          <BouncePreview
+            cell={cell}
+            currentStep={
+              cell.sequencer.enabled && currentStep !== undefined ? currentStep : -1
+            }
+          />
+        )}
+        {cell.sequencer.mode === 'draw' && (
+          <DrawCanvas
+            values={cell.sequencer.drawValues}
+            drawSteps={cell.sequencer.drawSteps}
+            drawValueMin={cell.sequencer.drawValueMin}
+            drawValueMax={cell.sequencer.drawValueMax}
+            currentStep={
+              cell.sequencer.enabled && currentStep !== undefined ? currentStep : -1
+            }
+            generative={cell.sequencer.generative}
+            genAmount={cell.sequencer.genAmount}
+            seed={cell.sequencer.seed}
+            onChange={(next) => uSeq({ drawValues: next })}
+          />
+        )}
 
-        <div className="mt-2 flex flex-col gap-1">
+        {cell.sequencer.mode !== 'draw' && (
+        <div className="mt-1 flex flex-col gap-0.5">
           <div className="label">
-            {cell.sequencer.mode === 'euclidean'
-              ? `Step values (1…${cell.sequencer.steps}) — hits emit, misses skip`
-              : `Step values (1…${cell.sequencer.steps})`}
+            {cell.sequencer.generative
+              ? `Live values (1…${cell.sequencer.steps}) — generated from the seed`
+              : cell.sequencer.mode === 'euclidean'
+                ? `Step values (1…${cell.sequencer.steps}) — hits emit, misses skip`
+                : `Step values (1…${cell.sequencer.steps})`}
           </div>
-          <div className="grid grid-cols-4 gap-1">
-            {Array.from({ length: cell.sequencer.steps }, (_, i) => (
-              <StepInput
-                key={i}
-                index={i}
-                active={currentStep === i && cell.sequencer.enabled}
-                value={cell.sequencer.stepValues[i] ?? ''}
-                onChange={(v) => {
-                  const next = [...cell.sequencer.stepValues]
-                  next[i] = v
-                  uSeq({ stepValues: next })
-                }}
-              />
-            ))}
+          {cell.sequencer.generative ? (
+            <GenerativeStepPreview
+              steps={cell.sequencer.steps}
+              cell={cell}
+              currentStep={
+                cell.sequencer.enabled && currentStep !== undefined ? currentStep : -1
+              }
+            />
+          ) : (
+            <div className="grid grid-cols-4 gap-1">
+              {Array.from({ length: cell.sequencer.steps }, (_, i) => (
+                <StepInput
+                  key={i}
+                  index={i}
+                  active={currentStep === i && cell.sequencer.enabled}
+                  muted={isStepGateMuted(cell.sequencer, i)}
+                  value={cell.sequencer.stepValues[i] ?? ''}
+                  onChange={(v) => {
+                    // Read fresh state from the store inside the
+                    // callback instead of spreading `cell.sequencer`
+                    // captured at render time. Two rapid keystrokes
+                    // across a re-render boundary would otherwise
+                    // race and the second write would clobber the
+                    // first using stale stepValues.
+                    const fresh = useStore.getState()
+                    const cur = fresh.session.scenes
+                      .find((s) => s.id === sel.sceneId)
+                      ?.cells[sel.trackId]
+                    if (!cur) return
+                    const next = [...cur.sequencer.stepValues]
+                    next[i] = v
+                    updateCell(sel.sceneId, sel.trackId, {
+                      sequencer: { ...cur.sequencer, stepValues: next }
+                    })
+                  }}
+                />
+              ))}
+            </div>
+          )}
+          <div className="text-[10px] text-muted">
+            {cell.sequencer.generative
+              ? genHelpText(cell.sequencer.mode)
+              : cell.sequencer.mode === 'euclidean'
+                ? 'Euclidean: active ("hit") steps emit their value; inactive steps emit nothing (receiver holds last value). With Modulation also on, the modulator affects hit values only.'
+                : cell.sequencer.mode === 'polyrhythm'
+                  ? 'Polyrhythm: two ring clocks fire at multiples of their length within the cycle. Combined gate decides which steps emit; misses hold last value.'
+                  : cell.sequencer.mode === 'density'
+                    ? 'Density: each step has its own personality from the Seed. The Density knob shapes the curve from silence to constant.'
+                    : cell.sequencer.mode === 'cellular'
+                      ? 'Cellular: the row evolves at every full cycle via the Wolfram rule. Active bits emit; inactive bits hold. Try rules 30, 90, 110.'
+                      : cell.sequencer.mode === 'drift'
+                        ? 'Drift: every clock the playhead steps +1 / 0 / -1 weighted by Bias, then plays that step\'s value. Edge controls boundary behaviour.'
+                        : cell.sequencer.mode === 'ratchet'
+                          ? 'Ratchet: each step has a chance of bursting into 2..N quick re-triggers. Most audible on string / bool / int OSC targets that re-fire on each send.'
+                          : cell.sequencer.mode === 'bounce'
+                            ? 'Bounce: cycles physically — each cycle is one drop, with step 0 the loud first impact and subsequent bounces accelerating + decaying. Decay sets the bounciness.'
+                            : 'Auto-detect per step (bool / int / float / string). With Modulation also on, the LFO oscillates around the current step value.'}
           </div>
-          <div className="text-[10px] text-muted mt-1">
-            {cell.sequencer.mode === 'euclidean'
-              ? 'Euclidean: active ("hit") steps emit their value; inactive steps emit nothing (receiver holds last value). With Modulation also on, the modulator affects hit values only.'
-              : 'Auto-detect per step (bool / int / float / string). With Modulation also on, the LFO oscillates around the current step value.'}
-          </div>
+        </div>
+        )}
+
+        {/* Behaviour — controls what the engine emits between value
+            changes. 'Last' re-sends the same value every tick (a
+            continuous stream); 'Hold' sends nothing until the value
+            changes, so the receiver naturally holds its previous
+            value. Tight row at the bottom of the section — the
+            mt-1/pt-1 keeps the whole section short enough to clear
+            the inspector viewport for the bigger modes (Cellular's
+            3-row preview etc.) without scrolling. */}
+        <div className="mt-1 grid grid-cols-[auto_1fr] gap-x-2 items-center pt-1 border-t border-border/40">
+          <span className="label">Behaviour</span>
+          <select
+            className="input text-[11px] py-0.5"
+            value={cell.sequencer.restBehaviour}
+            onChange={(e) =>
+              uSeq({
+                restBehaviour: e.target.value === 'hold' ? 'hold' : 'last'
+              })
+            }
+            title={
+              cell.sequencer.restBehaviour === 'hold'
+                ? 'Hold — engine sends only when the value changes; receivers naturally hold their previous value (no redundant OSC, no re-triggers).'
+                : 'Last — engine re-sends the same value every tick so receivers always have a fresh sample to act on (continuous stream).'
+            }
+          >
+            <option value="last">Last — re-send same value</option>
+            <option value="hold">Hold — send only on change</option>
+          </select>
         </div>
       </CollapsibleSection>
     </div>
@@ -796,6 +1698,7 @@ function LfoEditor({
   u: CellUpdate
 }): JSX.Element {
   const m = cell.modulation
+  const globalBpm = useStore((s) => s.session.globalBpm)
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
   }
@@ -804,33 +1707,35 @@ function LfoEditor({
     // by a narrow inspector. Middle column is `minmax(0, 1fr)` so the slider
     // can shrink gracefully instead of forcing overflow.
     <div className="grid grid-cols-[64px_minmax(0,1fr)_88px] gap-x-2 gap-y-1 items-center">
-      {/* Shape + Mode on the same row — Shape is width-capped so its menu
-          sits exactly as wide as "Random Smoothed". */}
+      {/* Shape on its own row — full middle column width so the
+          longest label ("Random Smoothed") fits without truncation. */}
       <span className="label">Shape</span>
-      <div className="flex items-center gap-1 min-w-0">
-        <select
-          className="input text-[11px] py-0.5"
-          style={{ width: 130 }}
-          value={m.shape}
-          onChange={(e) => uMod({ shape: e.target.value as LfoShape })}
-        >
-          <option value="sine">Sine</option>
-          <option value="triangle">Triangle</option>
-          <option value="sawtooth">Sawtooth</option>
-          <option value="square">Square</option>
-          <option value="rndStep">Random Stepped</option>
-          <option value="rndSmooth">Random Smoothed</option>
-        </select>
-        <select
-          className="input text-[11px] py-0.5 flex-1 min-w-0"
-          value={m.mode}
-          onChange={(e) => uMod({ mode: e.target.value as LfoMode })}
-          title="Unipolar = one-sided positive sweep. Bipolar = swings around center."
-        >
-          <option value="unipolar">Unipolar</option>
-          <option value="bipolar">Bipolar</option>
-        </select>
-      </div>
+      <select
+        className="input text-[11px] py-0.5 min-w-0"
+        value={m.shape}
+        onChange={(e) => uMod({ shape: e.target.value as LfoShape })}
+      >
+        <option value="sine">Sine</option>
+        <option value="triangle">Triangle</option>
+        <option value="sawtooth">Sawtooth</option>
+        <option value="square">Square</option>
+        <option value="rndStep">Random Stepped</option>
+        <option value="rndSmooth">Random Smoothed</option>
+      </select>
+      <span />
+
+      {/* Mode (Unipolar / Bipolar) on its own row, so it has space
+          for the full label without crowding the Shape dropdown. */}
+      <span className="label">Mode</span>
+      <select
+        className="input text-[11px] py-0.5 min-w-0"
+        value={m.mode}
+        onChange={(e) => uMod({ mode: e.target.value as LfoMode })}
+        title="Unipolar = one-sided positive sweep. Bipolar = swings around center."
+      >
+        <option value="unipolar">Unipolar</option>
+        <option value="bipolar">Bipolar</option>
+      </select>
       <span />
 
       <span className="label">Depth</span>
@@ -952,6 +1857,13 @@ function LfoEditor({
         </label>
       </div>
       <span />
+      {/* Span the full grid width — visual reacts to shape / depth /
+          rate / mode / sync so dragging any of them re-renders the
+          curve. Pass globalBpm so the visual respects BPM-synced
+          rate when sync mode isn't Free. */}
+      <div className="col-span-3">
+        <LfoVisual modulation={m} globalBpm={globalBpm} />
+      </div>
     </div>
   )
 }
@@ -1139,6 +2051,9 @@ Div/Mult: Value in the middle; halvings below, doublings above."
         output to [0, 1] as usual. If there are no numeric tokens in the Value field, the
         arpeggiator is skipped.
       </div>
+      <div className="col-span-3">
+        <ArpVisual arp={cell.modulation.arpeggiator} depthPct={cell.modulation.depthPct} />
+      </div>
     </div>
   )
 }
@@ -1150,6 +2065,7 @@ function RandomEditor({
   cell: import('@shared/types').Cell
   u: CellUpdate
 }): JSX.Element {
+  const globalBpm = useStore((s) => s.session.globalBpm)
   const m = cell.modulation
   const rnd = m.random
   function uMod(patch: Partial<typeof m>): void {
@@ -1302,6 +2218,9 @@ function RandomEditor({
             : ' One float OSC arg per sample, in [Min, Max], rounded to 1e-11.'}
         {' '}Scale 0.0–1.0 clamps each channel to [0, 1].
       </div>
+      <div className="col-span-3">
+        <RandomVisual modulation={cell.modulation} globalBpm={globalBpm} />
+      </div>
     </div>
   )
 }
@@ -1432,8 +2351,12 @@ function CompactDepthMode({
       </div>
 
       <span className="label">Mode</span>
+      {/* Just-as-wide-as-the-longest-word — was col-span-2 which
+          stretched the dropdown across the full middle + right
+          columns. 88 px fits "Unipolar" with the native arrow. */}
       <select
-        className="input text-[11px] py-0.5 col-span-2"
+        className="input text-[11px] py-0.5"
+        style={{ width: 88 }}
         value={m.mode}
         onChange={(e) => uMod({ mode: e.target.value as LfoMode })}
         title="Unipolar = one-sided positive sweep. Bipolar = swings around center."
@@ -1441,6 +2364,7 @@ function CompactDepthMode({
         <option value="unipolar">Unipolar</option>
         <option value="bipolar">Bipolar</option>
       </select>
+      <span />
     </>
   )
 }
@@ -1456,6 +2380,7 @@ function SampleHoldEditor({
 }): JSX.Element {
   const m = cell.modulation
   const sh = m.sh
+  const globalBpm = useStore((s) => s.session.globalBpm)
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
   }
@@ -1502,6 +2427,9 @@ function SampleHoldEditor({
         Below 100 % the modulator sometimes holds its previous sample
         across clocks — Turing-Machine-style locked-in feel.
       </div>
+      <div className="col-span-3">
+        <SampleHoldVisual modulation={cell.modulation} globalBpm={globalBpm} />
+      </div>
     </div>
   )
 }
@@ -1516,6 +2444,7 @@ function SlewEditor({
 }): JSX.Element {
   const m = cell.modulation
   const s = m.slew
+  const globalBpm = useStore((st) => st.session.globalBpm)
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
   }
@@ -1584,6 +2513,9 @@ function SlewEditor({
         asymmetrically for slow-rise / fast-fall envelope feel, or both
         equal for smooth symmetric glide.
       </div>
+      <div className="col-span-3">
+        <SlewVisual modulation={cell.modulation} globalBpm={globalBpm} />
+      </div>
     </div>
   )
 }
@@ -1637,6 +2569,9 @@ function ChaosEditor({
         3.83 hides a brief period-3 window (audible structure in a sea
         of noise); 4.0 is fully chaotic.
       </div>
+      <div className="col-span-3">
+        <ChaosVisual chaos={cell.modulation.chaos} depthPct={cell.modulation.depthPct} />
+      </div>
     </div>
   )
 }
@@ -1659,7 +2594,8 @@ function RampEditor({
     rampMs: 1000,
     curvePct: 0,
     sync: 'free' as const,
-    totalMs: 1000
+    totalMs: 1000,
+    mode: 'normal' as const
   }
   function uRamp(patch: Partial<typeof ramp>): void {
     u({ modulation: { ...m, ramp: { ...ramp, ...patch } } })
@@ -1706,7 +2642,11 @@ function RampEditor({
   // pushes state after the output stabilizes, so our timer is the only
   // thing driving renders). Left running = pure waste.
   const triggerAtVal = triggerAtRef.current
+  // Loop mode never "completes" — the timer needs to keep running
+  // for the whole time the cell's playing so the dot cycles. For
+  // Normal/Inverted we stop driving renders once the ramp finishes.
   const rampDoneByTime =
+    ramp.mode !== 'loop' &&
     isPlaying &&
     triggerAtVal !== null &&
     lenForVis > 0 &&
@@ -1718,9 +2658,18 @@ function RampEditor({
     return () => clearInterval(id)
   }, [needsTimer])
 
+  // In Loop mode the engine retriggers every period — the visual
+  // dot mirrors that by taking progress % 1 instead of clamping.
+  const rampMode = ramp.mode ?? 'normal'
   const progress =
     isPlaying && triggerAtRef.current !== null
-      ? clamp01((nowMs - triggerAtRef.current) / lenForVis)
+      ? (() => {
+          const raw = (nowMs - triggerAtRef.current) / lenForVis
+          if (rampMode === 'loop') {
+            return Math.max(0, raw % 1)
+          }
+          return clamp01(raw)
+        })()
       : 0
 
   return (
@@ -1745,18 +2694,44 @@ function RampEditor({
         </select>
         <span />
 
+        <span className="label">Mode</span>
+        <select
+          className="input text-[11px] py-0.5"
+          value={ramp.mode ?? 'normal'}
+          onChange={(e) =>
+            uRamp({
+              mode: e.target.value as 'normal' | 'inverted' | 'loop'
+            })
+          }
+          title={
+            'Normal: one-shot 0 → 1 (default).\n' +
+            'Inverted: one-shot 1 → 0 (mirror of Normal).\n' +
+            'Loop: 0 → 1 ramp repeats forever (retriggers each period).'
+          }
+        >
+          <option value="normal">Normal</option>
+          <option value="inverted">Inverted</option>
+          <option value="loop">Loop</option>
+        </select>
+        <span />
+
         {ramp.sync === 'free' && (
           <>
             <span className="label">Ramp time</span>
+            {/* Piecewise-linear mapping: position 0..500 = 0..5000 ms,
+                500..1000 = 5000..30000 ms. The fast / "tight" range
+                gets half the slider's travel so it's actually
+                dialable; longer rampts stay reachable on the right. */}
             <input
               type="range"
-              min={0.1}
-              max={300000}
-              step={0.1}
-              value={ramp.rampMs}
+              min={0}
+              max={1000}
+              step={1}
+              value={rampMsToSlider(ramp.rampMs)}
               onChange={(e) =>
-                uRamp({ rampMs: clamp(Number(e.target.value), 0.1, 300000) })
+                uRamp({ rampMs: sliderToRampMs(Number(e.target.value)) })
               }
+              title={`${ramp.rampMs.toFixed(1)} ms — slider midpoint = 5000 ms`}
             />
             <div className="flex items-center gap-1 justify-end">
               <BoundedNumberInput
@@ -1838,15 +2813,20 @@ function RampEditor({
         </div>
       </div>
 
-      {/* Visualizer — shows the curve shape, and a live dot tracing the
-          ramp while the cell is playing. Height is tight so the editor
-          still fits in the typical inspector width. */}
-      <RampVisualizer curvePct={ramp.curvePct} progress={progress} />
-
       <div className="text-[10px] text-muted italic">
         Ramp goes 0 → target in the configured time, then holds. Once the
         ramp completes the modulator becomes neutral (output = value).
       </div>
+
+      {/* Visualizer — same spec as LFO + Envelope: gradient stroke,
+          depth-reactive width + glow, full-width frame matching the
+          rest of the modulator panel. Replaces the older squashed
+          curve-only readout. */}
+      <RampVisual
+        ramp={ramp}
+        depthPct={cell.modulation.depthPct}
+        progress={isPlaying ? progress : undefined}
+      />
     </div>
   )
 }
@@ -1934,6 +2914,55 @@ function EnvelopeEditor({
   function uMod(patch: Partial<typeof m>): void {
     u({ modulation: { ...m, ...patch } })
   }
+  // Live progress dot — same trick as RampEditor. Stamp triggerAt
+  // when isPlaying flips on, integrate at 30 Hz while the envelope's
+  // total time hasn't yet elapsed, pass 0..1 progress to the visual.
+  const selectedCell = useStore((s) => s.selectedCell)
+  const isPlaying = useStore(
+    (s) =>
+      !!selectedCell &&
+      !!s.engine.activeBySceneAndTrack?.[selectedCell.sceneId]?.[selectedCell.trackId]
+  )
+  const envTriggerAtRef = useRef<number | null>(null)
+  const envWasPlayingRef = useRef(false)
+  if (isPlaying && !envWasPlayingRef.current) envTriggerAtRef.current = Date.now()
+  if (!isPlaying && envWasPlayingRef.current) envTriggerAtRef.current = null
+  envWasPlayingRef.current = isPlaying
+  // Total envelope time in ms — sync-mode aware. For synced mode we
+  // need the active scene's duration to convert the A/D/S/R
+  // fractions into real ms. We grab it from the selected cell's
+  // scene (the same one the inspector is displaying).
+  const sceneDurMs = useStore((st) => {
+    const cellSel = st.selectedCell
+    if (!cellSel) return 0
+    const sc = st.session.scenes.find((x) => x.id === cellSel.sceneId)
+    return sc ? sc.durationSec * 1000 : 0
+  })
+  const envTotalMs =
+    env.sync === 'synced'
+      ? Math.max(
+          1,
+          (env.attackPct + env.decayPct + env.sustainPct + env.releasePct) *
+            sceneDurMs
+        )
+      : env.sync === 'freeSync'
+        ? Math.max(1, env.totalMs)
+        : Math.max(
+            1,
+            env.attackMs + env.decayMs + env.sustainMs + env.releaseMs
+          )
+  const [envNowMs, setEnvNowMs] = useState<number>(() => Date.now())
+  const envProgress01 =
+    isPlaying && envTriggerAtRef.current !== null
+      ? clamp01((envNowMs - envTriggerAtRef.current) / envTotalMs)
+      : 0
+  const envNeedsTimer = isPlaying && envProgress01 < 1
+  useEffect(() => {
+    if (!envNeedsTimer) return
+    const id = setInterval(() => setEnvNowMs(Date.now()), 33)
+    return () => clearInterval(id)
+  }, [envNeedsTimer])
+
   // Percentage modes (synced, freeSync) edit stages as 0.01..100 %; free
   // mode uses absolute ms 0..10 000. Internally the Pct fields always live
   // as 0..1 fractions, Ms fields as ms.
@@ -2083,8 +3112,40 @@ function EnvelopeEditor({
           : 'Each stage in milliseconds (0–10 000).'}{' '}
         Envelope applies to every space-separated value in the clip.
       </div>
+
+      {/* ADSR visual — reacts to all four stage times + sustain level
+          + modulation depth. Drag any of them and the curve reshapes
+          immediately so the user can see the envelope's geometry. */}
+      <EnvelopeVisual
+        envelope={env}
+        depthPct={cell.modulation.depthPct}
+        progress={isPlaying ? envProgress01 : undefined}
+      />
+      {/* Live total-duration readout. Sync-mode aware: synced uses
+          scene duration × Σstages, freeSync uses totalMs, free
+          sums the four stages directly. Updates in real time as
+          the user adjusts any time field. */}
+      <div className="text-[10px] text-muted text-center">
+        Envelope time:{' '}
+        <span className="text-text font-mono">
+          {formatEnvelopeTime(envTotalMs)}
+        </span>
+      </div>
     </div>
   )
+}
+
+/** Format a duration in ms as a readable string. Switches units
+ *  automatically so the readout stays compact: `123 ms`, `2.45 s`,
+ *  `1:23.4` for longer envelopes. */
+function formatEnvelopeTime(ms: number): string {
+  const safe = Math.max(0, ms)
+  if (safe < 1000) return `${Math.round(safe)} ms`
+  if (safe < 60000) return `${(safe / 1000).toFixed(2)} s`
+  const totalSec = safe / 1000
+  const min = Math.floor(totalSec / 60)
+  const sec = totalSec - min * 60
+  return `${min}:${sec.toFixed(1).padStart(4, '0')}`
 }
 
 function Section({
@@ -2126,8 +3187,16 @@ function CollapsibleSection({
   headerRight?: React.ReactNode
   children: React.ReactNode
 }): JSX.Element {
+  // Rich themes wrap each section in a soft rounded card; classic
+  // themes keep the existing top-border divider. The CSS class
+  // `.rich-card` provides background, border, padding, and an inner
+  // shadow that reads as "small instrument-panel module".
+  const rich = useStore((s) => isRichTheme(s.theme))
+  const wrapClass = rich
+    ? 'rich-card flex flex-col gap-1'
+    : 'flex flex-col gap-1 pt-2 border-t border-border'
   return (
-    <div className="flex flex-col gap-1 pt-2 border-t border-border">
+    <div className={wrapClass}>
       <div className="flex items-center gap-2">
         <label className="flex items-center gap-2 cursor-pointer select-none">
           <input
@@ -2146,10 +3215,59 @@ function CollapsibleSection({
   )
 }
 
-// Euclidean pattern preview — row of N squares, filled for hit steps and
-// empty for misses. The currently-playing step gets an accent ring when
-// the sequencer is running. Pure visualization; editing happens through
-// the Pulses / Rotation sliders above.
+// ─────────────────────────────────────────────────────────────────
+// Sequencer preview building blocks (Rainbow-Circuit-flavoured).
+//
+// Each step in a row is laid across the rainbow wheel so adjacent
+// cells phase smoothly through hue space. The visual states (hit /
+// playhead) bloom in the cell's hue, with a soft halo that bleeds
+// onto the next-door cell — Tinge-style colour overlap. Animations
+// + transitions live in styles.css under the .rc-cell rules; this
+// component just renders the divs and sets `--rc-hue` per cell.
+// ─────────────────────────────────────────────────────────────────
+
+/** Hue for step `i` of `n`, spread across the full rainbow.
+ *  Slightly offset so step 0 sits at "warm orange" rather than pure
+ *  red — matches the existing accent palette better. */
+function hueForStep(i: number, n: number): number {
+  const wrap = Math.max(1, n)
+  return (((i / wrap) * 360 + 18) % 360 + 360) % 360
+}
+
+/** Rainbow-Circuit step cell. Pure presentational — caller decides
+ *  hit/now booleans, optional round variant, and per-cell hue (via
+ *  `hue` prop, falling back to step-index spread). */
+function RcCell({
+  hue,
+  hit,
+  now,
+  round,
+  faded,
+  title
+}: {
+  hue: number
+  hit: boolean
+  now: boolean
+  round?: boolean
+  faded?: boolean
+  title?: string
+}): JSX.Element {
+  const cls = ['rc-cell']
+  if (round) cls.push('is-round')
+  if (faded) cls.push('is-faded')
+  if (hit) cls.push('is-hit')
+  if (now) cls.push('is-now')
+  return (
+    <div
+      className={cls.join(' ')}
+      style={{ ['--rc-hue' as string]: String(hue) }}
+      title={title}
+    />
+  )
+}
+
+// Euclidean pattern preview — row of N rainbow cells; hits glow in
+// their hue, misses sit ghosted; the playhead bumps + pulses.
 function EuclideanPreview({
   steps,
   pulses,
@@ -2166,29 +3284,848 @@ function EuclideanPreview({
   const r = Math.max(0, Math.min(s - 1, Math.floor(rotation)))
   const pat = euclidean(p, s, r)
   return (
-    <div className="mt-2 flex items-center gap-1">
+    <div className="mt-2 flex items-center gap-2">
       <span className="label shrink-0">Pattern</span>
-      <div className="flex gap-[3px] flex-wrap">
+      <div className="flex gap-[5px] flex-wrap items-center">
         {pat.map((hit, i) => (
-          <div
-            key={i}
-            className="w-4 h-4 rounded-sm border"
-            style={{
-              borderColor: hit ? 'rgb(var(--c-accent))' : 'rgb(var(--c-border))',
-              background: hit
-                ? i === currentStep
-                  ? 'rgb(var(--c-accent))'
-                  : 'rgb(var(--c-accent) / 0.3)'
-                : i === currentStep
-                  ? 'rgb(var(--c-border))'
-                  : 'transparent',
-              outline: i === currentStep ? '1px solid rgb(var(--c-accent2))' : 'none',
-              outlineOffset: i === currentStep ? '1px' : undefined
-            }}
+          <RcCell
+            key={`${i}-${currentStep === i ? 'now' : ''}`}
+            hue={hueForStep(i, s)}
+            hit={hit}
+            now={i === currentStep}
             title={`Step ${i + 1} — ${hit ? 'hit' : 'rest'}`}
           />
         ))}
       </div>
+    </div>
+  )
+}
+
+// Three-row preview for Polyrhythm. Ring A and Ring B each sit in
+// a single tonal family — A in the warm half of the wheel, B in the
+// cool half — so the eye can tell which ring fires what without
+// reading labels. The Combined row spreads the full rainbow so the
+// emergent gate pattern reads at a glance, especially with XOR
+// (which is otherwise hard to predict).
+function PolyrhythmPreview({
+  steps,
+  ringALength,
+  ringBLength,
+  combine,
+  currentStep
+}: {
+  steps: number
+  ringALength: number
+  ringBLength: number
+  combine: SeqCombine
+  currentStep: number
+}): JSX.Element {
+  const s = Math.max(1, Math.min(16, Math.floor(steps)))
+  const a = Math.max(1, Math.min(16, Math.floor(ringALength)))
+  const b = Math.max(1, Math.min(16, Math.floor(ringBLength)))
+  const ringA = Array.from({ length: s }, (_, i) => i % a === 0)
+  const ringB = Array.from({ length: s }, (_, i) => i % b === 0)
+  const combined = Array.from({ length: s }, (_, i) =>
+    polyrhythmGate(i, a, b, combine)
+  )
+  // Two complementary tonal families: warm-orange for Ring A, cyan-blue
+  // for Ring B. The combined row uses the full rainbow spread.
+  const hueA = (i: number): number => 18 + (i / Math.max(1, s)) * 60 // 18..78
+  const hueB = (i: number): number => 190 + (i / Math.max(1, s)) * 60 // 190..250
+  const Row = ({
+    pat,
+    label,
+    hueFn
+  }: {
+    pat: boolean[]
+    label: string
+    hueFn: (i: number) => number
+  }): JSX.Element => (
+    <div className="flex items-center gap-2">
+      <span className="label shrink-0 w-14 text-right">{label}</span>
+      <div className="flex gap-[5px] flex-wrap items-center">
+        {pat.map((hit, i) => (
+          <RcCell
+            key={`${i}-${currentStep === i ? 'now' : ''}`}
+            hue={hueFn(i)}
+            hit={hit}
+            now={i === currentStep}
+            round
+            title={`Step ${i + 1} — ${hit ? 'hit' : 'rest'}`}
+          />
+        ))}
+      </div>
+    </div>
+  )
+  return (
+    <div className="mt-2 flex flex-col gap-1.5">
+      <Row pat={ringA} label="Ring A" hueFn={hueA} />
+      <Row pat={ringB} label="Ring B" hueFn={hueB} />
+      <Row
+        pat={combined}
+        label="Combined"
+        hueFn={(i) => hueForStep(i, s)}
+      />
+    </div>
+  )
+}
+
+// Density preview — each step is a glass tube whose fill height
+// reflects how "easy" that step is to fire (1 - personality). Hits
+// are tinted in their hue and gain a halo; misses fade to grey. As
+// the user drags Density, the tubes recolour smoothly because the
+// hit/miss class flips with a 220ms transition under the hood.
+function DensityPreview({
+  steps,
+  seed,
+  density,
+  currentStep
+}: {
+  steps: number
+  seed: number
+  density: number
+  currentStep: number
+}): JSX.Element {
+  const s = Math.max(1, Math.min(16, Math.floor(steps)))
+  const d = Math.max(0, Math.min(100, density)) / 100
+  const cells = Array.from({ length: s }, (_, i) => {
+    const personality = stepHash(i, seed)
+    const hit = personality < d
+    return { personality, hit }
+  })
+  return (
+    <div className="mt-2 flex items-end gap-2">
+      <span className="label shrink-0 mb-1">Pattern</span>
+      <div className="flex gap-[5px] flex-wrap items-end">
+        {cells.map(({ personality, hit }, i) => {
+          const heightPct = Math.round((1 - personality) * 100)
+          const hue = hueForStep(i, s)
+          const cls = ['rc-bar-cell']
+          if (hit) cls.push('is-hit')
+          if (i === currentStep) cls.push('is-now')
+          return (
+            <div
+              key={`${i}-${currentStep === i ? 'now' : ''}`}
+              className={cls.join(' ')}
+              style={{ ['--rc-hue' as string]: String(hue) }}
+              title={`Step ${i + 1} — personality ${personality.toFixed(2)}, ${hit ? 'hit' : 'rest'}`}
+            >
+              <div
+                className={hit ? 'rc-bar-fill' : 'rc-bar-fill is-rest'}
+                style={{ height: `${heightPct}%` }}
+              />
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// Cellular preview — top row is the live state; the eight rows below
+// are the next-generation projections stacked downward. Older rows
+// fade toward the background so the eye sees evolutionary direction
+// at a glance, while the topmost row carries the playhead glow.
+// Live-animating cellular preview. When the Seed LFO is on (depth>0),
+// the displayed seed value drifts via the same sine formula the
+// engine uses for `modulatedCellSeed`, and the rendered row patterns
+// follow — so what you SEE in the preview matches what the engine
+// WOULD play if the sequencer were triggered now.
+function useCellularModulatedSeed(
+  baseSeed: number,
+  depth: number,
+  rate: number
+): number {
+  const [, tick] = useState(0)
+  useEffect(() => {
+    if (depth <= 0) return
+    const id = setInterval(() => tick((n) => n + 1), 60)
+    return () => clearInterval(id)
+  }, [depth, rate])
+  if (depth <= 0) return baseSeed
+  const d = Math.max(0, Math.min(100, depth)) / 100
+  const r = Math.max(0.01, Math.min(10, rate))
+  const phase = (Date.now() / 1000) * r * Math.PI * 2
+  const offset = Math.round(Math.sin(phase) * d * 32767)
+  return Math.max(0, Math.min(65535, baseSeed + offset))
+}
+
+function CellularPreview({
+  steps,
+  rule,
+  cellSeed,
+  seedLfoDepth,
+  seedLfoRate,
+  currentStep
+}: {
+  steps: number
+  rule: number
+  cellSeed: number
+  seedLfoDepth: number
+  seedLfoRate: number
+  currentStep: number
+}): JSX.Element {
+  const s = Math.max(1, Math.min(16, Math.floor(steps)))
+  // Modulated seed — matches the engine's `modulatedCellSeed` so the
+  // preview shows EXACTLY the pattern the engine would play. When
+  // the LFO is off, `effectiveSeed === cellSeed` (no animation).
+  const effectiveSeed = useCellularModulatedSeed(cellSeed, seedLfoDepth, seedLfoRate)
+  // 3 generations shown — top row is the current cycle, two below
+  // are projected futures. Was 4; user asked for less vertical so
+  // the Behaviour row stays in view without scrolling.
+  const generations: number[] = [cellularInitialRow(effectiveSeed, s)]
+  for (let g = 1; g < 3; g++) {
+    generations.push(evolveCellular(generations[g - 1], rule, s))
+  }
+  return (
+    <div className="mt-2 flex items-start gap-2">
+      <span className="label shrink-0">Pattern</span>
+      <div className="flex flex-col gap-[3px]">
+        {generations.map((row, gi) => {
+          const isTop = gi === 0
+          // Older rows fade toward the panel background so the eye
+          // reads downward = older. Top row stays full-strength and
+          // is the only one that gets the live playhead bump.
+          const rowOpacity = isTop ? 1 : Math.max(0.25, 1 - gi / 5)
+          return (
+            <div key={gi} className="flex gap-[5px]" style={{ opacity: rowOpacity }}>
+              {Array.from({ length: s }, (_, i) => {
+                const hit = ((row >>> i) & 1) === 1
+                return (
+                  <RcCell
+                    key={`${i}-${isTop && currentStep === i ? 'now' : ''}`}
+                    hue={hueForStep(i, s)}
+                    hit={hit}
+                    now={isTop && i === currentStep}
+                    faded={!isTop}
+                    title={`Gen ${gi}, step ${i + 1} — ${hit ? 'on' : 'off'}`}
+                  />
+                )
+              })}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// Drift preview — clock-ring of rainbow dots arranged around a
+// circle, with the playhead glowing in its current-step's hue and
+// the previous N positions fading back behind it as a comet trail.
+// Reads as a watch face the user can stare at while drift wanders.
+function DriftPreview({
+  steps,
+  currentStep
+}: {
+  steps: number
+  currentStep: number
+}): JSX.Element {
+  const s = Math.max(1, Math.min(16, Math.floor(steps)))
+  // Track the last N playhead positions in a small ring buffer so we
+  // can render a fading comet-trail behind the active dot. Using a
+  // ref + state combo keeps the trail across renders without forcing
+  // the whole inspector to re-render every tick.
+  const trailRef = useRef<number[]>([])
+  // currentStep changes ~every step boundary; push it onto the trail.
+  // De-dup consecutive identical positions so a paused playhead
+  // doesn't fill the trail with one repeated value.
+  useEffect(() => {
+    if (currentStep < 0) {
+      trailRef.current = []
+      return
+    }
+    const last = trailRef.current[trailRef.current.length - 1]
+    if (last === currentStep) return
+    trailRef.current = [...trailRef.current, currentStep].slice(-6)
+  }, [currentStep])
+  // Position N dots evenly around a circle. Radius + size chosen so
+  // 16 dots still don't overlap; the SVG keeps the layout
+  // 100 px ring centred horizontally — label sits above so the
+  // whole assembly is symmetric across the inspector width. Was
+  // 86 px sideways; this is just enough bigger to read without
+  // dominating vertical space.
+  const ringSize = 100
+  const cx = ringSize / 2
+  const cy = ringSize / 2
+  const r = ringSize / 2 - 10
+  const dotRadius = 4.5
+  return (
+    <div className="mt-2 flex flex-col items-center justify-center gap-1">
+      <span className="label">Playhead</span>
+      <svg
+        width={ringSize}
+        height={ringSize}
+        viewBox={`0 0 ${ringSize} ${ringSize}`}
+        style={{ overflow: 'visible' }}
+      >
+        {/* Faint guide circle so the eye reads "ring" even when no
+            dot is lit at a given angle. Opacity-low so it doesn't
+            dominate. */}
+        <circle
+          cx={cx}
+          cy={cy}
+          r={r}
+          fill="none"
+          stroke="rgb(var(--c-border) / 0.6)"
+          strokeWidth={1}
+        />
+        {Array.from({ length: s }, (_, i) => {
+          // Step 0 sits at 12 o'clock (-π/2 offset).
+          const ang = (i / s) * Math.PI * 2 - Math.PI / 2
+          const dx = cx + r * Math.cos(ang)
+          const dy = cy + r * Math.sin(ang)
+          const hue = hueForStep(i, s)
+          const isNow = i === currentStep
+          // Trail position 0..n-1 (smaller idx = older)
+          const trailIdx = trailRef.current.indexOf(i)
+          const trailLen = trailRef.current.length
+          const isTrail = trailIdx >= 0 && !isNow
+          const trailOpacity =
+            isTrail && trailLen > 0
+              ? 0.18 + ((trailIdx + 1) / trailLen) * 0.4
+              : 0.85
+          return (
+            <g key={`${i}-${isNow ? 'now' : ''}`}>
+              <circle
+                cx={dx}
+                cy={dy}
+                r={dotRadius}
+                fill={
+                  isNow
+                    ? `hsl(${hue} 90% 65%)`
+                    : isTrail
+                      ? `hsl(${hue} 70% 55%)`
+                      : `hsl(${hue} 35% 35%)`
+                }
+                stroke={
+                  isNow
+                    ? `hsl(${hue} 95% 75%)`
+                    : `hsl(${hue} 50% 35% / 0.7)`
+                }
+                strokeWidth={isNow ? 2 : 1}
+                opacity={isNow ? 1 : isTrail ? trailOpacity : 0.65}
+                style={{
+                  filter: isNow
+                    ? `drop-shadow(0 0 6px hsl(${hue} 95% 70% / 0.9)) drop-shadow(0 0 14px hsl(${hue} 90% 65% / 0.5))`
+                    : isTrail
+                      ? `drop-shadow(0 0 3px hsl(${hue} 75% 55% / ${trailOpacity * 0.6}))`
+                      : 'none',
+                  transition:
+                    'r 220ms ease-out, opacity 220ms ease-out, fill 220ms ease-out'
+                }}
+              >
+                <title>{`Step ${i + 1}`}</title>
+              </circle>
+            </g>
+          )
+        })}
+        {/* Centre marker — a small dim disc that hints "this is a
+            wheel" on first read. */}
+        <circle
+          cx={cx}
+          cy={cy}
+          r={2.5}
+          fill="rgb(var(--c-muted) / 0.5)"
+        />
+      </svg>
+    </div>
+  )
+}
+
+// Ratchet preview — each step is a square framing a small dot whose
+// size grows with the burst probability. The bigger / brighter the
+// dot, the more likely the step will fan out into a sub-pulse burst.
+// The label above the row spells out "P × 2..N" so the numeric meaning
+// stays at a glance.
+function RatchetPreview({
+  steps,
+  ratchetProb,
+  ratchetMaxDiv,
+  ratchetVariation,
+  seed,
+  currentStep
+}: {
+  steps: number
+  ratchetProb: number
+  ratchetMaxDiv: number
+  ratchetVariation: number
+  seed: number
+  currentStep: number
+}): JSX.Element {
+  const s = Math.max(1, Math.min(16, Math.floor(steps)))
+  const variation01 = Math.max(0, Math.min(100, ratchetVariation)) / 100
+  return (
+    <div className="mt-2 flex flex-col items-center gap-1">
+      <span className="label whitespace-nowrap">
+        {variation01 > 0
+          ? `Bursts varied · ${Math.round(variation01 * 100)}% spread`
+          : `Bursts ${Math.round(ratchetProb)}% · ×2..${ratchetMaxDiv}`}
+      </span>
+      <div className="grid grid-cols-8 gap-[5px] items-center justify-items-center">
+        {Array.from({ length: s }, (_, i) => {
+          const hue = hueForStep(i, s)
+          const isNow = i === currentStep
+          const cls = ['rc-ratchet-cell']
+          if (isNow) cls.push('is-now')
+          // Per-step prob + maxDiv — mirrors engine `ratchetStepParams`.
+          // At variation=0, every step uses the global value. At 100,
+          // each step's hash drives its own.
+          const probHash = stepHash(i, seed)
+          const divHash = stepHash(i + 1000, seed * 7 + 13)
+          const stepProb =
+            (1 - variation01) * ratchetProb + variation01 * probHash * 100
+          const stepDiv = Math.max(
+            2,
+            Math.min(
+              8,
+              Math.round(
+                (1 - variation01) * ratchetMaxDiv + variation01 * (2 + divHash * 6)
+              )
+            )
+          )
+          const stepProbClamped = Math.max(0, Math.min(100, stepProb))
+          // Dot size encodes the per-step probability so the variation
+          // visibly translates into different dot sizes per step.
+          const dotPx = 3 + Math.round((stepProbClamped / 100) * 11)
+          return (
+            <div
+              key={`${i}-${isNow ? 'now' : ''}`}
+              className={cls.join(' ')}
+              style={{ ['--rc-hue' as string]: String(hue) }}
+              title={`Step ${i + 1} — ${Math.round(stepProbClamped)}% · ×2..${stepDiv}`}
+            >
+              <div
+                className="rc-ratchet-dot"
+                style={{
+                  width: `${dotPx}px`,
+                  height: `${dotPx}px`,
+                  boxShadow: isNow
+                    ? `0 0 8px hsl(${hue} 95% 70% / 0.9)`
+                    : stepProbClamped > 0
+                      ? `0 0 4px hsl(${hue} 80% 60% / 0.5)`
+                      : 'none'
+                }}
+              />
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// Bounce preview — animated. Static arcs (one per bounce, geometrically
+// shrinking widths + decaying heights) form the visual scaffolding;
+// over them, an SVG ball traces the active arc in real time, splashing
+// into a coloured ring at every landing. Timing is matched to the
+// engine's actual per-arc duration (derived from the cell's sync
+// mode + global BPM) so what you see is what you hear.
+function BouncePreview({
+  cell,
+  currentStep
+}: {
+  cell: import('@shared/types').Cell
+  currentStep: number
+}): JSX.Element {
+  const seq = cell.sequencer
+  const globalBpm = useStore((st) => st.session.globalBpm)
+  const s = Math.max(1, Math.min(16, Math.floor(seq.steps)))
+  // Same formulas as bounceCoeff / bounceStepDuration in factory.ts —
+  // mirrored here so the preview can compute both per-arc duration AND
+  // amplitude in one pass without round-tripping through the helper.
+  const e = 0.4 + (Math.max(0, Math.min(100, seq.bounceDecay)) / 100) * 0.55
+  const sumGeom = e === 1 ? s : (1 - Math.pow(e, s)) / (1 - e)
+  // Cycle's average step duration in ms — depends on which sync mode
+  // the user picked. Drives the SMIL `dur` so the ball's animation
+  // duration matches the engine's actual step boundary.
+  const stepDurMs =
+    seq.syncMode === 'bpm'
+      ? 60000 / Math.max(1, globalBpm)
+      : seq.syncMode === 'tempo'
+        ? 60000 / Math.max(1, seq.bpm)
+        : Math.max(1, seq.stepMs)
+  const cycleMs = stepDurMs * s
+  // Per-arc duration in seconds (for SMIL). Floored at 0.05s so the
+  // last few tiny bounces in a quick-decay cycle still register
+  // visually instead of teleporting. Capped at 4s for sanity in
+  // very-slow tempos.
+  const arcDurSec = (i: number): number =>
+    Math.max(0.05, Math.min(4, (cycleMs * Math.pow(e, i) / sumGeom) / 1000))
+  // Layout: 240px wide × 60px tall, with a 4px floor margin so arcs
+  // can land on a baseline without touching the edge.
+  const W = 240
+  const H = 60
+  const baseline = H - 4
+  const maxArcHeight = baseline - 4
+  // Compute every arc's geometry up-front so we know cumulative x.
+  const arcs: {
+    x0: number
+    x1: number
+    peakY: number
+    hue: number
+    pathD: string
+  }[] = []
+  let cursor = 0
+  for (let i = 0; i < s; i++) {
+    const stepFrac = Math.pow(e, i) / sumGeom
+    const w = stepFrac * W
+    const x0 = cursor
+    const x1 = cursor + w
+    const amp = Math.pow(e, i) // 1 → e^(s-1)
+    const peakY = baseline - amp * maxArcHeight
+    const midX = (x0 + x1) / 2
+    // Lift the Bézier control above the visual peak so the curve apex
+    // reaches peakY (quadratic Bézier maxes at half-way between mid
+    // control and endpoints).
+    const ctrlY = 2 * peakY - baseline
+    const pathD = `M ${x0} ${baseline} Q ${midX} ${ctrlY} ${x1} ${baseline}`
+    arcs.push({ x0, x1, peakY, hue: hueForStep(i, s), pathD })
+    cursor = x1
+  }
+
+  // The ball + splash live inside a keyed <g> so React unmounts +
+  // remounts (and therefore restarts the SMIL timeline) every time
+  // the engine advances to a new step. Without the key, the SMIL
+  // animations would only fire once per BouncePreview lifetime.
+  const liveArc = currentStep >= 0 && currentStep < arcs.length ? arcs[currentStep] : null
+
+  return (
+    // Constrained-width wrapper so the SVG can never poke past the
+    // inspector's right edge at narrow widths. The SVG itself
+    // scales via viewBox + width=100% so the arcs reshape with the
+    // available space (small inspectors get a denser bounce, wide
+    // ones get a roomy one). overflow: visible was leaking the
+    // splash rings past the right edge — clipped now.
+    <div className="mt-2 flex items-center gap-2 min-w-0">
+      <span className="label shrink-0">Bounce</span>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="xMidYMid meet"
+        style={{
+          width: '100%',
+          height: 'auto',
+          maxWidth: W,
+          minWidth: 0,
+          overflow: 'hidden'
+        }}
+      >
+        {/* Floor line — gives the eye a "ground" to land on. */}
+        <line
+          x1={0}
+          y1={baseline}
+          x2={W}
+          y2={baseline}
+          stroke="rgb(var(--c-border) / 0.7)"
+          strokeWidth={1}
+        />
+        {arcs.map((arc, i) => {
+          const isNow = i === currentStep
+          const stroke = isNow
+            ? `hsl(${arc.hue} 95% 70%)`
+            : `hsl(${arc.hue} 70% 55%)`
+          const opacity = isNow ? 1 : 0.4 + (1 - i / s) * 0.35
+          return (
+            <g
+              key={i}
+              style={{
+                filter: isNow
+                  ? `drop-shadow(0 0 6px hsl(${arc.hue} 95% 70% / 0.85)) drop-shadow(0 0 14px hsl(${arc.hue} 90% 65% / 0.5))`
+                  : undefined,
+                transition: 'opacity 220ms ease-out'
+              }}
+            >
+              <path
+                d={arc.pathD}
+                fill="none"
+                stroke={stroke}
+                strokeWidth={isNow ? 2.5 : 1.5}
+                strokeLinecap="round"
+                opacity={opacity}
+              >
+                <title>{`Bounce ${i + 1} — amplitude ${Math.pow(e, i).toFixed(2)}`}</title>
+                {/* Active-arc breathing pulse — subtle stroke-width
+                    swell timed to the bounce so the arc "breathes"
+                    in sync with the ball flight. Re-keyed on
+                    currentStep below so it restarts each step. */}
+                {isNow && (
+                  <animate
+                    attributeName="stroke-width"
+                    values="2.5; 3.6; 2.5"
+                    dur={`${arcDurSec(i)}s`}
+                    repeatCount="1"
+                  />
+                )}
+              </path>
+              {/* Landing dot — quiet guidepost where each bounce
+                  kisses the floor (the splash ring above will
+                  bloom from this same point in real time). */}
+              <circle
+                cx={arc.x1}
+                cy={baseline}
+                r={isNow ? 2.5 : 2}
+                fill={stroke}
+                opacity={opacity}
+              />
+            </g>
+          )
+        })}
+
+        {/* Live ball + splash. Keyed on currentStep so React unmounts
+            and remounts the whole group every step boundary, which
+            restarts the SMIL animations from t=0 — exactly the timing
+            we want for the visual to follow the engine's playhead. */}
+        {liveArc && (
+          <g key={`bounce-live-${currentStep}`}>
+            {/* Ghost trail — three dimmer balls that begin slightly
+                later than the leader, producing a comet-tail along
+                the same parabolic path. Each starts at arc.x0 / floor
+                so it doesn't flash in the SVG corner before its
+                animation begins. */}
+            {[0.05, 0.1, 0.15].map((delaySec, gi) => (
+              <circle
+                key={gi}
+                cx={liveArc.x0}
+                cy={baseline}
+                r={4 - gi * 0.9}
+                fill={`hsl(${liveArc.hue} 90% 65%)`}
+                opacity={0}
+                style={{ pointerEvents: 'none' }}
+              >
+                <animateMotion
+                  dur={`${arcDurSec(currentStep)}s`}
+                  path={liveArc.pathD}
+                  fill="freeze"
+                  begin={`${delaySec}s`}
+                />
+                {/* Fade in once the ghost actually starts moving (so
+                    it doesn't sit visible at arc.x0 during its delay). */}
+                <animate
+                  attributeName="opacity"
+                  from={0}
+                  to={0.55 - gi * 0.15}
+                  dur="0.04s"
+                  begin={`${delaySec}s`}
+                  fill="freeze"
+                />
+                {/* Fade out as the ghost approaches the landing so
+                    the trail dissolves into the splash. */}
+                <animate
+                  attributeName="opacity"
+                  values="0.55; 0"
+                  keyTimes="0; 1"
+                  dur={`${arcDurSec(currentStep) - delaySec}s`}
+                  begin={`${delaySec + arcDurSec(currentStep) * 0.6}s`}
+                  fill="freeze"
+                />
+              </circle>
+            ))}
+
+            {/* The leader — the loud, glowing main ball. */}
+            <circle
+              r={5}
+              fill={`hsl(${liveArc.hue} 95% 72%)`}
+              style={{
+                filter: `drop-shadow(0 0 7px hsl(${liveArc.hue} 95% 72% / 0.95)) drop-shadow(0 0 16px hsl(${liveArc.hue} 90% 65% / 0.55))`,
+                pointerEvents: 'none'
+              }}
+            >
+              <animateMotion
+                dur={`${arcDurSec(currentStep)}s`}
+                path={liveArc.pathD}
+                fill="freeze"
+              />
+              {/* Tiny scale pop on landing so the impact reads. */}
+              <animate
+                attributeName="r"
+                values="5; 6.5; 4.5; 5"
+                keyTimes="0; 0.92; 0.97; 1"
+                dur={`${arcDurSec(currentStep)}s`}
+                fill="freeze"
+              />
+            </circle>
+
+            {/* Splash ring at the landing — three layered concentric
+                rings expanding + fading at slightly staggered rates,
+                giving the landing a satisfying water-droplet feel.
+                Begin at arcDur so they trigger right when the ball
+                kisses the floor. */}
+            {[0, 0.04, 0.08].map((delay, ri) => (
+              <circle
+                key={`splash-${ri}`}
+                cx={liveArc.x1}
+                cy={baseline}
+                fill="none"
+                stroke={`hsl(${liveArc.hue} 95% ${75 - ri * 5}%)`}
+                strokeWidth={2 - ri * 0.5}
+                opacity={0}
+                style={{ pointerEvents: 'none' }}
+              >
+                <animate
+                  attributeName="r"
+                  from={2}
+                  to={18 - ri * 2}
+                  dur="0.55s"
+                  begin={`${arcDurSec(currentStep) + delay}s`}
+                  fill="freeze"
+                />
+                <animate
+                  attributeName="opacity"
+                  values="0; 0.95; 0"
+                  keyTimes="0; 0.2; 1"
+                  dur="0.55s"
+                  begin={`${arcDurSec(currentStep) + delay}s`}
+                  fill="freeze"
+                />
+                <animate
+                  attributeName="stroke-width"
+                  from={2 - ri * 0.5}
+                  to={0.3}
+                  dur="0.55s"
+                  begin={`${arcDurSec(currentStep) + delay}s`}
+                  fill="freeze"
+                />
+              </circle>
+            ))}
+
+            {/* A short floor-flash directly under the landing point —
+                a brief horizontal bar that brightens, then fades, like
+                the ground briefly registering the impact. */}
+            <line
+              x1={liveArc.x1 - 8}
+              y1={baseline}
+              x2={liveArc.x1 + 8}
+              y2={baseline}
+              stroke={`hsl(${liveArc.hue} 95% 75%)`}
+              strokeWidth={2}
+              strokeLinecap="round"
+              opacity={0}
+              style={{ pointerEvents: 'none' }}
+            >
+              <animate
+                attributeName="opacity"
+                values="0; 0.9; 0"
+                keyTimes="0; 0.15; 1"
+                dur="0.45s"
+                begin={`${arcDurSec(currentStep)}s`}
+                fill="freeze"
+              />
+              <animate
+                attributeName="x1"
+                values={`${liveArc.x1 - 4}; ${liveArc.x1 - 14}`}
+                keyTimes="0; 1"
+                dur="0.45s"
+                begin={`${arcDurSec(currentStep)}s`}
+                fill="freeze"
+              />
+              <animate
+                attributeName="x2"
+                values={`${liveArc.x1 + 4}; ${liveArc.x1 + 14}`}
+                keyTimes="0; 1"
+                dur="0.45s"
+                begin={`${arcDurSec(currentStep)}s`}
+                fill="freeze"
+              />
+            </line>
+          </g>
+        )}
+      </svg>
+    </div>
+  )
+}
+
+// Per-mode help text shown under the live-values grid in Generative
+// mode. Spells out what the seed becomes for each mode, in the same
+// organic / hardware-sequencer language as the title-attr metaphors.
+function genHelpText(mode: SeqMode): string {
+  switch (mode) {
+    case 'steps':
+      return 'Tide: the seed value swells through one cycle like a wave rising and breaking. Variation sets the swell depth; Seed shifts where the peak lands.'
+    case 'euclidean':
+      return 'Accent: every Euclidean hit lands harder on the downbeat than off-beat — natural drummer-emphasis from the same single seed value.'
+    case 'polyrhythm':
+      return 'Voicing: Ring A hits sit below the seed (root), Ring B hits sit above (harmony), coincidence peaks at full resonance.'
+    case 'density':
+      return 'Wave: a continuous sine runs through the row. The gate fires sparsely or densely; each fired step samples the wave\'s height at its position.'
+    case 'cellular':
+      return 'Crowd: each on-cell\'s value tracks how many of its neighbours are alive. Lonely cells dim, crowded cells excite.'
+    case 'drift':
+      return 'Terrain: a fixed 1D landscape (smooth hills + valleys) is generated from the Seed. The Brownian walker samples the elevation at each landing.'
+    case 'ratchet':
+      return 'Scatter: the first sub-pulse of each burst is the loud first impact; subsequent sub-pulses scatter from the seed into a flock of values.'
+    case 'bounce':
+      return 'Bounce: each cycle is one drop. Step 0 hits the floor at the seed value; subsequent bounces decay in amplitude (and time) until the cycle resets.'
+    default:
+      return 'Generative mode: each step\'s value is computed live from the cell\'s Value field as a seed.'
+  }
+}
+
+// Read-only preview of the values the engine is currently generating
+// for each step. Replaces the editable StepInput grid when generative
+// mode is on. Uses the same generateStepValue() the engine calls, so
+// the preview is always exactly what's being sent.
+//
+// For modes that wrap a sub-pulse layer (Ratchet → Scatter) we render
+// only the first sub-pulse value per step — visiting all sub-values
+// would clutter the grid; the live preview is meant to give the user
+// a snapshot of the cycle's "shape", not every micro-event.
+function GenerativeStepPreview({
+  steps,
+  cell,
+  currentStep
+}: {
+  steps: number
+  cell: import('@shared/types').Cell
+  currentStep: number
+}): JSX.Element {
+  const seq = cell.sequencer
+  // Read engine live value for the currently selected cell. For
+  // Ratchet specifically (and any other mode where sub-pulse/state
+  // makes the active step's value differ from the precomputed
+  // generative result), substitute the live value at the active
+  // step so the preview reflects real-time playback.
+  const sel = useStore((st) => st.selectedCell)
+  const liveValue = useStore((st) =>
+    sel ? st.engine.currentValueBySceneAndTrack[sel.sceneId]?.[sel.trackId] : undefined
+  )
+  const values = Array.from({ length: steps }, (_, i) =>
+    generateStepValue({
+      baseRaw: cell.value,
+      mode: seq.mode,
+      stepIdx: i,
+      steps,
+      amount: seq.genAmount,
+      seed: seq.seed,
+      ringALength: seq.ringALength,
+      ringBLength: seq.ringBLength,
+      cellRow: cellularInitialRow(seq.cellSeed, steps),
+      bounceDecay: seq.bounceDecay,
+      subIdx: 0,
+      subdiv: 1,
+      scaleToUnit: cell.scaleToUnit
+    })
+  )
+  return (
+    <div className="grid grid-cols-4 gap-1">
+      {values.map((v, i) => {
+        const isActive = i === currentStep
+        // Active step → show engine's live emitted value (captures
+        // Ratchet sub-pulse scatter, Cellular evolved row, etc).
+        const display = isActive && liveValue !== undefined ? liveValue : v
+        return (
+          <div
+            key={`${i}-${display}-${isActive ? 'now' : ''}`}
+            className={`px-1 py-1 rounded text-[10px] font-mono text-center border truncate transition-all duration-200 ${
+              isActive
+                ? 'border-success bg-success/20 text-success'
+                : 'border-border bg-panel2/40 text-muted'
+            }`}
+            title={`Step ${i + 1}: ${display}`}
+          >
+            {display}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -2201,11 +4138,17 @@ function EuclideanPreview({
 function StepInput({
   index,
   active,
+  muted,
   value,
   onChange
 }: {
   index: number
   active: boolean
+  /** When the playhead is here but the step is gated off (Euclidean
+   *  miss, Polyrhythm gap, Cellular dead bit, Density rest), the
+   *  step glows grey instead of orange — visual feedback that the
+   *  receiver will hold rather than fire. */
+  muted?: boolean
   value: string
   onChange: (v: string) => void
 }): JSX.Element {
@@ -2225,9 +4168,10 @@ function StepInput({
     const el = pulseRef.current
     if (!el) return
     el.classList.remove('seq-pulse')
+    el.classList.remove('seq-pulse-muted')
     void el.offsetWidth
-    el.classList.add('seq-pulse')
-  }, [active])
+    el.classList.add(muted ? 'seq-pulse-muted' : 'seq-pulse')
+  }, [active, muted])
 
   return (
     <div className="relative">
@@ -2235,7 +4179,9 @@ function StepInput({
       <input
         ref={inputRef}
         defaultValue={value}
-        className={`input text-[11px] py-0.5 px-1 font-mono w-full ${active ? 'border-accent' : ''}`}
+        className={`input text-[11px] py-0.5 px-1 font-mono w-full ${
+          active && !muted ? 'border-accent' : active && muted ? 'border-muted' : ''
+        }`}
         placeholder="–"
         onFocus={(e) => e.currentTarget.select()}
         onChange={(e) => onChange(e.target.value)}

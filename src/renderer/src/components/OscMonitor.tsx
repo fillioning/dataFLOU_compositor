@@ -52,6 +52,24 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
   // survives a drawer toggle.
   const drawerHeight = useStore((s) => s.oscMonitorHeight)
   const setDrawerHeight = useStore((s) => s.setOscMonitorHeight)
+  // The drawer lives inside the Ctrl+wheel zoom wrapper now (so the
+  // Pool tabs + OSC log scale alongside the rest of the app), which
+  // means a 600px max at uiScale=2 would eat 1200 device pixels. Cap
+  // the resize handle's max by 1/uiScale so the drawer can never
+  // grow past ~600 device pixels regardless of zoom. The min mirrors
+  // the same logic so the drawer's smallest CSS height shrinks at
+  // higher zoom (otherwise the user can't bring it below 240 device
+  // pixels at uiScale=2).
+  const uiScale = useStore((s) => s.uiScale)
+  const effectiveMaxDrawer = Math.max(160, Math.round(600 / Math.max(0.5, uiScale)))
+  const effectiveMinDrawer = Math.max(60, Math.round(120 / Math.max(0.5, uiScale)))
+  // Clamp the stored height back into the new effective range when
+  // zoom changes — without this a 600 px height set at scale=1 would
+  // remain 600 css px (= 1200 device px) after zooming to 2.
+  useEffect(() => {
+    if (drawerHeight > effectiveMaxDrawer) setDrawerHeight(effectiveMaxDrawer)
+    else if (drawerHeight < effectiveMinDrawer) setDrawerHeight(effectiveMinDrawer)
+  }, [effectiveMaxDrawer, effectiveMinDrawer, drawerHeight, setDrawerHeight])
   const poolHidden = useStore((s) => s.poolHidden)
   const setPoolHidden = useStore((s) => s.setPoolHidden)
   // Store raw events in a ref so the subscriber doesn't trigger a re-render
@@ -146,8 +164,8 @@ function OscMonitorDrawer({ onClose }: { onClose: () => void }): JSX.Element {
         direction="row"
         value={drawerHeight}
         onChange={setDrawerHeight}
-        min={120}
-        max={600}
+        min={effectiveMinDrawer}
+        max={effectiveMaxDrawer}
         inverse
         className="absolute top-0 left-0 right-0 h-[4px] z-20 cursor-row-resize"
         title="Drag to resize the OSC monitor drawer"

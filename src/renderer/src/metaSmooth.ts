@@ -28,6 +28,17 @@ interface Tween {
 const tweens = new Map<number, Tween>()
 let raf: number | null = null
 
+// Latch a single console.warn the first time an IPC rejection surfaces
+// from sendMetaValue — main may have crashed / be restarting and we
+// don't want to flood devtools at ~60Hz per active knob. Resets on
+// each module load.
+let metaIpcWarned = false
+function warnOnce(e: unknown): void {
+  if (metaIpcWarned) return
+  metaIpcWarned = true
+  console.warn('[meta] sendMetaValue IPC failed:', (e as Error)?.message ?? e)
+}
+
 function currentOf(t: Tween, now: number): number {
   if (t.smoothMs <= 0) return t.target
   const elapsed = now - t.startTime
@@ -45,7 +56,11 @@ function tick(): void {
     const v = currentOf(t, now)
     display[idx] = v
     // Fire OSC for this frame — main scales via curve + blasts destinations.
-    window.api.sendMetaValue(idx, v).catch(() => void 0)
+    // IPC rejections are silent — they fire ~60Hz per active knob and
+    // logging every one would flood devtools when main is restarting.
+    // A single warn on the first rejection is enough to surface
+    // engine-side problems without spamming.
+    window.api.sendMetaValue(idx, v).catch(warnOnce)
     if (v === t.target) tweens.delete(idx)
     else anyActive = true
   }
@@ -77,7 +92,7 @@ export function setKnobTarget(idx: number, target: number, smoothMs: number): vo
     const display = [...store.metaKnobDisplayValues]
     display[idx] = clamped
     store.setMetaKnobDisplayValues(display)
-    window.api.sendMetaValue(idx, clamped).catch(() => void 0)
+    window.api.sendMetaValue(idx, clamped).catch(warnOnce)
     return
   }
 

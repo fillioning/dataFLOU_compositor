@@ -1,7 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../store'
 import { createPortal } from 'react-dom'
-import { effectiveLfoHz } from '@shared/factory'
+import {
+  cellularInitialRow,
+  effectiveLfoHz,
+  generateStepValue
+} from '@shared/factory'
 import { DestHealthDot } from './DestHealthDot'
 
 const DRAG_MIME = 'application/x-dataflou-cell'
@@ -35,6 +39,75 @@ export default function CellTile({
     (s) => s.engine.seqStepBySceneAndTrack[sceneId]?.[trackId]
   )
   const liveValue = useStore((s) => s.engine.currentValueBySceneAndTrack[sceneId]?.[trackId])
+
+  // What text gets painted in the cell tile's value slot. Three branches:
+  //   1. Cell is playing AND the engine has emitted a live value for it
+  //      → show the engine's actual emitted value (post-modulation,
+  //      post-scaling, post-generative). This is the source of truth.
+  //   2. Sequencer + Generative are on (but cell isn't playing yet)
+  //      → preview-render the value the engine WOULD emit at the
+  //      current sequencer step, computed in the renderer using the
+  //      same `generateStepValue` helper the engine uses. This is
+  //      what makes the tile reflect Variation / Seed / mode tweaks
+  //      instantly, even before triggering — without this branch the
+  //      tile would just show the raw seed (cell.value) and feel
+  //      disconnected from the generative knobs.
+  //   3. Otherwise → show the cell's static value field (the seed,
+  //      or the literal value if the sequencer is off).
+  // Memo guards against re-running generateStepValue on every render
+  // when none of the inputs changed.
+  const generativePreview = useMemo(() => {
+    if (!cell?.sequencer.enabled || !cell.sequencer.generative) return null
+    const seq = cell.sequencer
+    const steps = Math.max(1, Math.min(16, Math.floor(seq.steps)))
+    const idx =
+      typeof currentStep === 'number' && currentStep >= 0
+        ? currentStep
+        : 0
+    return generateStepValue({
+      baseRaw: cell.value,
+      mode: seq.mode,
+      stepIdx: idx,
+      steps,
+      amount: seq.genAmount,
+      seed: seq.seed,
+      ringALength: seq.ringALength,
+      ringBLength: seq.ringBLength,
+      // Renderer doesn't have access to the engine's evolving
+      // cellular row, so we use the deterministic initial row.
+      // This makes the preview match what the engine emits at the
+      // start of each cycle; later in the cycle it may differ
+      // (live engine reading wins via branch 1 above).
+      cellRow: cellularInitialRow(seq.cellSeed, steps),
+      bounceDecay: seq.bounceDecay,
+      // Sub-pulse 0 of 1 = "treat as a normal step, not mid-burst".
+      subIdx: 0,
+      subdiv: 1,
+      scaleToUnit: cell.scaleToUnit
+    })
+  }, [
+    cell?.value,
+    cell?.scaleToUnit,
+    cell?.sequencer.enabled,
+    cell?.sequencer.generative,
+    cell?.sequencer.mode,
+    cell?.sequencer.steps,
+    cell?.sequencer.genAmount,
+    cell?.sequencer.seed,
+    cell?.sequencer.ringALength,
+    cell?.sequencer.ringBLength,
+    cell?.sequencer.cellSeed,
+    cell?.sequencer.bounceDecay,
+    currentStep
+  ])
+  const displayValue =
+    isPlaying && liveValue !== undefined
+      ? liveValue
+      : generativePreview ?? cell?.value ?? ''
+  // Whether the displayed value comes from the engine (live) or from
+  // either the generative preview or the static seed. Drives the
+  // accent-tinted styling so live values pop visually.
+  const isLiveDisplay = isPlaying && liveValue !== undefined
   const tracksCollapsedRaw = useStore((s) => s.tracksCollapsed)
   const showMode = useStore((s) => s.showMode)
   // Show mode always uses the compact single-line tile — no "expanded"
@@ -57,13 +130,19 @@ export default function CellTile({
   // point zustand would otherwise stop pushing updates).
   const triggerAtRef = useRef<number | null>(null)
   const wasPlayingRef = useRef(false)
-  if (isPlaying && !wasPlayingRef.current) {
-    triggerAtRef.current = Date.now()
-  }
-  if (!isPlaying && wasPlayingRef.current) {
-    triggerAtRef.current = null
-  }
-  wasPlayingRef.current = isPlaying
+  // Move the play-edge detection into a useEffect so a re-render
+  // during the isPlaying transition doesn't re-stamp triggerAtRef
+  // with a later `Date.now()` (which previously caused the ramp
+  // progress dot to micro-jitter at the moment of trigger).
+  useEffect(() => {
+    if (isPlaying && !wasPlayingRef.current) {
+      triggerAtRef.current = Date.now()
+    }
+    if (!isPlaying && wasPlayingRef.current) {
+      triggerAtRef.current = null
+    }
+    wasPlayingRef.current = isPlaying
+  }, [isPlaying])
 
   const isRampCell = cell?.modulation.enabled && cell.modulation.type === 'ramp'
   // Compute an upper bound on the ramp length here (at the top of the
@@ -378,10 +457,10 @@ export default function CellTile({
         </span>
         <span
           className={`text-[12px] font-mono font-semibold whitespace-nowrap shrink-0 text-right ${
-            isPlaying && liveValue !== undefined ? 'text-accent' : ''
+            isLiveDisplay ? 'text-accent' : ''
           }`}
         >
-          {isPlaying && liveValue !== undefined ? liveValue : cell.value}
+          {displayValue}
         </span>
       </div>
       {filledMenu && (
@@ -464,10 +543,10 @@ export default function CellTile({
       <div className="flex-1 flex items-center">
         <span
           className={`text-[14px] font-mono font-semibold whitespace-nowrap ${
-            isPlaying && liveValue !== undefined ? 'text-accent' : ''
+            isLiveDisplay ? 'text-accent' : ''
           }`}
         >
-          {isPlaying && liveValue !== undefined ? liveValue : cell.value}
+          {displayValue}
         </span>
       </div>
       <div className="flex items-center gap-1 text-[9px] text-muted">

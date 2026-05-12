@@ -8,10 +8,18 @@
 // (TopBar.tsx). Pushes the rest of the app down by sitting in the
 // App's flex-column. State lives in the session so it persists with .dflou.json.
 
-import { useLayoutEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../store'
 import { META_BANK_COUNT, META_KNOBS_PER_BANK, META_MAX_DESTS } from '@shared/types'
-import type { MetaCurve, MetaKnob as MetaKnobModel } from '@shared/types'
+import type {
+  InstrumentFunction,
+  InstrumentTemplate,
+  MetaCurve,
+  MetaDest,
+  MetaKnob as MetaKnobModel,
+  Session,
+  Track
+} from '@shared/types'
 import { META_MAX_HEIGHT, META_MAX_SMOOTH_MS, META_MIN_HEIGHT } from '@shared/factory'
 import { BoundedNumberInput } from './BoundedNumberInput'
 import { DestHealthDot } from './DestHealthDot'
@@ -129,15 +137,19 @@ export default function MetaControllerBar(): JSX.Element | null {
         })}
       </div>
 
-      {/* Bank selector — 4 letters (A/B/C/D) stacked vertically. Each knob
-          bank holds 8 knobs, so 32 total. Click a letter to swap the bank
-          shown to the left while keeping the within-bank position. */}
+      {/* Bank selector — 4 letters (A/B/C/D) stacked in a single
+          column so the bar's overall width stays narrow. Each knob
+          bank holds 8 knobs, so 32 total. Click a letter to swap the
+          bank shown to the left while keeping the within-bank
+          position. */}
       <div
         data-hide-in-show="true"
-        className="flex flex-col items-stretch justify-start gap-0.5 px-1.5 py-1 border-l border-border shrink-0"
+        className="flex flex-col items-stretch justify-start gap-0.5 px-1 py-1 border-l border-border shrink-0"
       >
         <span className="label text-[9px] text-center leading-none mb-0.5">BANKS</span>
-        <div className="grid grid-cols-2 grid-rows-2 gap-0.5">
+        {/* 1-column × 4-row grid. Buttons share the same width via
+            grid stretching so A/B/C/D align cleanly under each other. */}
+        <div className="grid grid-cols-1 grid-rows-4 gap-0.5">
           {Array.from({ length: META_BANK_COUNT }, (_, i) => {
             const letter = String.fromCharCode(65 + i)
             const active = i === bankIdx
@@ -211,7 +223,8 @@ function KnobDetails({
   readOnly?: boolean
 }): JSX.Element {
   const updateMetaKnob = useStore((s) => s.updateMetaKnob)
-  const addMetaDestination = useStore((s) => s.addMetaDestination)
+  // `addMetaDestination` is now wired through <DestinationPicker/> so
+  // it doesn't need to live on this scope.
   const removeMetaDestination = useStore((s) => s.removeMetaDestination)
   const updateMetaDestination = useStore((s) => s.updateMetaDestination)
   const setMetaKnobMidi = useStore((s) => s.setMetaKnobMidi)
@@ -314,25 +327,24 @@ function KnobDetails({
         )}
       </div>
 
-      {/* Row 2 — OSC destinations header. The curve description lives on
-          this same line (right-aligned via flex-1 spacer) so it sits
-          roughly under the Curve dropdown above and doesn't eat a full
-          extra row. */}
-      <div className="flex items-center gap-2">
+      {/* Row 2 — OSC destinations header + active-Instrument picker.
+          The picker dropdowns (Instrument → Parameter → optional
+          Value-slot) sit to the right of the "Destinations" label;
+          the "+" button at the end commits the picker's current
+          selection as a new destination. Empty picker = the old
+          freeform "+ Destination" behaviour (seeds from session
+          defaults).
+          The curve description hangs off the right edge via flex-1
+          so it sits roughly under the Curve dropdown above and
+          doesn't eat a full extra row. */}
+      <div className="flex items-center gap-2 flex-wrap">
         <span className="label shrink-0">
           Destinations ({knob.destinations.length}/{META_MAX_DESTS})
         </span>
-        <button
-          className="btn text-[11px] shrink-0"
-          onClick={() => addMetaDestination(knobIndex)}
-          disabled={destFull}
-          title={destFull ? `Max ${META_MAX_DESTS} destinations` : 'Add another OSC destination'}
-        >
-          + Destination
-        </button>
+        <DestinationPicker knobIndex={knobIndex} disabled={destFull} />
         <span className="flex-1" />
         <span
-          className="text-[11px] text-muted italic truncate"
+          className="text-[11px] text-muted italic truncate max-w-[300px]"
           title={CURVE_DESCRIPTIONS[knob.curve]}
         >
           {CURVE_DESCRIPTIONS[knob.curve]}
@@ -395,3 +407,307 @@ function KnobDetails({
   )
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Destination picker — the dropdown trio that sits next to the
+// Destinations header. The user walks Instrument → Parameter → (when
+// the Parameter has more than one arg slot) Value, then clicks "+" to
+// commit the selection as a new MetaDest on the active knob.
+//
+// "Instrument" / "Parameter" map to sidebar Tracks rather than Pool
+// templates because the user thinks in terms of what's already on the
+// grid right now ("control THIS instrument's volume") not the Pool's
+// abstract blueprint. Orphan Function rows (rows with no parent
+// Instrument header) are surfaced under an "(orphans)" pseudo-group
+// so the user can still target them.
+//
+// The "+" button is enabled in two modes:
+//   1. No Instrument selected → freeform add, identical to the old
+//      "+ Destination" button (seeds IP/port from session defaults,
+//      address = /meta/N).
+//   2. Instrument (+ optional Parameter, optional Value) selected →
+//      prefilled add with the resolved {destIp, destPort, oscAddress}.
+//
+// A "Value" picker only renders when the chosen Parameter's argSpec
+// has length > 1. Picking a specific value-slot appends "/<slotName>"
+// to the OSC address — most receivers split a multi-arg bundle along
+// these per-slot sub-addresses, and the user can edit further on the
+// resulting destination row.
+// ─────────────────────────────────────────────────────────────────────
+function DestinationPicker({
+  knobIndex,
+  disabled
+}: {
+  knobIndex: number
+  // True when the knob already has META_MAX_DESTS destinations — the
+  // "+" button is greyed out and the picker reads as informational.
+  disabled: boolean
+}): JSX.Element {
+  const session = useStore((s) => s.session)
+  const addMetaDestination = useStore((s) => s.addMetaDestination)
+
+  // Local picker state. We don't persist this in the session because
+  // it's transient ("which thing am I about to wire up?"). Two
+  // tracks: the picked Instrument header row (or special token
+  // `__orphan__` when the user reached for an orphan Parameter), and
+  // the picked Parameter (Function) track. `slotIdx` is the value
+  // slot for multi-arg Parameters; -1 = "All values".
+  const [instrumentId, setInstrumentId] = useState<string>('')
+  const [fnTrackId, setFnTrackId] = useState<string>('')
+  const [slotIdx, setSlotIdx] = useState<number>(-1)
+
+  // Index the sidebar tracks once per render — cheap (≤128 entries)
+  // and keeps the dropdowns in sync with live add / remove on the
+  // sidebar.
+  const { instrumentTracks, orphanFnTracks, fnTracksByParent } = useMemo(
+    () => buildPickerIndex(session.tracks),
+    [session.tracks]
+  )
+
+  // Combined "Instrument" dropdown — Instruments first, then orphan
+  // Parameters. Orphan values are encoded `__orphan__:<fnTrackId>` so
+  // a single select holds both populations. Picking an orphan
+  // auto-locks the Parameter dropdown to that one row.
+  function pickInstrumentOption(raw: string): void {
+    if (raw.startsWith('__orphan__:')) {
+      const fnId = raw.slice('__orphan__:'.length)
+      setInstrumentId('__orphan__')
+      setFnTrackId(fnId)
+    } else {
+      setInstrumentId(raw)
+      setFnTrackId('')
+    }
+    setSlotIdx(-1)
+  }
+  function pickFunction(id: string): void {
+    setFnTrackId(id)
+    setSlotIdx(-1)
+  }
+
+  // The "Instrument" select's current value — orphan + function row
+  // need to be encoded together so the select shows the right option.
+  const instrumentSelectValue =
+    instrumentId === '__orphan__' && fnTrackId
+      ? `__orphan__:${fnTrackId}`
+      : instrumentId
+
+  // Resolved Function track + its arg-slot list.
+  const fnTrack: Track | undefined = fnTrackId
+    ? session.tracks.find((t) => t.id === fnTrackId)
+    : undefined
+  const fnArgSpec = fnTrack?.argSpec ?? []
+  const hasMultipleValues = fnArgSpec.length > 1
+
+  // Drop the Parameter selection if the referenced track disappears
+  // (e.g. user deleted it from the sidebar between picks). Without
+  // this the "+" button would silently fall back to freeform add.
+  // Same cleanup for the Instrument picker — if the user-picked
+  // header row is removed from the sidebar, reset to "no instrument"
+  // so the Parameter dropdown doesn't render against a stale parent.
+  useEffect(() => {
+    if (fnTrackId && !fnTrack) {
+      setFnTrackId('')
+      setSlotIdx(-1)
+    }
+  }, [fnTrack, fnTrackId])
+  useEffect(() => {
+    if (
+      instrumentId &&
+      instrumentId !== '__orphan__' &&
+      !instrumentTracks.some((t) => t.id === instrumentId)
+    ) {
+      setInstrumentId('')
+      setFnTrackId('')
+      setSlotIdx(-1)
+    }
+  }, [instrumentId, instrumentTracks])
+  // Stale slotIdx guard: if the user picks a multi-arg function then
+  // switches to one with fewer slots, clamp slotIdx so it doesn't
+  // index past the new argSpec. The hasMultipleValues gate hides the
+  // dropdown when shrinking past 1 slot, but the value still flows
+  // into commit().
+  useEffect(() => {
+    if (slotIdx >= fnArgSpec.length) setSlotIdx(-1)
+  }, [fnArgSpec.length, slotIdx])
+
+  function commit(): void {
+    if (disabled) return
+    if (!fnTrack) {
+      // Freeform path — same as the original "+ Destination" button.
+      // Either no Instrument was picked, or the user picked an
+      // Instrument header but hasn't chosen a Parameter yet.
+      addMetaDestination(knobIndex)
+      return
+    }
+    const baseAddr = fnTrack.defaultOscAddress ?? session.defaultOscAddress
+    let oscAddress = baseAddr || ''
+    // Defensive: even though the useEffect above clamps `slotIdx`
+    // when fnArgSpec shrinks, a between-effect-and-commit race could
+    // still leave it out of range. Bounds-check here so we never
+    // index into undefined.
+    if (slotIdx >= 0 && slotIdx < fnArgSpec.length && fnArgSpec[slotIdx]) {
+      const slot = fnArgSpec[slotIdx]
+      // Sanitise slot name for the address suffix: lowercased,
+      // non-alphanumerics → underscore. Most receivers either listen
+      // on the per-slot sub-address directly, or the user edits the
+      // generated string after creation to match their convention.
+      const safe = slot.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+      const trimmedBase = oscAddress.endsWith('/')
+        ? oscAddress.slice(0, -1)
+        : oscAddress
+      oscAddress = `${trimmedBase}/${safe || `arg${slotIdx + 1}`}`
+    }
+    const prefill: Partial<MetaDest> = {
+      destIp: fnTrack.defaultDestIp ?? session.defaultDestIp,
+      destPort: fnTrack.defaultDestPort ?? session.defaultDestPort,
+      oscAddress,
+      enabled: true
+    }
+    addMetaDestination(knobIndex, prefill)
+    // Keep the picker on the same Instrument so the user can quickly
+    // wire up several Parameters in a row — but clear Parameter +
+    // Value so they have to make a deliberate next choice.
+    setFnTrackId('')
+    setSlotIdx(-1)
+  }
+
+  // Enter on any focused dropdown commits — matches the typical
+  // "configure then commit" flow without forcing a mouse trip.
+  function onKey(e: React.KeyboardEvent): void {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      commit()
+    }
+  }
+
+  const childFns = instrumentId && instrumentId !== '__orphan__'
+    ? fnTracksByParent.get(instrumentId) ?? []
+    : []
+
+  return (
+    <div className="flex items-center gap-1 flex-wrap" onKeyDown={onKey}>
+      <select
+        className="input text-[11px] py-0.5"
+        value={instrumentSelectValue}
+        onChange={(e) => pickInstrumentOption(e.target.value)}
+        title="Active Instrument (sidebar row) to control"
+      >
+        <option value="">— Instrument —</option>
+        {instrumentTracks.length > 0 && (
+          <optgroup label="Instruments">
+            {instrumentTracks.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name || '(unnamed)'}
+              </option>
+            ))}
+          </optgroup>
+        )}
+        {orphanFnTracks.length > 0 && (
+          // Pseudo-group for parameter rows that were instantiated
+          // without a parent Instrument header. Picking one of these
+          // auto-locks the Parameter picker to that single row.
+          <optgroup label="(orphan parameters)">
+            {orphanFnTracks.map((t) => (
+              <option key={t.id} value={`__orphan__:${t.id}`}>
+                {t.name || '(unnamed)'}
+              </option>
+            ))}
+          </optgroup>
+        )}
+      </select>
+
+      {/* Parameter dropdown — visible when an Instrument header is
+          picked. Orphans skip this dropdown (the Instrument-dropdown
+          option encoded both the row and its single "parameter"). */}
+      {instrumentId !== '' && instrumentId !== '__orphan__' && (
+        <select
+          className="input text-[11px] py-0.5"
+          value={fnTrackId}
+          onChange={(e) => pickFunction(e.target.value)}
+          title="Parameter of the selected Instrument"
+          disabled={childFns.length === 0}
+        >
+          <option value="">
+            {childFns.length === 0 ? '(no parameters)' : '— Parameter —'}
+          </option>
+          {childFns.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.name || '(unnamed)'}
+            </option>
+          ))}
+        </select>
+      )}
+
+      {/* Value-slot picker — only when the Parameter is multi-arg. */}
+      {hasMultipleValues && fnTrack && (
+        <select
+          className="input text-[11px] py-0.5"
+          value={String(slotIdx)}
+          onChange={(e) => setSlotIdx(parseInt(e.target.value, 10))}
+          title="Which arg-slot of this multi-value Parameter the knob should drive"
+        >
+          <option value="-1">All values</option>
+          {fnArgSpec.map((a, i) => (
+            <option key={i} value={i}>
+              {a.name || `Arg ${i + 1}`}
+            </option>
+          ))}
+        </select>
+      )}
+
+      <button
+        className={`btn text-[11px] py-0.5 px-2 shrink-0 ${
+          disabled ? 'opacity-50 cursor-not-allowed' : ''
+        }`}
+        onClick={commit}
+        disabled={disabled}
+        title={
+          disabled
+            ? `Max ${META_MAX_DESTS} destinations reached`
+            : fnTrack
+              ? 'Add this Instrument / Parameter as a destination'
+              : 'Add an empty destination (you can fill in the IP / port / address by hand)'
+        }
+      >
+        +
+      </button>
+    </div>
+  )
+}
+
+// Build the lookup tables the picker needs in one pass. Templates
+// without children are still listed — the user might be wiring up
+// the header row's own defaults — but no Parameter dropdown will
+// appear for them because the children list is empty.
+function buildPickerIndex(tracks: Session['tracks']): {
+  instrumentTracks: Track[]
+  orphanFnTracks: Track[]
+  fnTracksByParent: Map<string, Track[]>
+} {
+  const instrumentTracks: Track[] = []
+  const orphanFnTracks: Track[] = []
+  const fnTracksByParent = new Map<string, Track[]>()
+  for (const t of tracks) {
+    if (t.kind === 'template') {
+      instrumentTracks.push(t)
+    } else {
+      if (t.parentTrackId) {
+        const list = fnTracksByParent.get(t.parentTrackId) ?? []
+        list.push(t)
+        fnTracksByParent.set(t.parentTrackId, list)
+      } else {
+        orphanFnTracks.push(t)
+      }
+    }
+  }
+  return { instrumentTracks, orphanFnTracks, fnTracksByParent }
+}
+
+// `InstrumentTemplate` / `InstrumentFunction` aren't read at runtime
+// here, but importing them keeps the picker's intent self-documenting
+// (it walks the Pool indirectly via track.sourceTemplateId / etc.)
+// and lets a future refactor swap Track-driven enumeration for Pool-
+// driven without a fresh import dance.
+void (null as unknown as InstrumentTemplate | InstrumentFunction)

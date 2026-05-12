@@ -21,12 +21,21 @@ export default function CrashRecoveryPrompt(): JSX.Element | null {
 
   useEffect(() => {
     let cancelled = false
-    void window.api.autosaveCrashCheck().then((r) => {
-      if (cancelled) return
-      if (r.crashed && r.entries.length > 0) {
-        setState({ visible: true, entries: r.entries.slice(0, 10) })
-      }
-    })
+    // `.catch` so a rejection (FS error reading the autosave manifest)
+    // doesn't become an unhandled rejection — Electron's main process
+    // would log it to stderr but the user would just see no prompt
+    // and no error. Log to the renderer console so devtools surfaces it.
+    void window.api
+      .autosaveCrashCheck()
+      .then((r) => {
+        if (cancelled) return
+        if (r.crashed && r.entries.length > 0) {
+          setState({ visible: true, entries: r.entries.slice(0, 10) })
+        }
+      })
+      .catch((e: unknown) => {
+        console.warn('[crash-recovery] check failed:', (e as Error)?.message ?? e)
+      })
     return () => {
       cancelled = true
     }

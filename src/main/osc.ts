@@ -145,6 +145,11 @@ export class OscSender {
       this.udp = null
       this.ready = false
     }
+    // Always drain the pre-ready queue — stopping before 'ready' fires
+    // would otherwise leak the deferred doSend closures forever
+    // (next `start()` opens a NEW UDPPort with its own 'ready' that
+    // never sees them). Cheap to clear regardless.
+    this.queue.length = 0
   }
 
   send(ip: string, port: number, address: string, arg: Arg): void {

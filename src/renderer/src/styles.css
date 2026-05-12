@@ -88,23 +88,69 @@
   --input-inset: inset 0 1px 0 rgb(6 6 6 / 0.9);
 }
 
-/* Cream — warm paper light (IBM Plex Sans, burnt orange). */
+/* Cream — repainted to match Rainbow Circuit's "Peaks" plugin: warm
+   cream paper with mustard-ochre accents and a desaturated warm-grey
+   inverted card for readouts. Rich theme — opts into bespoke arc
+   sliders, icon-row mode pickers, card-wrap sections, and console
+   readouts (see RICH_THEMES in store.ts). */
 :root[data-theme='cream'] {
-  --c-bg: 228 220 206;
-  --c-panel: 245 240 228;
-  --c-panel2: 238 232 218;
-  --c-panel3: 222 214 196;
-  --c-border: 182 170 148;
-  --c-accent: 200 88 36;
-  --c-accent2: 58 130 160;
-  --c-muted: 122 108 88;
-  --c-text: 46 38 28;
-  --c-active: 220 110 50;
+  --c-bg: 229 224 213;
+  --c-panel: 237 232 220;
+  --c-panel2: 240 235 224;
+  --c-panel3: 216 210 194;
+  --c-border: 184 176 160;
+  --c-accent: 212 176 72;
+  --c-accent2: 122 133 144;
+  --c-muted: 126 120 104;
+  --c-text: 63 64 71;
+  --c-active: 220 184 80;
   --c-danger: 180 60 50;
-  --c-success: 110 150 80;
-  --c-input-bg: 232 224 206;
+  --c-success: 122 153 96;
+  --c-input-bg: 234 228 214;
   --font-app: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
-  --input-inset: inset 0 1px 2px rgb(0 0 0 / 0.08);
+  --input-inset: inset 0 1px 2px rgb(0 0 0 / 0.05);
+  /* Rich-theme tonal-spectrum endpoints — drive the gradient on
+     bespoke arc sliders + step bars. Peaks-style: a single ochre
+     family from light cream-yellow to deeper amber. */
+  --c-rich-warm: 232 196 110;
+  --c-rich-cool: 184 132 52;
+  /* Inverted readout panel — the dark-grey card Peaks tucks beneath
+     its main panel for metric readouts. */
+  --c-rich-card-bg: 84 80 76;
+  --c-rich-card-text: 232 226 212;
+  --c-rich-card-muted: 156 150 138;
+}
+
+/* Nature — repainted to match Rainbow Circuit's "Hopscotch" plugin:
+   dark warm grey background with a tonal yellow-olive → teal-green
+   gradient for active values and warm orange for accents/locks. Rich
+   theme. */
+:root[data-theme='nature'] {
+  --c-bg: 26 26 26;
+  --c-panel: 38 38 38;
+  --c-panel2: 48 48 48;
+  --c-panel3: 64 64 64;
+  --c-border: 14 14 14;
+  --c-accent: 255 142 15;
+  --c-accent2: 93 212 176;
+  --c-muted: 138 138 138;
+  --c-text: 220 220 220;
+  --c-active: 255 170 64;
+  --c-danger: 235 95 95;
+  --c-success: 125 212 156;
+  --c-input-bg: 22 22 22;
+  --font-app: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --input-inset: inset 0 1px 0 rgb(8 8 8 / 0.95);
+  /* Rich-theme tonal spectrum — Hopscotch's signature warm yellow-
+     olive → mossy → teal-green ramp. The arc sliders and step bars
+     interpolate between these endpoints across their length. */
+  --c-rich-warm: 197 196 93;
+  --c-rich-cool: 93 212 176;
+  /* Inverted readout card — slightly darker than the main panel so
+     metric tiles read as embedded displays. */
+  --c-rich-card-bg: 18 18 18;
+  --c-rich-card-text: 220 218 198;
+  --c-rich-card-muted: 138 138 132;
 }
 
 /* Paper Light — cool paper light (Work Sans, blue). */
@@ -500,6 +546,205 @@ html[data-show-mode='true'] [data-hide-in-show='true'] {
   animation: seq-pulse 400ms ease-out;
 }
 
+/* Muted variant of the step pulse — same shape, but in the muted/
+   border colour instead of accent. Tells the user "the playhead is
+   here but this step is gated off in the current cycle (Euclidean
+   miss, Cellular dead bit, etc) — receiver will hold." */
+@keyframes seq-pulse-muted {
+  0% {
+    box-shadow: 0 0 0 2px rgb(var(--c-muted) / 0.7) inset;
+    background: rgb(var(--c-muted) / 0.2);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgb(var(--c-muted) / 0) inset;
+    background: rgb(var(--c-muted) / 0);
+  }
+}
+.seq-pulse-muted {
+  animation: seq-pulse-muted 400ms ease-out;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   Rainbow-Circuit-flavoured visualisers for the sequencer previews.
+
+   Three building blocks the previews share:
+   - .rc-cell — one slot in a row. Soft rounded square or circle
+     (variants below), uses the cell's `--rc-hue` custom property to
+     paint itself; smooth transitions on every state change so the
+     row feels alive when params drag.
+   - .rc-cell.is-hit — the cell is part of the active pattern; tints
+     itself in its hue at low opacity, gets a coloured outline, and
+     casts a soft halo glow that blends across neighbours.
+   - .rc-cell.is-now — the live playhead is over this cell; bumps
+     scale, pumps the glow, and triggers a one-shot pulse animation.
+
+   Each preview sets `style={{ '--rc-hue': '...' }}` per cell so the
+   row spreads across the rainbow wheel based on step index. The
+   colours are HSL-derived in the components; the CSS just consumes
+   them, so theme switches don't need rewriting here.
+
+   ──────────────────────────────────────────────────────────────── */
+
+.rc-cell {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  border: 1.5px solid rgb(var(--c-border) / 0.5);
+  background: transparent;
+  position: relative;
+  /* All visual state (hit, now, hue change) animates in on a single
+     transition stack so dragging Density / Bias / Rule feels fluid
+     instead of step-frame-snapping. */
+  transition:
+    background-color 220ms ease-out,
+    border-color 220ms ease-out,
+    box-shadow 220ms ease-out,
+    transform 220ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+
+.rc-cell.is-hit {
+  border-color: hsl(var(--rc-hue) 75% 60%);
+  background: hsl(var(--rc-hue) 75% 55% / 0.28);
+  /* Soft Rainbow-Circuit-ish bloom: two stacked glows give the cell a
+     halo that bleeds onto the next-door cell, much like Tinge's discs
+     blending colour at their overlaps. */
+  box-shadow:
+    0 0 6px hsl(var(--rc-hue) 80% 60% / 0.45),
+    0 0 14px hsl(var(--rc-hue) 80% 60% / 0.18);
+}
+
+.rc-cell.is-now {
+  border-color: hsl(var(--rc-hue) 90% 70%);
+  background: hsl(var(--rc-hue) 80% 60% / 0.95);
+  transform: scale(1.18);
+  z-index: 1;
+  box-shadow:
+    0 0 8px hsl(var(--rc-hue) 95% 70% / 0.85),
+    0 0 22px hsl(var(--rc-hue) 90% 65% / 0.45);
+  animation: rc-cell-pulse 480ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+
+/* When a step is BOTH a hit and the live playhead, the .is-now rules
+   above already win — no extra rule needed. The pulse on each new
+   "now" frame triggers because React re-mounts the class via the
+   playhead key changing, restarting the animation. */
+
+@keyframes rc-cell-pulse {
+  0% {
+    transform: scale(1);
+    box-shadow:
+      0 0 0 0 hsl(var(--rc-hue) 95% 70% / 0.95),
+      0 0 0 0 hsl(var(--rc-hue) 90% 65% / 0.6);
+  }
+  60% {
+    transform: scale(1.28);
+    box-shadow:
+      0 0 14px hsl(var(--rc-hue) 95% 70% / 0.95),
+      0 0 28px hsl(var(--rc-hue) 90% 65% / 0.5);
+  }
+  100% {
+    transform: scale(1.18);
+    box-shadow:
+      0 0 8px hsl(var(--rc-hue) 95% 70% / 0.85),
+      0 0 22px hsl(var(--rc-hue) 90% 65% / 0.45);
+  }
+}
+
+/* Round variant — used by Drift's clock ring + Polyrhythm's rings,
+   where circles read more naturally than rounded squares. */
+.rc-cell.is-round {
+  border-radius: 50%;
+}
+
+/* The "rest" state for cellular's older generations: dimmer, smaller,
+   no glow. The fade-down (controlled by inline `opacity` in the
+   component) communicates "this row is older history". */
+.rc-cell.is-faded {
+  border-color: rgb(var(--c-border) / 0.4);
+}
+
+/* Bar-fill cell used by the Density preview — the cell itself is
+   transparent; an inner div fills from the bottom up, tinted by the
+   cell's hue. The :before sliver gives the bar a subtle highlight
+   along the top so it reads as a glass tube rather than a flat fill. */
+.rc-bar-cell {
+  width: 18px;
+  height: 28px;
+  border-radius: 5px;
+  border: 1.5px solid rgb(var(--c-border) / 0.5);
+  background: rgb(var(--c-panel2) / 0.4);
+  position: relative;
+  overflow: hidden;
+  transition:
+    border-color 220ms ease-out,
+    box-shadow 220ms ease-out,
+    transform 220ms ease-out;
+}
+.rc-bar-cell.is-hit {
+  border-color: hsl(var(--rc-hue) 75% 60%);
+  box-shadow: 0 0 8px hsl(var(--rc-hue) 80% 60% / 0.35);
+}
+.rc-bar-cell.is-now {
+  border-color: hsl(var(--rc-hue) 90% 70%);
+  box-shadow:
+    0 0 10px hsl(var(--rc-hue) 95% 70% / 0.7),
+    0 0 22px hsl(var(--rc-hue) 90% 65% / 0.4);
+  transform: scale(1.08);
+}
+.rc-bar-fill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  border-radius: 0 0 3px 3px;
+  /* Rainbow-Circuit gradient — the bar's own hue at the top fades
+     down into a deeper, slightly desaturated foot. Reads as glassy. */
+  background: linear-gradient(
+    180deg,
+    hsl(var(--rc-hue) 90% 70% / 0.95) 0%,
+    hsl(var(--rc-hue) 70% 45% / 0.7) 100%
+  );
+  /* Smooth fill changes when Density slider moves. */
+  transition: height 220ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+.rc-bar-fill.is-rest {
+  background: rgb(var(--c-border) / 0.35);
+}
+
+/* Ratchet's per-step burst meter — concentric inner dots that scale
+   with the step's burst probability so high-prob steps look denser. */
+.rc-ratchet-cell {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  border: 1.5px solid rgb(var(--c-border) / 0.5);
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: hsl(var(--rc-hue) 60% 50% / 0.06);
+  transition:
+    border-color 220ms ease-out,
+    box-shadow 220ms ease-out,
+    transform 220ms ease-out;
+}
+.rc-ratchet-cell.is-now {
+  border-color: hsl(var(--rc-hue) 90% 70%);
+  background: hsl(var(--rc-hue) 80% 55% / 0.22);
+  box-shadow: 0 0 12px hsl(var(--rc-hue) 95% 70% / 0.7);
+  transform: scale(1.12);
+}
+.rc-ratchet-dot {
+  border-radius: 50%;
+  background: hsl(var(--rc-hue) 90% 65%);
+  /* Each dot's size is set inline based on probability; the smooth
+     transition makes the slider feel responsive without lag. */
+  transition:
+    width 220ms ease-out,
+    height 220ms ease-out,
+    box-shadow 220ms ease-out;
+}
+
 /* One-shot red flash for the Stop All / Panic buttons on click. */
 @keyframes flash-red {
   0% {
@@ -699,4 +944,143 @@ html[data-show-mode='true'] [data-hide-in-show='true'] {
 .resize-h:hover,
 .resize-v:hover {
   background: rgb(var(--c-accent) / 0.35);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   Rich-theme styling. Activated by ThemeName ∈ RICH_THEMES (Nature,
+   Cream-as-Peaks). Components opt in by reading `isRichTheme()` from
+   the store and either rendering bespoke variants of their controls
+   or applying these classes. Other themes are unaffected.
+   ──────────────────────────────────────────────────────────────── */
+
+/* Section card — softly rounded panel with a subtle border and inner
+   padding. Wraps each CollapsibleSection in rich themes so they feel
+   modular instead of merging into one continuous form. */
+.rich-card {
+  background: rgb(var(--c-panel2) / 0.7);
+  border: 1px solid rgb(var(--c-border) / 0.65);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-top: 6px;
+  /* Replace the default top-border divider — the card IS the
+     visual separator now. */
+  border-top: 1px solid rgb(var(--c-border) / 0.65);
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 0.04),
+    inset 0 1px 0 rgb(255 255 255 / 0.03);
+  transition: background-color 220ms ease-out, border-color 220ms ease-out;
+}
+.rich-card:hover {
+  border-color: rgb(var(--c-border) / 0.95);
+}
+
+/* Console readout — replaces the BoundedNumberInput's default look
+   when not focused. The number sits softly tinted in the accent hue
+   on a dark embedded card, like a vintage instrument display. On
+   focus the input border returns so editing feels familiar. */
+.rich-readout {
+  background: rgb(var(--c-rich-card-bg) / 0.6);
+  color: rgb(var(--c-accent));
+  border: 1px solid rgb(var(--c-border) / 0.6);
+  border-radius: 4px;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 11px;
+  text-align: right;
+  padding: 2px 6px;
+  transition:
+    background-color 180ms ease-out,
+    color 180ms ease-out,
+    border-color 180ms ease-out;
+}
+.rich-readout:hover {
+  border-color: rgb(var(--c-accent) / 0.45);
+}
+.rich-readout:focus {
+  background: rgb(var(--c-input-bg));
+  color: rgb(var(--c-text));
+  border-color: rgb(var(--c-accent) / 0.7);
+  outline: none;
+}
+
+/* Mode-icon button — used by RcModeIcons in place of the Pattern
+   <select>. Each mode is a 26×26 square with a tiny SVG pictogram.
+   Rests muted; the active mode lights up in the accent hue with a
+   soft halo. */
+.rc-mode-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  border: 1px solid rgb(var(--c-border) / 0.7);
+  background: rgb(var(--c-panel) / 0.8);
+  color: rgb(var(--c-muted));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background-color 180ms ease-out,
+    border-color 180ms ease-out,
+    color 180ms ease-out,
+    transform 180ms cubic-bezier(0.2, 0.9, 0.3, 1.2),
+    box-shadow 180ms ease-out;
+  flex-shrink: 0;
+}
+.rc-mode-btn:hover {
+  border-color: rgb(var(--c-accent) / 0.55);
+  color: rgb(var(--c-text));
+}
+.rc-mode-btn.is-active {
+  background: rgb(var(--c-accent) / 0.18);
+  border-color: rgb(var(--c-accent));
+  color: rgb(var(--c-accent));
+  box-shadow:
+    0 0 0 1px rgb(var(--c-accent) / 0.45),
+    0 0 8px rgb(var(--c-accent) / 0.35);
+}
+.rc-mode-btn.is-active svg {
+  filter: drop-shadow(0 0 3px rgb(var(--c-accent) / 0.6));
+}
+
+/* Arc slider — half-circle arc of N vertical bars, tonal warm→cool
+   gradient via --c-rich-warm / --c-rich-cool. Bars left of the
+   active position fill in their hue; bars to the right are dim
+   placeholders. The active position pumps slightly. Click + drag
+   on the SVG sets the value. */
+.rc-arc {
+  display: inline-block;
+  cursor: pointer;
+  user-select: none;
+  touch-action: none;
+}
+.rc-arc-bar {
+  transition:
+    fill 180ms ease-out,
+    opacity 180ms ease-out,
+    transform 180ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+.rc-arc-bar.is-lit {
+  /* Active bars get a soft glow halo via SVG filter. Inline because
+     it depends on a component-passed colour. Default opacity here. */
+  opacity: 1;
+}
+.rc-arc-bar.is-rest {
+  opacity: 0.28;
+}
+.rc-arc-bar.is-now {
+  transform-box: fill-box;
+  transform-origin: center bottom;
+  transform: scaleY(1.15);
+}
+.rc-arc-label {
+  fill: rgb(var(--c-muted));
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 10px;
+  text-anchor: middle;
+}
+.rc-arc-readout {
+  fill: rgb(var(--c-accent));
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 11px;
+  text-anchor: middle;
+  font-weight: 600;
 }

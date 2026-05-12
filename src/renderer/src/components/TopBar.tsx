@@ -7,10 +7,15 @@ import { detectMidiConflicts } from '../hooks/midiConflicts'
 
 // Theme picker options. Order = order shown in the dropdown. New themes first.
 const THEMES: { id: ThemeName; label: string }[] = [
+  // Rainbow-Circuit-flavoured themes — opt into rich UI controls
+  // (bespoke arc sliders, icon-row mode pickers, card-wrap inspector
+  // sections, console-readout numerics).
+  { id: 'nature', label: 'Nature ✦' },
+  { id: 'cream', label: 'Cream ✦' },
+  // Standard themes.
   { id: 'studio-dark', label: 'Studio Dark' },
   { id: 'warm-charcoal', label: 'Warm Charcoal' },
   { id: 'graphite', label: 'Graphite' },
-  { id: 'cream', label: 'Cream' },
   { id: 'paper-light', label: 'Paper Light' },
   { id: 'dark', label: 'Dark' },
   { id: 'light', label: 'Light' },
