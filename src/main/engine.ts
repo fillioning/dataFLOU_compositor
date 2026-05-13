@@ -344,6 +344,25 @@ function generateDrawCurve(cell: Cell, cycle: number): number[] {
  *  Returns a degenerate {min:center, max:center} when no modulator
  *  is active (caller falls back to plain clamp01).
  */
+// Serialise a `ParamArgSpec.fixed` value into the OSC arg shape the
+// engine emits. Strings stay 's'; booleans become 0/1 int (matches
+// the token format produced by `buildInitialValueFromArgSpec`);
+// numbers respect the spec's declared `type` so an `{ type: 'int',
+// fixed: 0 }` round-trips as `i 0` and not `f 0.0`.
+function formatFixedAsOscArg(spec: import('@shared/types').ParamArgSpec): {
+  type: 'i' | 'f' | 's' | 'T' | 'F'
+  value: number | string | boolean
+} {
+  const fv = spec.fixed
+  if (typeof fv === 'string') return { type: 's', value: fv }
+  if (typeof fv === 'boolean') return { type: 'i', value: fv ? 1 : 0 }
+  const n = Number(fv ?? 0)
+  const isInt = Number.isInteger(n) || spec.type === 'int'
+  return isInt
+    ? { type: 'i', value: Math.round(n) }
+    : { type: 'f', value: n }
+}
+
 function predictModRange(m: Modulation, center: number): { min: number; max: number } {
   if (!m.enabled) return { min: center, max: center }
   const depth01 = Math.max(0, Math.min(1, m.depthPct / 100))
@@ -1796,7 +1815,19 @@ export class SceneEngine {
       ) {
         const originalTokens = parseValueTokens(cell.value)
         const padded: typeof perTokenSeq = new Array(slotCount)
+        const specForPad = track?.argSpec
         for (let i = 0; i < slotCount; i++) {
+          // Fixed argSpec slot (protocol header like 'compositor' or
+          // 0) — emit the declared fixed value regardless of what the
+          // sequencer or pin says. The per-token emit loop below ALSO
+          // checks `fixed` and re-asserts the value, but stamping it
+          // here keeps the rest of the pipeline (stepTargets,
+          // modulator center, lastSentNumeric) consistent.
+          const specEntryPad = specForPad?.[i]
+          if (specEntryPad?.fixed !== undefined) {
+            padded[i] = formatFixedAsOscArg(specEntryPad)
+            continue
+          }
           const pinned =
             persistArrPad?.[i] === true &&
             persistValsPad?.[i] !== undefined
@@ -1823,9 +1854,7 @@ export class SceneEngine {
             padded[i] = autoDetectOscArg(originalTokens[i])
           } else {
             // No source for this slot — emit a neutral 0 float rather
-            // than a malformed short bundle. argSpec entries with a
-            // fixed value would have been baked into cell.value at
-            // instantiation, so this branch is defensive only.
+            // than a malformed short bundle.
             padded[i] = { type: 'f', value: 0 }
           }
         }
@@ -1933,8 +1962,40 @@ export class SceneEngine {
       // redundant traffic, no re-triggering).
       const sentValuesBefore = ts.lastSentNumeric.slice()
       const newFinalVals: number[] = []
+      const trackArgSpec = track?.argSpec
       for (let idx = 0; idx < perToken.length; idx++) {
         const a = perToken[idx]
+        // ── Fixed argSpec slot — protocol header ──────────────────
+        // `argSpec[idx].fixed` declares "this slot ALWAYS emits this
+        // value" (Pure Data's `list split 2` etc.). Sequencer and
+        // modulator must not touch it; the slot bypasses the entire
+        // center / morph / mod / scaleToUnit pipeline and emits the
+        // declared `fixed` token verbatim. Without this short-circuit
+        // the multi-arg sequencer pad would broadcast its step value
+        // over fixed slots, breaking the receiver's split.
+        const specEntry = trackArgSpec?.[idx]
+        if (specEntry?.fixed !== undefined) {
+          const fv = specEntry.fixed
+          if (typeof fv === 'string') {
+            outs.push({ type: 's', value: fv })
+            liveParts.push(fv)
+          } else if (typeof fv === 'boolean') {
+            // Pure Data + most splitters expect 0/1 for booleans —
+            // serialise as int rather than osc 'T'/'F' to match the
+            // `buildInitialValueFromArgSpec` token format.
+            const n = fv ? 1 : 0
+            outs.push({ type: 'i', value: n })
+            liveParts.push(String(n))
+            newFinalVals.push(n)
+          } else {
+            const n = Number(fv)
+            const isInt = Number.isInteger(n) || specEntry.type === 'int'
+            outs.push({ type: isInt ? 'i' : 'f', value: isInt ? Math.round(n) : n })
+            liveParts.push(isInt ? String(Math.round(n)) : n.toFixed(3))
+            newFinalVals.push(isInt ? Math.round(n) : n)
+          }
+          continue
+        }
         if (a.type === 's' || a.type === 'T' || a.type === 'F') {
           outs.push({ type: a.type, value: a.value })
           liveParts.push(String(a.value))

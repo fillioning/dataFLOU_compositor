@@ -451,7 +451,42 @@ function PersistentSlotList({
   return (
     <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center">
       {argSpec.map((a, i) => {
-        if (a.fixed !== undefined) return null
+        // Fixed argSpec entries (protocol headers like 'compositor'
+        // or 0) are always emitted as their declared `fixed` token
+        // by the engine — they bypass sequencer + modulator. Show
+        // them in the pin list as locked rows so the user can SEE
+        // what's being prepended on every send. The "pin" checkbox
+        // is replaced with a static FIXED badge: pinning is
+        // meaningless because the engine already treats `fixed`
+        // exactly the way a pin would.
+        if (a.fixed !== undefined) {
+          const fixedDisplay =
+            typeof a.fixed === 'boolean'
+              ? a.fixed ? '1' : '0'
+              : String(a.fixed)
+          return (
+            <Fragment key={i}>
+              <span
+                className="text-[10px] text-muted truncate"
+                title={`${a.name} — protocol header (${a.type}); always emits this value`}
+              >
+                {a.name}
+              </span>
+              <span
+                className="font-mono text-[11px] text-right truncate text-accent"
+                title={`Fixed at ${fixedDisplay}`}
+              >
+                🔒 {fixedDisplay || '—'}
+              </span>
+              <span
+                className="text-[9px] text-muted shrink-0 px-1 rounded-sm border border-border whitespace-nowrap"
+                title="Sequencer + modulators never touch this slot — it's a protocol header declared in the Parameter's argSpec."
+              >
+                FIXED
+              </span>
+            </Fragment>
+          )
+        }
         const cellVal = tokens[i] ?? ''
         const pinned = persistentSlots[i] === true
         const pinnedVal = persistentValues[i] ?? ''

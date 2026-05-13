@@ -341,8 +341,9 @@ Parameters with an `argSpec` (e.g. OCTOCOSME Voice Pots with four pots per voice
 - **One numeric input per slot** in the cell editor, labelled by name (HAUTEUR1 / r / x / etc.).
 - **Each slot has its own pin**: click the pin to freeze that slot at the value shown. Modulators + the sequencer keep running on the unpinned slots; the pinned slot emits its captured value forever until unpinned.
 - **Sequencer respects pinned slots** — when the sequencer is on and your step value is a single number, that number is broadcast to every *unpinned* slot. Pinned slots keep their frozen values. Type a multi‑token step (`0.5 0.7 0.9 0.2`) to drive each unpinned slot independently per step.
+- **Fixed protocol headers** (argSpec entries declared with `fixed:`, like OCTOCOSME's `sender: "compositor"` and `timestamp: 0`) appear in the pin list as **locked rows with a `FIXED` badge**. The engine bypasses sequencer + modulator on these slots entirely — they always emit their declared value so receivers like Pure Data's `list split 2` can do their job.
 
-This means you can sequence one channel of a multi‑value parameter while leaving the other channels pinned at a hand‑set value.
+This means you can sequence one channel of a multi‑value parameter while leaving the other channels pinned at a hand‑set value, and the receiver's protocol header stays intact even under heavy modulation.
 
 ### Templates & bulk actions
 
@@ -575,9 +576,11 @@ Click **+** to commit the resolved destination. With no Instrument picked, **+**
 
 The **A / B / C / D bank selector** is now a single‑column 4‑row stack so the bar's footprint stays narrow.
 
-### Multi‑arg Sequencer respects pinned slots
+### Multi‑arg Sequencer respects pinned slots + fixed protocol headers
 
 When the sequencer is on for a multi‑value parameter (e.g. OCTOCOSME Voice Pots' four pots), the engine now emits the **full** multi‑arg bundle every step. Pinned slots keep their frozen values; unpinned slots receive the sequencer's output (broadcast from the single token, or matched per‑slot if you type a multi‑token step value). You can now sequence one channel while leaving the others hand‑set.
+
+Additionally, **argSpec entries marked `fixed:`** (the protocol headers OCTOCOSME prepends as `sender: "compositor"` and `timestamp: 0` for Pure Data's `list split 2`) are now always emitted as their declared value — the engine bypasses sequencer + modulator on those slots entirely. Previously the sequencer's broadcast value could overwrite them, breaking the receiver's split. The Inspector's pin list shows these slots as locked rows with a `FIXED` badge so you can see what's being prepended on every send.
 
 ### Rich themes — Nature + Cream
 
